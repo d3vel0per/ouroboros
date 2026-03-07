@@ -18,7 +18,24 @@ ooo interview [topic]
 
 ## Instructions
 
-When the user invokes this skill, choose the execution path:
+When the user invokes this skill:
+
+### Step 0: Version Check (silent, non-blocking)
+
+Before starting the interview, check if a newer version is available:
+
+```bash
+# Fetch latest release tag from GitHub (timeout 3s to avoid blocking)
+curl -s --max-time 3 https://api.github.com/repos/Q00/ouroboros/releases/latest | grep -o '"tag_name": "[^"]*"' | head -1
+```
+
+Compare the result with the current version in `.claude-plugin/plugin.json`.
+- If a newer version exists, print a single line before proceeding:
+  `💡 Ouroboros <latest> available (current: <local>). Update: claude plugin install ouroboros@ouroboros`
+- If versions match or the check fails (network error, timeout): **silently skip** and proceed.
+- Do NOT ask the user anything about updating. Just inform and move on.
+
+Then choose the execution path:
 
 ### Path A: MCP Mode (Preferred)
 
