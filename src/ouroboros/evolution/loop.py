@@ -709,7 +709,11 @@ class EvolutionaryLoop:
                 )
                 if wonder_result.is_ok:
                     wonder_output = wonder_result.value
-                    if not wonder_output.should_continue:
+                    if not wonder_output.should_continue and not wonder_output.questions:
+                        # Only early-return if Wonder has NO questions at all.
+                        # If questions exist, we must continue to Reflect even if
+                        # should_continue=false, because the questions represent
+                        # ontological gaps that need to be addressed.
                         logger.info("evolution.wonder.nothing_to_learn")
                         return Result.ok(
                             GenerationResult(
@@ -719,6 +723,15 @@ class EvolutionaryLoop:
                                 phase=GenerationPhase.COMPLETED,
                                 success=True,
                             )
+                        )
+                    if not wonder_output.should_continue and wonder_output.questions:
+                        logger.warning(
+                            "evolution.wonder.continue_override",
+                            extra={
+                                "generation": generation_number,
+                                "question_count": len(wonder_output.questions),
+                                "reason": "Wonder said stop but has unanswered questions",
+                            },
                         )
                 else:
                     # Wonder degraded - emit event but continue
@@ -730,28 +743,52 @@ class EvolutionaryLoop:
                         )
                     )
 
-            # Reflect phase
+            # Reflect phase (with retry on parse failure)
             if self.reflect_engine and wonder_output and prev_gen.evaluation_summary:
-                reflect_result = await self.reflect_engine.reflect(
-                    current_seed=current_seed,
-                    execution_output=prev_gen.execution_output or "",
-                    evaluation_summary=prev_gen.evaluation_summary,
-                    wonder_output=wonder_output,
-                    lineage=lineage,
-                )
-
-                if reflect_result.is_err:
-                    await self.event_store.append(
-                        lineage_generation_failed(
-                            lineage.lineage_id,
-                            generation_number,
-                            GenerationPhase.REFLECTING.value,
-                            str(reflect_result.error),
-                        )
+                max_reflect_attempts = 2
+                for attempt in range(max_reflect_attempts):
+                    reflect_result = await self.reflect_engine.reflect(
+                        current_seed=current_seed,
+                        execution_output=prev_gen.execution_output or "",
+                        evaluation_summary=prev_gen.evaluation_summary,
+                        wonder_output=wonder_output,
+                        lineage=lineage,
                     )
-                    return Result.err(OuroborosError(f"Reflect failed: {reflect_result.error}"))
+
+                    if reflect_result.is_ok:
+                        break
+
+                    if attempt < max_reflect_attempts - 1:
+                        logger.warning(
+                            "evolution.reflect.retry",
+                            extra={
+                                "generation": generation_number,
+                                "attempt": attempt + 1,
+                                "error": str(reflect_result.error),
+                            },
+                        )
+                    else:
+                        await self.event_store.append(
+                            lineage_generation_failed(
+                                lineage.lineage_id,
+                                generation_number,
+                                GenerationPhase.REFLECTING.value,
+                                str(reflect_result.error),
+                            )
+                        )
+                        return Result.err(OuroborosError(f"Reflect failed after {max_reflect_attempts} attempts: {reflect_result.error}"))
 
                 reflect_output = reflect_result.value
+
+                # Warn if Reflect produced no ontology mutations despite Wonder questions
+                if wonder_output.questions and not reflect_output.ontology_mutations:
+                    logger.warning(
+                        "evolution.reflect.empty_mutations",
+                        extra={
+                            "generation": generation_number,
+                            "wonder_question_count": len(wonder_output.questions),
+                        },
+                    )
 
                 # Generate evolved seed
                 if self.seed_generator:

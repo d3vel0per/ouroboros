@@ -19,7 +19,7 @@ import logging
 from pydantic import BaseModel, Field
 
 from ouroboros.core.errors import ProviderError
-from ouroboros.core.lineage import EvaluationSummary, MutationAction, OntologyLineage
+from ouroboros.core.lineage import EvaluationSummary, MutationAction, OntologyDelta, OntologyLineage
 from ouroboros.core.seed import Seed
 from ouroboros.core.text import truncate_head_tail
 from ouroboros.core.types import Result
@@ -132,7 +132,15 @@ class ReflectEngine:
             },
         )
 
-        return Result.ok(self._parse_response(raw_content, current_seed))
+        parsed = self._parse_response(raw_content, current_seed)
+        if parsed is None:
+            return Result.err(
+                ProviderError(
+                    message="Reflect failed to parse LLM response",
+                    provider="reflect",
+                )
+            )
+        return Result.ok(parsed)
 
     def _system_prompt(self) -> str:
         return """You are the Reflect Engine of Ouroboros, an evolutionary development system.
@@ -156,11 +164,14 @@ You must respond with a JSON object (no markdown, no code fences):
 }
 
 Guidelines:
-- If evaluation was mostly successful (score >= 0.8, approved), propose MINIMAL changes
+- If Wonder questions exist, you MUST propose at least one ontology_mutation that addresses them
+- If evaluation score >= 0.8 and approved, keep changes focused but still evolve the ontology based on Wonder insights
+- If evaluation score < 0.8 or not approved, propose more aggressive mutations to address failures
 - Each mutation must have a clear reason tied to evaluation findings or wonder questions
 - refined_acs should address the wonder questions and ontology tensions
 - Do NOT change things that are working well -- only evolve what needs evolution
 - action must be exactly one of: "add", "modify", "remove"
+- An empty ontology_mutations list is ONLY acceptable when there are no Wonder questions
 """
 
     def _build_prompt(
@@ -233,6 +244,23 @@ Guidelines:
                     f"approved={gen.evaluation_summary.final_approved if gen.evaluation_summary else 'N/A'}"
                 )
 
+            # Stagnation warning: detect consecutive identical ontologies
+            stagnant_count = 0
+            gens = lineage.generations
+            for i in range(len(gens) - 1, 0, -1):
+                if OntologyDelta.compute(gens[i - 1].ontology_snapshot, gens[i].ontology_snapshot).similarity >= 0.99:
+                    stagnant_count += 1
+                else:
+                    break
+            if stagnant_count >= 1:
+                parts.append(
+                    f"\n## WARNING: STAGNATION DETECTED"
+                    f"\n  The ontology has NOT changed for {stagnant_count} consecutive generation(s)."
+                    f"\n  Previous Reflect phases produced ZERO effective mutations."
+                    f"\n  You MUST propose concrete ontology mutations based on the Wonder questions above."
+                    f"\n  Translate each Wonder question into at least one add/modify/remove mutation."
+                )
+
         parts.append("\n## Your Task")
         parts.append(
             "Based on the evaluation results and wonder questions, propose specific "
@@ -242,8 +270,11 @@ Guidelines:
 
         return "\n".join(parts)
 
-    def _parse_response(self, content: str, current_seed: Seed) -> ReflectOutput:
-        """Parse LLM response into ReflectOutput."""
+    def _parse_response(self, content: str, current_seed: Seed) -> ReflectOutput | None:
+        """Parse LLM response into ReflectOutput.
+
+        Returns None on parse failure so the caller can retry or propagate error.
+        """
         try:
             cleaned = content.strip()
             if cleaned.startswith("```"):
@@ -285,11 +316,4 @@ Guidelines:
                     "raw_content": content[:1000],
                 },
             )
-            # Return current seed values with no mutations (safe fallback)
-            return ReflectOutput(
-                refined_goal=current_seed.goal,
-                refined_constraints=current_seed.constraints,
-                refined_acs=current_seed.acceptance_criteria,
-                ontology_mutations=(),
-                reasoning=f"Parse error, keeping current: {e}",
-            )
+            return None
