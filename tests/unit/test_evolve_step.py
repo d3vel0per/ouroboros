@@ -722,6 +722,7 @@ class TestEvolveStepHandler:
             {
                 "lineage_id": "lin_handler_test",
                 "seed_content": yaml.dump(seed.to_dict()),
+                "skip_qa": True,
             }
         )
 
@@ -754,6 +755,7 @@ class TestEvolveStepHandler:
                 "lineage_id": "lin_handler_project_dir",
                 "seed_content": yaml.dump(seed.to_dict()),
                 "project_dir": "/tmp/test-project",
+                "skip_qa": True,
             }
         )
 
