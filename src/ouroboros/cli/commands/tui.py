@@ -90,6 +90,8 @@ def main(
 
 def _run_slt_backend(db_path: Path) -> None:
     import shutil
+    import subprocess
+    import sys
 
     bin_path = shutil.which("ouroboros-tui")
     if bin_path is None:
@@ -103,11 +105,20 @@ def _run_slt_backend(db_path: Path) -> None:
         )
         raise typer.Exit(1)
 
-    args = [bin_path, "monitor", "--db-path", str(db_path)]
-    if os.name == "nt":
-        import subprocess
-        import sys
+    if not sys.stdin.isatty():
+        print_error(
+            "SLT backend requires an interactive terminal.\n\n"
+            "This usually happens when running via 'uvx'. Instead:\n"
+            "  1. Run the binary directly:\n"
+            "       ouroboros-tui --db-path " + str(db_path) + "\n\n"
+            "  2. Or install ouroboros first, then run:\n"
+            "       pip install ouroboros-ai\n"
+            "       ouroboros monitor --backend slt",
+        )
+        raise typer.Exit(1)
 
+    args = [bin_path, "--db-path", str(db_path)]
+    if os.name == "nt":
         sys.exit(subprocess.call(args))
     else:
         os.execv(bin_path, args)
