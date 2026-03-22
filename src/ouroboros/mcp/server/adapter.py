@@ -35,6 +35,21 @@ from ouroboros.mcp.types import (
 
 log = structlog.get_logger(__name__)
 
+VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
+
+
+def validate_transport(transport: str) -> str:
+    """Normalize and validate a transport string.
+
+    Returns the lowercased transport if valid, raises ValueError otherwise.
+    """
+    transport = transport.lower()
+    if transport not in VALID_TRANSPORTS:
+        msg = f"Invalid transport {transport!r}. Must be one of: {', '.join(sorted(VALID_TRANSPORTS))}"
+        raise ValueError(msg)
+    return transport
+
+
 # Map MCPToolParameter types to Python annotations for FastMCP schema inference.
 _TOOL_TYPE_MAP: dict[ToolInputType, type] = {
     ToolInputType.STRING: str,
@@ -78,6 +93,70 @@ def _build_tool_signature(parameters: tuple[MCPToolParameter, ...]) -> inspect.S
                 )
             )
     return inspect.Signature(parameters=sig_params)
+
+
+def _looks_like_project_root(path: object) -> bool:
+    """Return True when the given path looks like a project root."""
+    from pathlib import Path
+
+    if not isinstance(path, Path):
+        return False
+
+    return (
+        (path / "pyproject.toml").exists()
+        or (path / "setup.py").exists()
+        or (path / "package.json").exists()
+    )
+
+
+def _project_dir_from_seed(seed: Any) -> str | None:
+    """Extract a likely project directory from seed metadata or brownfield context."""
+    if seed is None:
+        return None
+
+    seed_meta = getattr(seed, "metadata", None)
+    if seed_meta:
+        project_dir = getattr(seed_meta, "project_dir", None) or getattr(
+            seed_meta,
+            "working_directory",
+            None,
+        )
+        if project_dir:
+            return str(project_dir)
+
+    brownfield_context = getattr(seed, "brownfield_context", None)
+    context_references = getattr(brownfield_context, "context_references", ()) or ()
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        role = getattr(reference, "role", None)
+        if isinstance(path, str) and path and role == "primary":
+            return path
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        if isinstance(path, str) and path:
+            return path
+
+    return None
+
+
+def _project_dir_from_artifact(artifact: str) -> str | None:
+    """Extract a likely project root from Write/Edit tool output."""
+    from pathlib import Path
+    import re
+
+    write_matches = re.findall(r"(?:Write|Edit): (/[^\s]+)", artifact)
+    for path_str in write_matches:
+        candidate = Path(path_str).parent
+        for _ in range(10):
+            if _looks_like_project_root(candidate):
+                return str(candidate)
+            if candidate == candidate.parent:
+                break
+            candidate = candidate.parent
+
+    return None
 
 
 class MCPServerAdapter:
@@ -351,18 +430,28 @@ class MCPServerAdapter:
         Uses the MCP SDK's FastMCP server implementation.
 
         Args:
-            transport: Transport type - "stdio" or "sse".
-            host: Host to bind to (SSE only).
-            port: Port to bind to (SSE only).
+            transport: Transport type - "stdio" or "sse" (case-insensitive).
+            host: Host to bind to (SSE only). Defaults to "localhost".
+            port: Port to bind to (SSE only). Defaults to 8080.
         """
+        transport = validate_transport(transport)
+
         try:
             from mcp.server.fastmcp import FastMCP
         except ImportError as e:
             msg = "mcp package not installed. Install with: pip install mcp"
             raise ImportError(msg) from e
 
-        # Create FastMCP server
-        self._mcp_server = FastMCP(self._name)
+        # Pass host/port at construction time — FastMCP reads these from
+        # its internal settings, so run_sse_async() alone won't pick them up.
+        if transport == "sse":
+            self._mcp_server = FastMCP(
+                self._name,
+                host=host,
+                port=port,
+            )
+        else:
+            self._mcp_server = FastMCP(self._name)
 
         # Register tools with FastMCP
         for _name, handler in self._tool_handlers.items():
@@ -425,7 +514,7 @@ class MCPServerAdapter:
 
         # Run the server with the appropriate transport
         if transport == "sse":
-            await self._mcp_server.run_sse_async(host=host, port=port)
+            await self._mcp_server.run_sse_async()
         else:
             await self._mcp_server.run_stdio_async()
 
@@ -485,19 +574,27 @@ def create_ouroboros_server(
         EvaluationPipeline,
         PipelineConfig,
     )
+    from ouroboros.mcp.job_manager import JobManager
     from ouroboros.mcp.tools.definitions import (
         ACDashboardHandler,
+        CancelExecutionHandler,
+        CancelJobHandler,
         EvaluateHandler,
         EvolveRewindHandler,
         EvolveStepHandler,
         ExecuteSeedHandler,
         GenerateSeedHandler,
         InterviewHandler,
+        JobResultHandler,
+        JobStatusHandler,
+        JobWaitHandler,
         LateralThinkHandler,
         LineageStatusHandler,
         MeasureDriftHandler,
         QueryEventsHandler,
         SessionStatusHandler,
+        StartEvolveStepHandler,
+        StartExecuteSeedHandler,
     )
     from ouroboros.mcp.tools.qa import QAHandler
     from ouroboros.mcp.tools.registry import ToolRegistry
@@ -505,11 +602,13 @@ def create_ouroboros_server(
     from ouroboros.orchestrator.runner import (
         OrchestratorRunner,
     )
-    from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
 
     # Create LLM adapter (shared across services)
-    # Default to ClaudeCodeAdapter — uses Max Plan auth, no API key needed.
-    llm_adapter = ClaudeCodeAdapter(max_turns=1)
+    # Use ClaudeAgentAdapter for interview/explore — ClaudeCodeAdapter with
+    # max_turns=1 prevented multi-turn tool use (codebase exploration).
+    # bypassPermissions is safe here: only read-only tools (Read/Glob/Grep)
+    # are used for interview question generation and brownfield exploration.
+    llm_adapter = ClaudeAgentAdapter(permission_mode="bypassPermissions")
 
     # Create or use provided EventStore
     if event_store is None:
@@ -567,12 +666,13 @@ def create_ouroboros_server(
         debug=False,
         enable_decomposition=True,
     )
+    # Stage 1 (mechanical checks: lint/build/test) can be enabled via env var.
+    # Disabled by default to reduce latency per generation step.
+    evolve_stage1 = os.environ.get("OUROBOROS_EVOLVE_STAGE1", "false").lower() == "true"
     evolution_eval_pipeline = EvaluationPipeline(
         llm_adapter=llm_adapter,
-        # Stage 1 is intentionally disabled here to avoid running full
-        # mechanical checks on every generation step.
         config=PipelineConfig(
-            stage1_enabled=False,
+            stage1_enabled=evolve_stage1,
             stage2_enabled=True,
             stage3_enabled=False,
         ),
@@ -655,26 +755,25 @@ def create_ouroboros_server(
 
     spec_extractor = AssertionExtractor(llm_adapter=llm_adapter)
 
-    def _extract_project_dir(artifact: str) -> str | None:
-        """Extract project directory from execution output.
-
-        Looks for Write/Edit file paths and walks up to find project root.
-        """
+    def _extract_project_dir(artifact: str, seed: Any = None) -> str | None:
+        """Resolve project directory from explicit config, seed context, or artifacts."""
         from pathlib import Path
-        import re
 
-        write_matches = re.findall(r"(?:Write|Edit): (/[^\s]+)", artifact)
-        if not write_matches:
-            return None
+        configured_project_dir = evolutionary_loop.get_project_dir()
+        if configured_project_dir:
+            return configured_project_dir
 
-        for path_str in write_matches:
-            candidate = Path(path_str).parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    return str(candidate)
-                if candidate == candidate.parent:
-                    break
-                candidate = candidate.parent
+        seed_project_dir = _project_dir_from_seed(seed)
+        if seed_project_dir:
+            return seed_project_dir
+
+        artifact_project_dir = _project_dir_from_artifact(artifact)
+        if artifact_project_dir:
+            return artifact_project_dir
+
+        cwd = Path.cwd()
+        if _looks_like_project_root(cwd):
+            return str(cwd)
 
         return None
 
@@ -688,7 +787,7 @@ def create_ouroboros_server(
         Returns a corrected EvaluationSummary if discrepancies are detected,
         or None if no override is needed (verification passed or unavailable).
         """
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         if not project_dir:
             return None
 
@@ -807,7 +906,7 @@ def create_ouroboros_server(
             current_ac = "Verify execution output meets requirements"
 
         # Collect file-based artifacts for richer evaluation
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         artifact_bundle = ArtifactCollector().collect(artifact, project_dir)
 
         eval_context = EvaluationContext(
@@ -841,7 +940,7 @@ def create_ouroboros_server(
             failure_reason=result.failure_reason,
         )
 
-    async def _evolution_validator(_seed: Any, execution_output: str | None) -> str:
+    async def _evolution_validator(seed: Any, execution_output: str | None) -> str:
         """Validate and reconcile code generated by parallel AC execution.
 
         After parallel ACs generate code independently, inconsistencies
@@ -855,21 +954,15 @@ def create_ouroboros_server(
         import re
         import subprocess  # noqa: S404  # nosec
 
-        # Extract project directory from execution output
-        # The parallel executor writes to the project directory referenced in the seed
-        project_dir = None
-        write_matches = re.findall(r"Write: (/[^\s]+)", execution_output or "")
-        if write_matches:
-            paths = [Path(p) for p in write_matches]
-            # Walk up from the first written file to find a dir with pyproject.toml or setup.py
-            candidate = paths[0].parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    project_dir = str(candidate)
-                    break
-                candidate = candidate.parent
+        project_dir = _extract_project_dir(execution_output or "", seed=seed)
 
         if not project_dir:
+            log.warning(
+                "evolution.validation.skipped",
+                reason="could not determine project directory",
+                has_seed_metadata=_project_dir_from_seed(seed) is not None,
+                execution_output_length=len(execution_output) if execution_output else 0,
+            )
             return "Validation skipped: could not determine project directory"
 
         # Detect the correct Python binary (prefer project venv over system)
@@ -965,18 +1058,44 @@ def create_ouroboros_server(
         evaluator=_evolution_evaluator,
         validator=_evolution_validator,
     )
+    job_manager = JobManager(event_store)
 
     # Create tool registry for dependency injection
     registry = ToolRegistry()
 
     # Create and register tool handlers with injected dependencies
+    execute_seed = ExecuteSeedHandler(
+        event_store=event_store,
+        llm_adapter=llm_adapter,
+    )
+    evolve_step = EvolveStepHandler(
+        evolutionary_loop=evolutionary_loop,
+    )
     tool_handlers = [
-        ExecuteSeedHandler(
+        execute_seed,
+        StartExecuteSeedHandler(
+            execute_handler=execute_seed,
             event_store=event_store,
-            llm_adapter=llm_adapter,
+            job_manager=job_manager,
         ),
         SessionStatusHandler(
             event_store=event_store,
+        ),
+        JobStatusHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        JobWaitHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        JobResultHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        CancelJobHandler(
+            event_store=event_store,
+            job_manager=job_manager,
         ),
         QueryEventsHandler(
             event_store=event_store,
@@ -998,8 +1117,11 @@ def create_ouroboros_server(
             llm_adapter=llm_adapter,
         ),
         LateralThinkHandler(),
-        EvolveStepHandler(
-            evolutionary_loop=evolutionary_loop,
+        evolve_step,
+        StartEvolveStepHandler(
+            evolve_handler=evolve_step,
+            event_store=event_store,
+            job_manager=job_manager,
         ),
         LineageStatusHandler(
             event_store=event_store,
@@ -1012,6 +1134,9 @@ def create_ouroboros_server(
         ),
         QAHandler(
             llm_adapter=llm_adapter,
+        ),
+        CancelExecutionHandler(
+            event_store=event_store,
         ),
     ]
 

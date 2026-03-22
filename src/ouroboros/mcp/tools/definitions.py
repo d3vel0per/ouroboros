@@ -16,13 +16,19 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from pydantic import ValidationError as PydanticValidationError
 from rich.console import Console
 import structlog
 import yaml
 
-from ouroboros.bigbang.ambiguity import AmbiguityScore, ComponentScore, ScoreBreakdown
+from ouroboros.bigbang.ambiguity import (
+    AmbiguityScore,
+    AmbiguityScorer,
+    ComponentScore,
+    ScoreBreakdown,
+)
 from ouroboros.bigbang.interview import InterviewEngine, InterviewState
 from ouroboros.bigbang.seed_generator import SeedGenerator
 from ouroboros.core.errors import ValidationError
@@ -30,6 +36,7 @@ from ouroboros.core.seed import Seed
 from ouroboros.core.text import truncate_head_tail
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
+from ouroboros.mcp.job_manager import JobLinks, JobManager, JobSnapshot, JobStatus
 from ouroboros.mcp.types import (
     ContentType,
     MCPContentItem,
@@ -42,13 +49,51 @@ from ouroboros.observability.drift import (
     DRIFT_THRESHOLD,
     DriftMeasurement,
 )
-from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+from ouroboros.orchestrator.adapter import (
+    DELEGATED_PARENT_CWD_ARG,
+    DELEGATED_PARENT_EFFECTIVE_TOOLS_ARG,
+    DELEGATED_PARENT_PERMISSION_MODE_ARG,
+    DELEGATED_PARENT_SESSION_ID_ARG,
+    DELEGATED_PARENT_TRANSCRIPT_PATH_ARG,
+    ClaudeAgentAdapter,
+    RuntimeHandle,
+)
 from ouroboros.orchestrator.runner import OrchestratorRunner
-from ouroboros.orchestrator.session import SessionRepository
+from ouroboros.orchestrator.session import SessionRepository, SessionStatus
 from ouroboros.persistence.event_store import EventStore
 from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
 
 log = structlog.get_logger(__name__)
+
+
+def _extract_inherited_runtime_handle(arguments: dict[str, Any]) -> RuntimeHandle | None:
+    """Build a forkable parent runtime handle from internal delegated tool arguments."""
+    session_id = arguments.get(DELEGATED_PARENT_SESSION_ID_ARG)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+
+    transcript_path = arguments.get(DELEGATED_PARENT_TRANSCRIPT_PATH_ARG)
+    cwd = arguments.get(DELEGATED_PARENT_CWD_ARG)
+    permission_mode = arguments.get(DELEGATED_PARENT_PERMISSION_MODE_ARG)
+
+    return RuntimeHandle(
+        backend="claude",
+        native_session_id=session_id,
+        transcript_path=transcript_path if isinstance(transcript_path, str) else None,
+        cwd=cwd if isinstance(cwd, str) else None,
+        approval_mode=permission_mode if isinstance(permission_mode, str) else None,
+        metadata={"fork_session": True},
+    )
+
+
+def _extract_inherited_effective_tools(arguments: dict[str, Any]) -> list[str] | None:
+    """Extract the parent effective tool set from internal delegated tool arguments."""
+    tools = arguments.get(DELEGATED_PARENT_EFFECTIVE_TOOLS_ARG)
+    if not isinstance(tools, list):
+        return None
+
+    inherited_tools = [tool for tool in tools if isinstance(tool, str) and tool]
+    return inherited_tools or None
 
 
 @dataclass
@@ -112,11 +157,17 @@ class ExecuteSeedHandler:
     async def handle(
         self,
         arguments: dict[str, Any],
+        *,
+        execution_id: str | None = None,
+        session_id_override: str | None = None,
     ) -> Result[MCPToolResult, MCPServerError]:
         """Handle a seed execution request.
 
         Args:
             arguments: Tool arguments including seed_content.
+            execution_id: Pre-allocated execution ID (used by StartExecuteSeedHandler).
+            session_id_override: Pre-allocated session ID for new executions
+                (used by StartExecuteSeedHandler).
 
         Returns:
             Result containing execution result or error.
@@ -131,8 +182,15 @@ class ExecuteSeedHandler:
             )
 
         session_id = arguments.get("session_id")
+        new_session_id = session_id_override
         model_tier = arguments.get("model_tier", "medium")
         max_iterations = arguments.get("max_iterations", 10)
+        inherited_runtime_handle = (
+            None if session_id else _extract_inherited_runtime_handle(arguments)
+        )
+        inherited_effective_tools = (
+            None if session_id else _extract_inherited_effective_tools(arguments)
+        )
 
         log.info(
             "mcp.tool.execute_seed",
@@ -164,7 +222,13 @@ class ExecuteSeedHandler:
 
         # Use injected or create orchestrator dependencies
         try:
-            agent_adapter = ClaudeAgentAdapter(permission_mode="acceptEdits")
+            agent_adapter = ClaudeAgentAdapter(
+                permission_mode=(
+                    inherited_runtime_handle.approval_mode
+                    if inherited_runtime_handle and inherited_runtime_handle.approval_mode
+                    else "acceptEdits"
+                )
+            )
             event_store = self.event_store or EventStore()
             await event_store.initialize()
             # Use stderr: in MCP stdio mode, stdout is the JSON-RPC channel.
@@ -177,6 +241,8 @@ class ExecuteSeedHandler:
                 console=console,
                 debug=False,
                 enable_decomposition=True,
+                inherited_runtime_handle=inherited_runtime_handle,
+                inherited_tools=inherited_effective_tools,
             )
 
             # Execute or resume session
@@ -196,7 +262,8 @@ class ExecuteSeedHandler:
                 # Execute new seed
                 result = await runner.execute_seed(
                     seed=seed,
-                    execution_id=None,
+                    execution_id=execution_id,
+                    session_id=new_session_id,
                     parallel=True,
                 )
                 if result.is_err:
@@ -268,7 +335,8 @@ class ExecuteSeedHandler:
         ac_lines = [f"- {ac}" for ac in seed.acceptance_criteria]
         return "The execution must satisfy all acceptance criteria:\n" + "\n".join(ac_lines)
 
-    def _format_execution_result(self, exec_result, seed: Seed) -> str:
+    @staticmethod
+    def _format_execution_result(exec_result, seed: Seed) -> str:
         """Format execution result as human-readable text.
 
         Args:
@@ -611,6 +679,54 @@ class GenerateSeedHandler:
     seed_generator: SeedGenerator | None = field(default=None, repr=False)
     llm_adapter: ClaudeCodeAdapter | None = field(default=None, repr=False)
 
+    def _build_ambiguity_score_from_value(self, ambiguity_score_value: float) -> AmbiguityScore:
+        """Build an ambiguity score object from an explicit numeric override."""
+        breakdown = ScoreBreakdown(
+            goal_clarity=ComponentScore(
+                name="goal_clarity",
+                clarity_score=1.0 - ambiguity_score_value,
+                weight=0.40,
+                justification="Provided as input parameter",
+            ),
+            constraint_clarity=ComponentScore(
+                name="constraint_clarity",
+                clarity_score=1.0 - ambiguity_score_value,
+                weight=0.30,
+                justification="Provided as input parameter",
+            ),
+            success_criteria_clarity=ComponentScore(
+                name="success_criteria_clarity",
+                clarity_score=1.0 - ambiguity_score_value,
+                weight=0.30,
+                justification="Provided as input parameter",
+            ),
+        )
+        return AmbiguityScore(
+            overall_score=ambiguity_score_value,
+            breakdown=breakdown,
+        )
+
+    def _load_stored_ambiguity_score(self, state: InterviewState) -> AmbiguityScore | None:
+        """Load a persisted ambiguity score snapshot from interview state."""
+        if state.ambiguity_score is None:
+            return None
+
+        if isinstance(state.ambiguity_breakdown, dict):
+            try:
+                breakdown = ScoreBreakdown.model_validate(state.ambiguity_breakdown)
+            except PydanticValidationError:
+                log.warning(
+                    "mcp.tool.generate_seed.invalid_stored_ambiguity_breakdown",
+                    session_id=state.interview_id,
+                )
+            else:
+                return AmbiguityScore(
+                    overall_score=state.ambiguity_score,
+                    breakdown=breakdown,
+                )
+
+        return self._build_ambiguity_score_from_value(state.ambiguity_score)
+
     @property
     def definition(self) -> MCPToolDefinition:
         """Return the tool definition."""
@@ -689,42 +805,36 @@ class GenerateSeedHandler:
 
             state: InterviewState = state_result.value
 
-            # Use provided ambiguity score or check if state has it
+            # Use provided ambiguity score, a persisted snapshot, or compute on demand.
             if ambiguity_score_value is not None:
-                # Create a valid ScoreBreakdown with placeholder component scores
-                breakdown = ScoreBreakdown(
-                    goal_clarity=ComponentScore(
-                        name="goal_clarity",
-                        clarity_score=1.0 - ambiguity_score_value,
-                        weight=0.40,
-                        justification="Provided as input parameter",
-                    ),
-                    constraint_clarity=ComponentScore(
-                        name="constraint_clarity",
-                        clarity_score=1.0 - ambiguity_score_value,
-                        weight=0.30,
-                        justification="Provided as input parameter",
-                    ),
-                    success_criteria_clarity=ComponentScore(
-                        name="success_criteria_clarity",
-                        clarity_score=1.0 - ambiguity_score_value,
-                        weight=0.30,
-                        justification="Provided as input parameter",
-                    ),
-                )
-                ambiguity_score = AmbiguityScore(
-                    overall_score=ambiguity_score_value,
-                    breakdown=breakdown,
-                )
+                ambiguity_score = self._build_ambiguity_score_from_value(ambiguity_score_value)
             else:
-                # TODO: Check if state has embedded ambiguity score
-                # For now, require explicit score if not in state
-                return Result.err(
-                    MCPToolError(
-                        "ambiguity_score is required (interview didn't calculate it)",
-                        tool_name="ouroboros_generate_seed",
+                ambiguity_score = self._load_stored_ambiguity_score(state)
+                if ambiguity_score is None:
+                    scorer = AmbiguityScorer(
+                        llm_adapter=llm_adapter,
                     )
-                )
+                    score_result = await scorer.score(state)
+                    if score_result.is_err:
+                        return Result.err(
+                            MCPToolError(
+                                f"Failed to calculate ambiguity: {score_result.error}",
+                                tool_name="ouroboros_generate_seed",
+                            )
+                        )
+
+                    ambiguity_score = score_result.value
+                    state.store_ambiguity(
+                        score=ambiguity_score.overall_score,
+                        breakdown=ambiguity_score.breakdown.model_dump(mode="json"),
+                    )
+                    save_result = await interview_engine.save_state(state)
+                    if save_result.is_err:
+                        log.warning(
+                            "mcp.tool.generate_seed.persist_ambiguity_failed",
+                            session_id=session_id,
+                            error=str(save_result.error),
+                        )
 
             # Use injected or create seed generator
             generator = self.seed_generator or SeedGenerator(llm_adapter=llm_adapter)
@@ -1072,7 +1182,7 @@ class InterviewHandler:
 
         # Use injected or create interview engine
         engine = self.interview_engine or InterviewEngine(
-            llm_adapter=ClaudeCodeAdapter(max_turns=3),
+            llm_adapter=ClaudeAgentAdapter(permission_mode="bypassPermissions"),
             state_dir=Path.home() / ".ouroboros" / "data",
         )
 
@@ -1215,6 +1325,7 @@ class InterviewHandler:
                             )
                         )
                     state = record_result.value
+                    state.clear_stored_ambiguity()
 
                     # Emit response recorded event
                     from ouroboros.events.interview import interview_response_recorded
@@ -1523,8 +1634,13 @@ class EvaluateHandler:
 
             eval_result = result.value
 
+            # Detect code changes when Stage 1 fails (presentation concern)
+            code_changes: bool | None = None
+            if eval_result.stage1_result and not eval_result.stage1_result.passed:
+                code_changes = await self._has_code_changes(working_dir)
+
             # Build result text
-            result_text = self._format_evaluation_result(eval_result)
+            result_text = self._format_evaluation_result(eval_result, code_changes=code_changes)
 
             # Build metadata
             meta = {
@@ -1543,6 +1659,7 @@ class EvaluateHandler:
                 "stage3_approved": eval_result.stage3_result.approved
                 if eval_result.stage3_result
                 else None,
+                "code_changes_detected": code_changes,
             }
 
             return Result.ok(
@@ -1561,11 +1678,35 @@ class EvaluateHandler:
                 )
             )
 
-    def _format_evaluation_result(self, result) -> str:
+    async def _has_code_changes(self, working_dir: Path) -> bool | None:
+        """Detect whether the working tree has code changes.
+
+        Runs ``git status --porcelain`` to check for modifications.
+
+        Returns:
+            True if changes detected, False if clean, None if not a git repo
+            or git is unavailable.
+        """
+        from ouroboros.evaluation.mechanical import run_command
+
+        try:
+            cmd_result = await run_command(
+                ("git", "status", "--porcelain"),
+                timeout=10,
+                working_dir=working_dir,
+            )
+            if cmd_result.return_code != 0:
+                return None
+            return bool(cmd_result.stdout.strip())
+        except Exception:
+            return None
+
+    def _format_evaluation_result(self, result, *, code_changes: bool | None = None) -> str:
         """Format evaluation result as human-readable text.
 
         Args:
             result: EvaluationResult from pipeline.
+            code_changes: Whether working tree has code changes (Stage 1 context).
 
         Returns:
             Formatted text representation.
@@ -1617,9 +1758,13 @@ class EvaluateHandler:
         # Stage 3 results
         if result.stage3_result:
             s3 = result.stage3_result
+            if s3.is_single_model:
+                header = "Stage 3: Multi-Perspective Consensus (single-model)"
+            else:
+                header = "Stage 3: Multi-Model Consensus"
             lines.extend(
                 [
-                    "Stage 3: Multi-Model Consensus",
+                    header,
                     "-" * 40,
                     f"Status: {'APPROVED' if s3.approved else 'REJECTED'}",
                     f"Majority Ratio: {s3.majority_ratio:.1%}",
@@ -1629,11 +1774,19 @@ class EvaluateHandler:
             )
             for vote in s3.votes:
                 decision = "APPROVE" if vote.approved else "REJECT"
-                lines.append(f"  [{decision}] {vote.model} (confidence: {vote.confidence:.2f})")
+                role_suffix = f" [{vote.role}]" if vote.role else ""
+                lines.append(
+                    f"  [{decision}] {vote.model}{role_suffix} (confidence: {vote.confidence:.2f})"
+                )
             if s3.disagreements:
                 lines.append("Disagreements:")
                 for d in s3.disagreements:
                     lines.append(f"  - {d[:100]}...")
+            if s3.is_single_model:
+                lines.append(
+                    "Note: Same model with different evaluation perspectives. "
+                    "Configure OPENROUTER_API_KEY for true multi-model consensus."
+                )
             lines.append("")
 
         # Failure reason
@@ -1645,6 +1798,24 @@ class EvaluateHandler:
                     result.failure_reason or "Unknown",
                 ]
             )
+            # Contextual annotation for Stage 1 failures
+            stage1_failed = result.stage1_result and not result.stage1_result.passed
+            if stage1_failed and code_changes is True:
+                lines.extend(
+                    [
+                        "",
+                        "⚠ Code changes detected — these are real build/test failures "
+                        "that need to be fixed before re-evaluating.",
+                    ]
+                )
+            elif stage1_failed and code_changes is False:
+                lines.extend(
+                    [
+                        "",
+                        "ℹ No code changes detected in the working tree. These failures "
+                        "are expected if you haven't run `ooo run` yet to produce code.",
+                    ]
+                )
 
         return "\n".join(lines)
 
@@ -1876,6 +2047,15 @@ class EvolveStepHandler:
                     required=False,
                     default=False,
                 ),
+                MCPToolParameter(
+                    name="project_dir",
+                    type=ToolInputType.STRING,
+                    description=(
+                        "Project root directory for validation (pytest collection check). "
+                        "If omitted, auto-detected from execution output or CWD."
+                    ),
+                    required=False,
+                ),
             ),
         )
 
@@ -1918,6 +2098,12 @@ class EvolveStepHandler:
 
         execute = arguments.get("execute", True)
         parallel = arguments.get("parallel", True)
+        project_dir = arguments.get("project_dir")
+        normalized_project_dir = (
+            project_dir if isinstance(project_dir, str) and project_dir else None
+        )
+
+        project_dir_token = self.evolutionary_loop.set_project_dir(normalized_project_dir)
 
         try:
             # Ensure event store is initialized before evolve_step accesses it
@@ -1934,6 +2120,8 @@ class EvolveStepHandler:
                     tool_name="ouroboros_evolve_step",
                 )
             )
+        finally:
+            self.evolutionary_loop.reset_project_dir(project_dir_token)
 
         if result.is_err:
             return Result.err(
@@ -2524,15 +2712,800 @@ class ACDashboardHandler:
         )
 
 
+@dataclass
+class CancelExecutionHandler:
+    """Handler for the cancel_execution tool.
+
+    Cancels a running or paused Ouroboros execution session.
+    Validates that the execution exists and is not already in a terminal state
+    (completed, failed, or cancelled) before performing cancellation.
+    """
+
+    event_store: EventStore | None = field(default=None, repr=False)
+
+    # Terminal statuses that cannot be cancelled
+    TERMINAL_STATUSES: tuple[SessionStatus, ...] = (
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.CANCELLED,
+    )
+
+    def __post_init__(self) -> None:
+        """Initialize the session repository after dataclass creation."""
+        self._event_store = self.event_store or EventStore()
+        self._session_repo = SessionRepository(self._event_store)
+        self._initialized = False
+
+    async def _ensure_initialized(self) -> None:
+        """Ensure the event store is initialized."""
+        if not self._initialized:
+            await self._event_store.initialize()
+            self._initialized = True
+
+    async def _resolve_session_id(self, execution_id: str) -> str | None:
+        """Resolve an execution_id to its session_id via event store lookup."""
+        events = await self._event_store.get_all_sessions()
+        for event in events:
+            if event.data.get("execution_id") == execution_id:
+                return event.aggregate_id
+        return None
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        """Return the tool definition."""
+        return MCPToolDefinition(
+            name="ouroboros_cancel_execution",
+            description=(
+                "Cancel a running or paused Ouroboros execution. "
+                "Validates that the execution exists and is not already in a "
+                "terminal state (completed, failed, cancelled) before cancelling."
+            ),
+            parameters=(
+                MCPToolParameter(
+                    name="execution_id",
+                    type=ToolInputType.STRING,
+                    description="The execution/session ID to cancel",
+                    required=True,
+                ),
+                MCPToolParameter(
+                    name="reason",
+                    type=ToolInputType.STRING,
+                    description="Reason for cancellation",
+                    required=False,
+                    default="Cancelled by user",
+                ),
+            ),
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        """Handle a cancel execution request.
+
+        Validates the execution exists and is not in a terminal state,
+        then marks it as cancelled.
+
+        Args:
+            arguments: Tool arguments including execution_id and optional reason.
+
+        Returns:
+            Result containing cancellation confirmation or error.
+        """
+        execution_id = arguments.get("execution_id")
+        if not execution_id:
+            return Result.err(
+                MCPToolError(
+                    "execution_id is required",
+                    tool_name="ouroboros_cancel_execution",
+                )
+            )
+
+        reason = arguments.get("reason", "Cancelled by user")
+
+        log.info(
+            "mcp.tool.cancel_execution",
+            execution_id=execution_id,
+            reason=reason,
+        )
+
+        try:
+            await self._ensure_initialized()
+
+            # Try direct lookup first (user may have passed session_id)
+            result = await self._session_repo.reconstruct_session(execution_id)
+
+            if result.is_err:
+                # Try resolving as execution_id
+                session_id = await self._resolve_session_id(execution_id)
+                if session_id is None:
+                    return Result.err(
+                        MCPToolError(
+                            f"Execution not found: {execution_id}",
+                            tool_name="ouroboros_cancel_execution",
+                        )
+                    )
+                result = await self._session_repo.reconstruct_session(session_id)
+                if result.is_err:
+                    return Result.err(
+                        MCPToolError(
+                            f"Execution not found: {result.error.message}",
+                            tool_name="ouroboros_cancel_execution",
+                        )
+                    )
+
+            tracker = result.value
+
+            # Check if already in a terminal state
+            if tracker.status in self.TERMINAL_STATUSES:
+                return Result.err(
+                    MCPToolError(
+                        f"Execution {execution_id} is already in terminal state: "
+                        f"{tracker.status.value}. Cannot cancel.",
+                        tool_name="ouroboros_cancel_execution",
+                    )
+                )
+
+            # Perform cancellation
+            cancel_result = await self._session_repo.mark_cancelled(
+                session_id=tracker.session_id,
+                reason=reason,
+                cancelled_by="mcp_tool",
+            )
+
+            if cancel_result.is_err:
+                cancel_error = cancel_result.error
+                return Result.err(
+                    MCPToolError(
+                        f"Failed to cancel execution: {cancel_error.message}",
+                        tool_name="ouroboros_cancel_execution",
+                    )
+                )
+
+            status_text = (
+                f"Execution {execution_id} has been cancelled.\n"
+                f"Previous status: {tracker.status.value}\n"
+                f"Reason: {reason}\n"
+            )
+
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text=status_text),),
+                    is_error=False,
+                    meta={
+                        "execution_id": execution_id,
+                        "previous_status": tracker.status.value,
+                        "new_status": SessionStatus.CANCELLED.value,
+                        "reason": reason,
+                        "cancelled_by": "mcp_tool",
+                    },
+                )
+            )
+        except Exception as e:
+            log.error(
+                "mcp.tool.cancel_execution.error",
+                execution_id=execution_id,
+                error=str(e),
+            )
+            return Result.err(
+                MCPToolError(
+                    f"Failed to cancel execution: {e}",
+                    tool_name="ouroboros_cancel_execution",
+                )
+            )
+
+
+_render_cache: dict[tuple[str, int], str] = {}
+_RENDER_CACHE_MAX = 64
+
+
+async def _render_job_snapshot(snapshot: JobSnapshot, event_store: EventStore) -> str:
+    """Format a user-facing job summary with linked execution context.
+
+    Results are cached by (job_id, cursor) to avoid redundant EventStore queries
+    when the same snapshot is rendered repeatedly (e.g. poll loops).
+    Terminal snapshots are never cached since they won't change.
+    """
+    cache_key = (snapshot.job_id, snapshot.cursor)
+    if not snapshot.is_terminal and cache_key in _render_cache:
+        return _render_cache[cache_key]
+
+    text = await _render_job_snapshot_inner(snapshot, event_store)
+
+    if not snapshot.is_terminal:
+        if len(_render_cache) >= _RENDER_CACHE_MAX:
+            # Evict oldest entries
+            to_remove = list(_render_cache.keys())[: _RENDER_CACHE_MAX // 2]
+            for key in to_remove:
+                _render_cache.pop(key, None)
+        _render_cache[cache_key] = text
+
+    return text
+
+
+async def _render_job_snapshot_inner(snapshot: JobSnapshot, event_store: EventStore) -> str:
+    """Inner render without caching."""
+    lines = [
+        f"## Job: {snapshot.job_id}",
+        "",
+        f"**Type**: {snapshot.job_type}",
+        f"**Status**: {snapshot.status.value}",
+        f"**Message**: {snapshot.message}",
+        f"**Created**: {snapshot.created_at.isoformat()}",
+        f"**Updated**: {snapshot.updated_at.isoformat()}",
+        f"**Cursor**: {snapshot.cursor}",
+    ]
+
+    if snapshot.links.execution_id:
+        events = await event_store.query_events(
+            aggregate_id=snapshot.links.execution_id,
+            limit=25,
+        )
+        workflow_event = next((e for e in events if e.type == "workflow.progress.updated"), None)
+        if workflow_event is not None:
+            data = workflow_event.data
+            lines.extend(
+                [
+                    "",
+                    "### Execution",
+                    f"**Execution ID**: {snapshot.links.execution_id}",
+                    f"**Phase**: {data.get('current_phase') or 'Working'}",
+                    f"**Activity**: {data.get('activity_detail') or data.get('activity') or 'running'}",
+                    f"**AC Progress**: {data.get('completed_count', 0)}/{data.get('total_count', '?')}",
+                ]
+            )
+
+        subtasks: dict[str, tuple[str, str]] = {}
+        for event in events:
+            if event.type != "execution.subtask.updated":
+                continue
+            sub_task_id = event.data.get("sub_task_id")
+            if sub_task_id and sub_task_id not in subtasks:
+                subtasks[sub_task_id] = (
+                    event.data.get("content", ""),
+                    event.data.get("status", "unknown"),
+                )
+
+        if subtasks:
+            lines.append("")
+            lines.append("### Recent Subtasks")
+            for sub_task_id, (content, status) in list(subtasks.items())[:3]:
+                lines.append(f"- `{sub_task_id}`: {status} -- {content}")
+
+    elif snapshot.links.session_id:
+        repo = SessionRepository(event_store)
+        session_result = await repo.reconstruct_session(snapshot.links.session_id)
+        if session_result.is_ok:
+            tracker = session_result.value
+            lines.extend(
+                [
+                    "",
+                    "### Session",
+                    f"**Session ID**: {tracker.session_id}",
+                    f"**Session Status**: {tracker.status.value}",
+                    f"**Messages Processed**: {tracker.messages_processed}",
+                ]
+            )
+
+    if snapshot.links.lineage_id:
+        events = await event_store.query_events(
+            aggregate_id=snapshot.links.lineage_id,
+            limit=10,
+        )
+        latest = next((e for e in events if e.type.startswith("lineage.")), None)
+        if latest is not None:
+            lines.extend(
+                [
+                    "",
+                    "### Lineage",
+                    f"**Lineage ID**: {snapshot.links.lineage_id}",
+                ]
+            )
+            if latest.type == "lineage.generation.started":
+                lines.append(
+                    f"**Current Step**: Gen {latest.data.get('generation_number')} {latest.data.get('phase')}"
+                )
+            elif latest.type == "lineage.generation.completed":
+                lines.append(
+                    f"**Current Step**: Gen {latest.data.get('generation_number')} completed"
+                )
+            elif latest.type == "lineage.generation.failed":
+                lines.append(
+                    f"**Current Step**: Gen {latest.data.get('generation_number')} failed at {latest.data.get('phase')}"
+                )
+            elif latest.type in {"lineage.converged", "lineage.stagnated", "lineage.exhausted"}:
+                lines.append(f"**Current Step**: {latest.type.split('.', 1)[1]}")
+                if latest.data.get("reason"):
+                    lines.append(f"**Reason**: {latest.data.get('reason')}")
+
+    if snapshot.result_text and snapshot.is_terminal:
+        lines.extend(
+            [
+                "",
+                "### Result",
+                "Use `ouroboros_job_result` to fetch the full terminal output.",
+            ]
+        )
+
+    if snapshot.error:
+        lines.extend(["", f"**Error**: {snapshot.error}"])
+
+    return "\n".join(lines)
+
+
+@dataclass
+class StartExecuteSeedHandler:
+    """Start a seed execution asynchronously and return a job ID immediately."""
+
+    execute_handler: ExecuteSeedHandler | None = field(default=None, repr=False)
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+        self._execute_handler = self.execute_handler or ExecuteSeedHandler(
+            event_store=self._event_store
+        )
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_start_execute_seed",
+            description=(
+                "Start a seed execution in the background and return a job ID immediately. "
+                "Use ouroboros_job_status, ouroboros_job_wait, and ouroboros_job_result "
+                "to monitor progress."
+            ),
+            parameters=ExecuteSeedHandler().definition.parameters,
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        seed_content = arguments.get("seed_content")
+        if not seed_content:
+            return Result.err(
+                MCPToolError(
+                    "seed_content is required",
+                    tool_name="ouroboros_start_execute_seed",
+                )
+            )
+
+        await self._event_store.initialize()
+
+        session_id = arguments.get("session_id")
+        execution_id: str | None = None
+        new_session_id: str | None = None
+        if session_id:
+            repo = SessionRepository(self._event_store)
+            session_result = await repo.reconstruct_session(session_id)
+            if session_result.is_ok:
+                execution_id = session_result.value.execution_id
+        else:
+            execution_id = f"exec_{uuid4().hex[:12]}"
+            new_session_id = f"orch_{uuid4().hex[:12]}"
+
+        async def _runner() -> MCPToolResult:
+            result = await self._execute_handler.handle(
+                arguments,
+                execution_id=execution_id,
+                session_id_override=new_session_id,
+            )
+            if result.is_err:
+                raise RuntimeError(str(result.error))
+            return result.value
+
+        snapshot = await self._job_manager.start_job(
+            job_type="execute_seed",
+            initial_message="Queued seed execution",
+            runner=_runner(),
+            links=JobLinks(
+                session_id=session_id or new_session_id,
+                execution_id=execution_id,
+            ),
+        )
+
+        text = (
+            f"Started background execution.\n\n"
+            f"Job ID: {snapshot.job_id}\n"
+            f"Session ID: {snapshot.links.session_id or 'pending'}\n"
+            f"Execution ID: {snapshot.links.execution_id or 'pending'}\n\n"
+            "Use ouroboros_job_status, ouroboros_job_wait, or ouroboros_job_result to monitor it."
+        )
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=False,
+                meta={
+                    "job_id": snapshot.job_id,
+                    "session_id": snapshot.links.session_id,
+                    "execution_id": snapshot.links.execution_id,
+                    "status": snapshot.status.value,
+                    "cursor": snapshot.cursor,
+                },
+            )
+        )
+
+
+@dataclass
+class StartEvolveStepHandler:
+    """Start one evolve_step generation asynchronously."""
+
+    evolve_handler: EvolveStepHandler | None = field(default=None, repr=False)
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+        self._evolve_handler = self.evolve_handler or EvolveStepHandler()
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_start_evolve_step",
+            description=(
+                "Start one evolve_step generation in the background and return a job ID "
+                "immediately for later status checks."
+            ),
+            parameters=EvolveStepHandler().definition.parameters,
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        lineage_id = arguments.get("lineage_id")
+        if not lineage_id:
+            return Result.err(
+                MCPToolError(
+                    "lineage_id is required",
+                    tool_name="ouroboros_start_evolve_step",
+                )
+            )
+
+        async def _runner() -> MCPToolResult:
+            result = await self._evolve_handler.handle(arguments)
+            if result.is_err:
+                raise RuntimeError(str(result.error))
+            return result.value
+
+        snapshot = await self._job_manager.start_job(
+            job_type="evolve_step",
+            initial_message=f"Queued evolve_step for {lineage_id}",
+            runner=_runner(),
+            links=JobLinks(lineage_id=lineage_id),
+        )
+
+        text = (
+            f"Started background evolve_step.\n\n"
+            f"Job ID: {snapshot.job_id}\n"
+            f"Lineage ID: {lineage_id}\n\n"
+            "Use ouroboros_job_status, ouroboros_job_wait, or ouroboros_job_result to monitor it."
+        )
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=False,
+                meta={
+                    "job_id": snapshot.job_id,
+                    "lineage_id": lineage_id,
+                    "status": snapshot.status.value,
+                    "cursor": snapshot.cursor,
+                },
+            )
+        )
+
+
+@dataclass
+class JobStatusHandler:
+    """Return a human-readable status summary for a background job."""
+
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_job_status",
+            description="Get the latest summary for a background Ouroboros job.",
+            parameters=(
+                MCPToolParameter(
+                    name="job_id",
+                    type=ToolInputType.STRING,
+                    description="Job ID returned by a start tool",
+                    required=True,
+                ),
+            ),
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        job_id = arguments.get("job_id")
+        if not job_id:
+            return Result.err(
+                MCPToolError(
+                    "job_id is required",
+                    tool_name="ouroboros_job_status",
+                )
+            )
+
+        try:
+            snapshot = await self._job_manager.get_snapshot(job_id)
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_job_status"))
+
+        text = await _render_job_snapshot(snapshot, self._event_store)
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=snapshot.status in {JobStatus.FAILED, JobStatus.CANCELLED},
+                meta={
+                    "job_id": snapshot.job_id,
+                    "status": snapshot.status.value,
+                    "cursor": snapshot.cursor,
+                    "session_id": snapshot.links.session_id,
+                    "execution_id": snapshot.links.execution_id,
+                    "lineage_id": snapshot.links.lineage_id,
+                },
+            )
+        )
+
+
+@dataclass
+class JobWaitHandler:
+    """Long-poll for the next background job update."""
+
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_job_wait",
+            description=(
+                "Wait briefly for a background job to change state. "
+                "Useful for conversational polling after a start command."
+            ),
+            parameters=(
+                MCPToolParameter(
+                    name="job_id",
+                    type=ToolInputType.STRING,
+                    description="Job ID returned by a start tool",
+                    required=True,
+                ),
+                MCPToolParameter(
+                    name="cursor",
+                    type=ToolInputType.INTEGER,
+                    description="Previous cursor from job_status or job_wait",
+                    required=False,
+                    default=0,
+                ),
+                MCPToolParameter(
+                    name="timeout_seconds",
+                    type=ToolInputType.INTEGER,
+                    description="Maximum seconds to wait for a change (longer = fewer round-trips)",
+                    required=False,
+                    default=30,
+                ),
+            ),
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        job_id = arguments.get("job_id")
+        if not job_id:
+            return Result.err(
+                MCPToolError(
+                    "job_id is required",
+                    tool_name="ouroboros_job_wait",
+                )
+            )
+
+        cursor = int(arguments.get("cursor", 0))
+        timeout_seconds = int(arguments.get("timeout_seconds", 30))
+
+        try:
+            snapshot, changed = await self._job_manager.wait_for_change(
+                job_id,
+                cursor=cursor,
+                timeout_seconds=timeout_seconds,
+            )
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_job_wait"))
+
+        text = await _render_job_snapshot(snapshot, self._event_store)
+        if not changed:
+            text += "\n\nNo new job-level events during this wait window."
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=snapshot.status in {JobStatus.FAILED, JobStatus.CANCELLED},
+                meta={
+                    "job_id": snapshot.job_id,
+                    "status": snapshot.status.value,
+                    "cursor": snapshot.cursor,
+                    "changed": changed,
+                },
+            )
+        )
+
+
+@dataclass
+class JobResultHandler:
+    """Fetch the terminal output for a background job."""
+
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_job_result",
+            description="Get the final output for a completed background job.",
+            parameters=(
+                MCPToolParameter(
+                    name="job_id",
+                    type=ToolInputType.STRING,
+                    description="Job ID returned by a start tool",
+                    required=True,
+                ),
+            ),
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        job_id = arguments.get("job_id")
+        if not job_id:
+            return Result.err(
+                MCPToolError(
+                    "job_id is required",
+                    tool_name="ouroboros_job_result",
+                )
+            )
+
+        try:
+            snapshot = await self._job_manager.get_snapshot(job_id)
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_job_result"))
+
+        if not snapshot.is_terminal:
+            return Result.err(
+                MCPToolError(
+                    f"Job still running: {snapshot.status.value}",
+                    tool_name="ouroboros_job_result",
+                )
+            )
+
+        result_text = snapshot.result_text or snapshot.error or snapshot.message
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=result_text),),
+                is_error=snapshot.status in {JobStatus.FAILED, JobStatus.CANCELLED},
+                meta={
+                    "job_id": snapshot.job_id,
+                    "status": snapshot.status.value,
+                    "session_id": snapshot.links.session_id,
+                    "execution_id": snapshot.links.execution_id,
+                    "lineage_id": snapshot.links.lineage_id,
+                    **snapshot.result_meta,
+                },
+            )
+        )
+
+
+@dataclass
+class CancelJobHandler:
+    """Cancel a background job."""
+
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+
+    @property
+    def definition(self) -> MCPToolDefinition:
+        return MCPToolDefinition(
+            name="ouroboros_cancel_job",
+            description="Request cancellation for a background job.",
+            parameters=(
+                MCPToolParameter(
+                    name="job_id",
+                    type=ToolInputType.STRING,
+                    description="Job ID returned by a start tool",
+                    required=True,
+                ),
+            ),
+        )
+
+    async def handle(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        job_id = arguments.get("job_id")
+        if not job_id:
+            return Result.err(
+                MCPToolError(
+                    "job_id is required",
+                    tool_name="ouroboros_cancel_job",
+                )
+            )
+
+        try:
+            snapshot = await self._job_manager.cancel_job(job_id)
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_cancel_job"))
+
+        text = await _render_job_snapshot(snapshot, self._event_store)
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=False,
+                meta={
+                    "job_id": snapshot.job_id,
+                    "status": snapshot.status.value,
+                    "cursor": snapshot.cursor,
+                },
+            )
+        )
+
+
 # Convenience functions for handler access
 def execute_seed_handler() -> ExecuteSeedHandler:
     """Create an ExecuteSeedHandler instance."""
     return ExecuteSeedHandler()
 
 
+def start_execute_seed_handler() -> StartExecuteSeedHandler:
+    """Create a StartExecuteSeedHandler instance."""
+    return StartExecuteSeedHandler()
+
+
 def session_status_handler() -> SessionStatusHandler:
     """Create a SessionStatusHandler instance."""
     return SessionStatusHandler()
+
+
+def job_status_handler() -> JobStatusHandler:
+    """Create a JobStatusHandler instance."""
+    return JobStatusHandler()
+
+
+def job_wait_handler() -> JobWaitHandler:
+    """Create a JobWaitHandler instance."""
+    return JobWaitHandler()
+
+
+def job_result_handler() -> JobResultHandler:
+    """Create a JobResultHandler instance."""
+    return JobResultHandler()
+
+
+def cancel_job_handler() -> CancelJobHandler:
+    """Create a CancelJobHandler instance."""
+    return CancelJobHandler()
 
 
 def query_events_handler() -> QueryEventsHandler:
@@ -2570,6 +3543,11 @@ def evolve_step_handler() -> EvolveStepHandler:
     return EvolveStepHandler()
 
 
+def start_evolve_step_handler() -> StartEvolveStepHandler:
+    """Create a StartEvolveStepHandler instance."""
+    return StartEvolveStepHandler()
+
+
 def lineage_status_handler() -> LineageStatusHandler:
     """Create a LineageStatusHandler instance."""
     return LineageStatusHandler()
@@ -2585,7 +3563,12 @@ from ouroboros.mcp.tools.qa import QAHandler  # noqa: E402
 
 OUROBOROS_TOOLS: tuple[
     ExecuteSeedHandler
+    | StartExecuteSeedHandler
     | SessionStatusHandler
+    | JobStatusHandler
+    | JobWaitHandler
+    | JobResultHandler
+    | CancelJobHandler
     | QueryEventsHandler
     | GenerateSeedHandler
     | MeasureDriftHandler
@@ -2593,13 +3576,20 @@ OUROBOROS_TOOLS: tuple[
     | EvaluateHandler
     | LateralThinkHandler
     | EvolveStepHandler
+    | StartEvolveStepHandler
     | LineageStatusHandler
     | EvolveRewindHandler
+    | CancelExecutionHandler
     | QAHandler,
     ...,
 ] = (
     ExecuteSeedHandler(),
+    StartExecuteSeedHandler(),
     SessionStatusHandler(),
+    JobStatusHandler(),
+    JobWaitHandler(),
+    JobResultHandler(),
+    CancelJobHandler(),
     QueryEventsHandler(),
     GenerateSeedHandler(),
     MeasureDriftHandler(),
@@ -2607,7 +3597,9 @@ OUROBOROS_TOOLS: tuple[
     EvaluateHandler(),
     LateralThinkHandler(),
     EvolveStepHandler(),
+    StartEvolveStepHandler(),
     LineageStatusHandler(),
     EvolveRewindHandler(),
+    CancelExecutionHandler(),
     QAHandler(),
 )

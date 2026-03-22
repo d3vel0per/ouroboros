@@ -14,6 +14,7 @@ and autonomously evolves through Wonder → Reflect cycles for Gen 2+.
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from enum import StrEnum
 import json
@@ -38,6 +39,7 @@ from ouroboros.events.lineage import (
     lineage_exhausted,
     lineage_generation_completed,
     lineage_generation_failed,
+    lineage_generation_phase_changed,
     lineage_generation_started,
     lineage_ontology_evolved,
     lineage_stagnated,
@@ -47,6 +49,7 @@ from ouroboros.evolution.convergence import ConvergenceCriteria, ConvergenceSign
 from ouroboros.evolution.projector import LineageProjector
 from ouroboros.evolution.reflect import ReflectEngine, ReflectOutput
 from ouroboros.evolution.wonder import WonderEngine, WonderOutput
+from ouroboros.observability.drift import DriftMeasuredEvent, DriftMeasurement
 from ouroboros.persistence.event_store import EventStore
 
 logger = logging.getLogger(__name__)
@@ -153,6 +156,10 @@ class EvolutionaryLoop:
         self.executor = executor
         self.evaluator = evaluator
         self.validator = validator
+        self._project_dir_context: ContextVar[str | None] = ContextVar(
+            "evolutionary_loop_project_dir",
+            default=None,
+        )
         self._convergence = ConvergenceCriteria(
             convergence_threshold=self.config.convergence_threshold,
             stagnation_window=self.config.stagnation_window,
@@ -162,6 +169,18 @@ class EvolutionaryLoop:
             eval_gate_enabled=self.config.eval_gate_enabled,
             eval_min_score=self.config.eval_min_score,
         )
+
+    def set_project_dir(self, project_dir: str | None) -> Token[str | None]:
+        """Set task-local project directory context for the current generation."""
+        return self._project_dir_context.set(project_dir)
+
+    def get_project_dir(self) -> str | None:
+        """Return the task-local project directory for the current execution."""
+        return self._project_dir_context.get()
+
+    def reset_project_dir(self, token: Token[str | None]) -> None:
+        """Restore the previous task-local project directory context."""
+        self._project_dir_context.reset(token)
 
     async def run(
         self,
@@ -292,6 +311,7 @@ class EvolutionaryLoop:
                 lineage,
                 result.wonder_output,
                 latest_evaluation=result.evaluation_summary,
+                validation_output=result.validation_output,
             )
 
             if signal.converged:
@@ -578,6 +598,7 @@ class EvolutionaryLoop:
             lineage,
             result.wonder_output,
             latest_evaluation=result.evaluation_summary,
+            validation_output=result.validation_output,
         )
 
         action = StepAction.CONTINUE
@@ -709,7 +730,11 @@ class EvolutionaryLoop:
                 )
                 if wonder_result.is_ok:
                     wonder_output = wonder_result.value
-                    if not wonder_output.should_continue:
+                    if not wonder_output.should_continue and not wonder_output.questions:
+                        # Only early-return if Wonder has NO questions at all.
+                        # If questions exist, we must continue to Reflect even if
+                        # should_continue=false, because the questions represent
+                        # ontological gaps that need to be addressed.
                         logger.info("evolution.wonder.nothing_to_learn")
                         return Result.ok(
                             GenerationResult(
@@ -719,6 +744,15 @@ class EvolutionaryLoop:
                                 phase=GenerationPhase.COMPLETED,
                                 success=True,
                             )
+                        )
+                    if not wonder_output.should_continue and wonder_output.questions:
+                        logger.warning(
+                            "evolution.wonder.continue_override",
+                            extra={
+                                "generation": generation_number,
+                                "question_count": len(wonder_output.questions),
+                                "reason": "Wonder said stop but has unanswered questions",
+                            },
                         )
                 else:
                     # Wonder degraded - emit event but continue
@@ -730,28 +764,74 @@ class EvolutionaryLoop:
                         )
                     )
 
-            # Reflect phase
-            if self.reflect_engine and wonder_output and prev_gen.evaluation_summary:
-                reflect_result = await self.reflect_engine.reflect(
-                    current_seed=current_seed,
-                    execution_output=prev_gen.execution_output or "",
-                    evaluation_summary=prev_gen.evaluation_summary,
-                    wonder_output=wonder_output,
-                    lineage=lineage,
+            # Phase transition: wondering → reflecting
+            await self.event_store.append(
+                lineage_generation_phase_changed(
+                    lineage.lineage_id,
+                    generation_number,
+                    GenerationPhase.REFLECTING.value,
                 )
+            )
 
-                if reflect_result.is_err:
-                    await self.event_store.append(
-                        lineage_generation_failed(
-                            lineage.lineage_id,
-                            generation_number,
-                            GenerationPhase.REFLECTING.value,
-                            str(reflect_result.error),
-                        )
+            # Reflect phase (with retry on parse failure)
+            if self.reflect_engine and wonder_output and prev_gen.evaluation_summary:
+                max_reflect_attempts = 2
+                for attempt in range(max_reflect_attempts):
+                    reflect_result = await self.reflect_engine.reflect(
+                        current_seed=current_seed,
+                        execution_output=prev_gen.execution_output or "",
+                        evaluation_summary=prev_gen.evaluation_summary,
+                        wonder_output=wonder_output,
+                        lineage=lineage,
                     )
-                    return Result.err(OuroborosError(f"Reflect failed: {reflect_result.error}"))
+
+                    if reflect_result.is_ok:
+                        break
+
+                    if attempt < max_reflect_attempts - 1:
+                        logger.warning(
+                            "evolution.reflect.retry",
+                            extra={
+                                "generation": generation_number,
+                                "attempt": attempt + 1,
+                                "error": str(reflect_result.error),
+                            },
+                        )
+                    else:
+                        await self.event_store.append(
+                            lineage_generation_failed(
+                                lineage.lineage_id,
+                                generation_number,
+                                GenerationPhase.REFLECTING.value,
+                                str(reflect_result.error),
+                            )
+                        )
+                        return Result.err(
+                            OuroborosError(
+                                f"Reflect failed after {max_reflect_attempts} attempts: {reflect_result.error}"
+                            )
+                        )
 
                 reflect_output = reflect_result.value
+
+                # Warn if Reflect produced no ontology mutations despite Wonder questions
+                if wonder_output.questions and not reflect_output.ontology_mutations:
+                    logger.warning(
+                        "evolution.reflect.empty_mutations",
+                        extra={
+                            "generation": generation_number,
+                            "wonder_question_count": len(wonder_output.questions),
+                        },
+                    )
+
+                # Phase transition: reflecting → seeding
+                await self.event_store.append(
+                    lineage_generation_phase_changed(
+                        lineage.lineage_id,
+                        generation_number,
+                        GenerationPhase.SEEDING.value,
+                    )
+                )
 
                 # Generate evolved seed
                 if self.seed_generator:
@@ -791,6 +871,15 @@ class EvolutionaryLoop:
                     current_seed.metadata.seed_id,
                 )
             )
+
+        # Phase transition: → executing
+        await self.event_store.append(
+            lineage_generation_phase_changed(
+                lineage.lineage_id,
+                generation_number,
+                GenerationPhase.EXECUTING.value,
+            )
+        )
 
         # Execute phase (placeholder - actual execution via OrchestratorRunner)
         execution_output: str | None = None
@@ -847,16 +936,31 @@ class EvolutionaryLoop:
                         validation_output = f"Validation error: {validation_result.error}"
                 else:
                     validation_output = str(validation_result)
-                logger.info(
-                    "evolution.generation.validated",
-                    extra={"generation": generation_number},
-                )
+                if validation_output and "skipped" in validation_output.lower():
+                    logger.warning(
+                        "evolution.generation.validation_skipped",
+                        extra={"generation": generation_number, "output": validation_output},
+                    )
+                else:
+                    logger.info(
+                        "evolution.generation.validated",
+                        extra={"generation": generation_number},
+                    )
             except Exception as e:
                 logger.warning(
                     "evolution.validation.failed",
                     extra={"error": str(e), "generation": generation_number},
                 )
                 validation_output = f"Validation skipped: {e}"
+
+        # Phase transition: → evaluating
+        await self.event_store.append(
+            lineage_generation_phase_changed(
+                lineage.lineage_id,
+                generation_number,
+                GenerationPhase.EVALUATING.value,
+            )
+        )
 
         # Evaluate phase (placeholder - actual evaluation via EvaluationPipeline)
         evaluation_summary: EvaluationSummary | None = None
@@ -870,6 +974,29 @@ class EvolutionaryLoop:
             except Exception as e:
                 logger.warning(
                     "evolution.evaluation.failed",
+                    extra={"error": str(e), "generation": generation_number},
+                )
+
+        # Measure drift after evaluation
+        if execution_output:
+            try:
+                drift_measurement = DriftMeasurement()
+                drift_metrics = drift_measurement.measure(
+                    current_output=execution_output,
+                    constraint_violations=[],
+                    current_concepts=[],
+                    seed=current_seed,
+                )
+                drift_event = DriftMeasuredEvent(
+                    execution_id=lineage.lineage_id,
+                    seed_id=current_seed.metadata.seed_id,
+                    iteration=generation_number,
+                    metrics=drift_metrics,
+                )
+                await self.event_store.append(drift_event)
+            except Exception as e:
+                logger.warning(
+                    "evolution.drift.measurement_failed",
                     extra={"error": str(e), "generation": generation_number},
                 )
 

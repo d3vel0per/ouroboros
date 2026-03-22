@@ -38,6 +38,9 @@ Format: name:description:weight (pipe-separated, weight 0.0-1.0)
 Conditions that indicate the workflow should terminate.
 Format: name:description:criteria (pipe-separated)
 
+### 7. METADATA
+- **AMBIGUITY_SCORE**: A float 0.0-1.0 estimating how ambiguous the requirements are. Lower is better. Must be <= 0.2 for seed generation. Estimate based on how specific and testable the acceptance criteria are.
+
 ## OUTPUT FORMAT
 
 Provide your analysis in this exact structure:
@@ -51,6 +54,7 @@ ONTOLOGY_DESCRIPTION: <description>
 ONTOLOGY_FIELDS: <name>:<type>:<description> | ...
 EVALUATION_PRINCIPLES: <name>:<description>:<weight> | ...
 EXIT_CONDITIONS: <name>:<description>:<criteria> | ...
+AMBIGUITY_SCORE: <float 0.0-1.0>
 ```
 
 Field types should be one of: string, number, boolean, array, object

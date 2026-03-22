@@ -3,7 +3,6 @@
 Tests cover:
 - Agent orchestration with pool
 - Skill execution flow
-- State persistence across sessions
 - Router integration with complexity estimation
 - End-to-end workflows
 """
@@ -28,8 +27,6 @@ from ouroboros.plugin.orchestration.router import ModelRouter, RoutingContext
 from ouroboros.plugin.skills.registry import (
     SkillRegistry,
 )
-from ouroboros.plugin.state.manager import SessionStatus, StateManager
-from ouroboros.plugin.state.store import StateMode, StateStore
 from ouroboros.routing.tiers import Tier
 
 
@@ -370,86 +367,6 @@ class TestModelRouterIntegration:
         assert tier in [Tier.FRUGAL, Tier.STANDARD, Tier.FRONTIER]
 
 
-class TestStateManagerIntegration:
-    """Integration tests for StateManager."""
-
-    @pytest.mark.asyncio
-    async def test_session_lifecycle(self) -> None:
-        """Test complete session lifecycle."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            worktree = Path(tmpdir)
-            store = StateStore(worktree=worktree)
-            manager = StateManager(store=store)
-
-            # Create session
-            result = await manager.save_session(
-                session_id="sess-test",
-                execution_id="exec-1",
-                seed_id="seed-1",
-                seed_goal="Test goal",
-                acceptance_criteria=["AC1", "AC2"],
-                workflow_state={"step": "initial"},
-                mode=StateMode.AUTOPILOT,
-            )
-
-            assert result.is_ok
-
-            # Load session
-            loaded = await manager.load_session("sess-test")
-            assert loaded is not None
-            assert loaded.seed_goal == "Test goal"
-
-            # Update session
-            update_result = await manager.update_session(
-                session_id="sess-test",
-                workflow_state={"step": "completed"},
-                status=SessionStatus.COMPLETED,
-            )
-
-            assert update_result.is_ok
-
-            # Create checkpoint
-            ckpt_result = await manager.create_checkpoint(
-                session_id="sess-test",
-                phase="completion",
-                state={"checkpointed": True},
-            )
-
-            assert ckpt_result.is_ok
-
-            # List checkpoints
-            checkpoints = await manager.list_checkpoints("sess-test")
-            assert len(checkpoints) >= 1
-
-    @pytest.mark.asyncio
-    async def test_auto_checkpoint_workflow(self) -> None:
-        """Test auto-checkpoint functionality."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            worktree = Path(tmpdir)
-            store = StateStore(worktree=worktree)
-            manager = StateManager(store=store, auto_checkpoint=True)
-
-            # Create active session
-            await manager.save_session(
-                session_id="sess-auto",
-                execution_id="exec-1",
-                seed_id="seed-1",
-                seed_goal="Auto checkpoint test",
-                acceptance_criteria=[],
-                workflow_state={},
-                mode=StateMode.AUTOPILOT,
-            )
-
-            # Start auto-checkpoint
-            await manager.start_auto_checkpoint()
-
-            # Wait a bit for checkpoint task to potentially run
-            await asyncio.sleep(0.1)
-
-            # Stop auto-checkpoint
-            await manager.stop_auto_checkpoint()
-
-
 class TestEndToEndWorkflow:
     """End-to-end workflow tests."""
 
@@ -460,43 +377,21 @@ class TestEndToEndWorkflow:
         AgentRegistry()
         router = ModelRouter()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            worktree = Path(tmpdir)
-            store = StateStore(worktree=worktree)
-            state_manager = StateManager(store=store)
+        # 2. Route a task
+        context = RoutingContext(
+            task_type="code",
+            token_estimate=1500,
+            tool_count=2,
+            ac_depth=2,
+        )
 
-            # 2. Route a task
-            context = RoutingContext(
-                task_type="code",
-                token_estimate=1500,
-                tool_count=2,
-                ac_depth=2,
-            )
+        tier = await router.route(context)
+        assert tier in [Tier.FRUGAL, Tier.STANDARD, Tier.FRONTIER]
 
-            tier = await router.route(context)
-            assert tier in [Tier.FRUGAL, Tier.STANDARD, Tier.FRONTIER]
+        # 3. Record routing result
+        await router.record_result(context, tier, success=True)
 
-            # 3. Create session
-            session_result = await state_manager.save_session(
-                session_id="sess-e2e",
-                execution_id="exec-e2e",
-                seed_id="seed-e2e",
-                seed_goal="End-to-end test",
-                acceptance_criteria=[],
-                workflow_state={"tier": tier.value},
-                mode=StateMode.AUTOPILOT,
-            )
-
-            assert session_result.is_ok
-
-            # 4. Record routing result
-            await router.record_result(context, tier, success=True)
-
-            # 5. Verify state
-            stats = router.get_statistics()
-            assert stats["total_routes"] == 1
-            assert stats["total_records"] == 1
-
-            loaded_session = await state_manager.load_session("sess-e2e")
-            assert loaded_session is not None
-            assert loaded_session.workflow_state["tier"] == tier.value
+        # 4. Verify state
+        stats = router.get_statistics()
+        assert stats["total_routes"] == 1
+        assert stats["total_records"] == 1

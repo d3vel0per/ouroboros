@@ -32,7 +32,10 @@ CLI Usage:
 from ouroboros.orchestrator.adapter import (
     DEFAULT_TOOLS,
     AgentMessage,
+    AgentRuntime,
     ClaudeAgentAdapter,
+    ClaudeCodeRuntime,
+    RuntimeHandle,
     TaskResult,
 )
 from ouroboros.orchestrator.coordinator import (
@@ -49,6 +52,7 @@ from ouroboros.orchestrator.dependency_analyzer import (
 from ouroboros.orchestrator.events import (
     create_mcp_tools_loaded_event,
     create_progress_event,
+    create_session_cancelled_event,
     create_session_completed_event,
     create_session_failed_event,
     create_session_paused_event,
@@ -103,9 +107,12 @@ from ouroboros.orchestrator.session import (
 
 __all__ = [
     # Adapter
+    "AgentRuntime",
     "AgentMessage",
     "ClaudeAgentAdapter",
+    "ClaudeCodeRuntime",
     "DEFAULT_TOOLS",
+    "RuntimeHandle",
     "TaskResult",
     # Session
     "SessionRepository",
@@ -130,6 +137,7 @@ __all__ = [
     # Events
     "create_mcp_tools_loaded_event",
     "create_progress_event",
+    "create_session_cancelled_event",
     "create_session_completed_event",
     "create_session_failed_event",
     "create_session_paused_event",

@@ -122,7 +122,7 @@ You must respond with a JSON object (no markdown, no code fences):
 Guidelines:
 - questions: What gaps remain? What assumptions haven't been tested?
 - ontology_tensions: Where does the current ontology contradict itself or miss something?
-- should_continue: false ONLY if the ontology is complete and evaluation is fully satisfied
+- should_continue: Set to true if you generated ANY questions or tensions. Set to false ONLY if there are genuinely NO remaining questions AND the ontology is provably complete
 - reasoning: Brief explanation of why these questions/tensions matter
 
 Focus on ONTOLOGICAL questions (what IS the thing?) not implementation questions (how to code it)."""

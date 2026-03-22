@@ -40,7 +40,7 @@ Usage:
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
@@ -57,7 +57,7 @@ from ouroboros.core.security import (
 )
 
 
-class LogMode(str, Enum):
+class LogMode(StrEnum):
     """Logging output mode."""
 
     DEV = "dev"
@@ -129,28 +129,34 @@ def _setup_file_handler(config: LoggingConfig) -> TimedRotatingFileHandler | Non
         config: Logging configuration.
 
     Returns:
-        Configured TimedRotatingFileHandler or None if file logging disabled.
+        Configured TimedRotatingFileHandler or None if file logging is disabled
+        or the handler cannot be created.
     """
     if not config.enable_file_logging:
         return None
 
-    # Ensure log directory exists
-    config.log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # Ensure log directory exists
+        config.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create log file path with date
-    log_file = config.log_dir / "ouroboros.log"
+        # Create log file path with date
+        log_file = config.log_dir / "ouroboros.log"
 
-    # Configure rotating file handler
-    # - when="midnight" for daily rotation
-    # - backupCount controls retention
-    handler = TimedRotatingFileHandler(
-        filename=str(log_file),
-        when="midnight",
-        interval=1,
-        backupCount=config.max_log_days,
-        encoding="utf-8",
-        utc=True,
-    )
+        # Configure rotating file handler
+        # - when="midnight" for daily rotation
+        # - backupCount controls retention
+        handler = TimedRotatingFileHandler(
+            filename=str(log_file),
+            when="midnight",
+            interval=1,
+            backupCount=config.max_log_days,
+            encoding="utf-8",
+            utc=True,
+        )
+    except OSError:
+        # File logging should not break imports or test collection when the
+        # default log path is unavailable (for example in sandboxed CI).
+        return None
 
     # Set formatter based on mode
     if config.mode == LogMode.PROD:

@@ -155,10 +155,10 @@ AC 2 (complex)
 _try_decompose_ac() → ["Sub-AC 1: Add auth config", "Sub-AC 2: Create auth.py", "Sub-AC 3: Write tests"]
     |
     v
-_execute_sub_acs_parallel()
+_execute_sub_acs()
     |
     +-- Sub-AC 1 → Claude session → Edit config.py
-    +-- Sub-AC 2 → Claude session → Write auth.py      (parallel)
+    +-- Sub-AC 2 → Claude session → Write auth.py      (sequential)
     +-- Sub-AC 3 → Claude session → Write test_auth.py
     |
     v
@@ -298,7 +298,7 @@ what to watch out for — without having to rediscover the state from scratch.
 [7]     |   IF atomic:
          |      |   _execute_atomic_ac(ac) → Claude session with tools
          |      ELSE:
-         |      |   _execute_sub_acs_parallel(sub_acs) → N Claude sessions
+         |      |   _execute_sub_acs(sub_acs) → N Claude sessions (sequential)
          |      |
 [8]     |   → ACExecutionResult(messages, sub_results)
          |

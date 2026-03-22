@@ -14,8 +14,8 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import asdict, dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from ouroboros.observability.logging import get_logger
 
@@ -113,14 +113,17 @@ def build_context_prompt(level_contexts: list[LevelContext]) -> str:
         if text:
             sections.append(text)
 
-    if not sections:
+    has_reviews = any(ctx.coordinator_review for ctx in level_contexts)
+    if not sections and not has_reviews:
         return ""
 
-    result = (
-        "\n## Previous Work Context\n"
-        "The following ACs have already been completed. "
-        "Use this context to inform your work.\n\n" + "\n\n".join(sections) + "\n"
-    )
+    result = ""
+    if sections:
+        result = (
+            "\n## Previous Work Context\n"
+            "The following ACs have already been completed. "
+            "Use this context to inform your work.\n\n" + "\n\n".join(sections) + "\n"
+        )
 
     # Append coordinator review warnings if present
     for ctx in level_contexts:
@@ -173,7 +176,7 @@ def extract_level_context(
             if msg.tool_name:
                 tools_used.add(msg.tool_name)
                 # Extract file paths from Write/Edit tool inputs
-                if msg.tool_name in ("Write", "Edit"):
+                if msg.tool_name in ("Write", "Edit", "NotebookEdit"):
                     tool_input = msg.data.get("tool_input", {})
                     file_path = tool_input.get("file_path")
                     if file_path:
@@ -208,9 +211,92 @@ def extract_level_context(
     )
 
 
+def serialize_level_contexts(contexts: list[LevelContext]) -> list[dict[str, Any]]:
+    """Serialize level contexts for checkpoint storage.
+
+    Uses dataclasses.asdict() for complete, field-addition-safe serialization.
+    All nested types (ACContextSummary, CoordinatorReview, FileConflict) are
+    frozen dataclasses composed of primitives and tuples, so asdict() produces
+    a fully JSON-serializable dict tree (tuples become lists).
+    """
+    return [asdict(ctx) for ctx in contexts]
+
+
+def deserialize_level_contexts(data: list[dict[str, Any]]) -> list[LevelContext]:
+    """Deserialize level contexts from checkpoint data.
+
+    Reconstructs the typed dataclass tree, converting lists back to tuples
+    where the frozen dataclasses expect them. Tolerates missing/extra fields
+    from older/newer checkpoint schemas by using explicit field extraction
+    with defaults rather than dict-splatting.
+    """
+    from ouroboros.orchestrator.coordinator import CoordinatorReview, FileConflict
+
+    result: list[LevelContext] = []
+    for d in data:
+        review = None
+        if d.get("coordinator_review"):
+            rd = d["coordinator_review"]
+            try:
+                conflicts = tuple(
+                    FileConflict(
+                        file_path=fc.get("file_path", ""),
+                        ac_indices=tuple(fc.get("ac_indices", ())),
+                        resolved=fc.get("resolved", False),
+                        resolution_description=fc.get("resolution_description", ""),
+                    )
+                    for fc in rd.get("conflicts_detected", ())
+                )
+                review = CoordinatorReview(
+                    level_number=rd.get("level_number", 0),
+                    conflicts_detected=conflicts,
+                    review_summary=rd.get("review_summary", ""),
+                    fixes_applied=tuple(rd.get("fixes_applied", ())),
+                    warnings_for_next_level=tuple(rd.get("warnings_for_next_level", ())),
+                    duration_seconds=rd.get("duration_seconds", 0.0),
+                    session_id=rd.get("session_id"),
+                )
+            except Exception as e:
+                log.warning(
+                    "level_context.deserialize.review_skipped",
+                    error=str(e),
+                )
+                review = None
+
+        completed_acs: list[ACContextSummary] = []
+        for ac in d.get("completed_acs", ()):
+            try:
+                completed_acs.append(
+                    ACContextSummary(
+                        ac_index=ac.get("ac_index", 0),
+                        ac_content=ac.get("ac_content", ""),
+                        success=ac.get("success", False),
+                        tools_used=tuple(ac.get("tools_used", ())),
+                        files_modified=tuple(ac.get("files_modified", ())),
+                        key_output=ac.get("key_output", ""),
+                    )
+                )
+            except Exception as e:
+                log.warning(
+                    "level_context.deserialize.ac_skipped",
+                    error=str(e),
+                )
+
+        result.append(
+            LevelContext(
+                level_number=d.get("level_number", 0),
+                completed_acs=tuple(completed_acs),
+                coordinator_review=review,
+            )
+        )
+    return result
+
+
 __all__ = [
     "ACContextSummary",
     "LevelContext",
     "build_context_prompt",
+    "deserialize_level_contexts",
     "extract_level_context",
+    "serialize_level_contexts",
 ]

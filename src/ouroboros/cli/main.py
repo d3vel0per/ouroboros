@@ -14,7 +14,7 @@ from typing import Annotated
 import typer
 
 from ouroboros import __version__
-from ouroboros.cli.commands import config, init, mcp, run, status, tui
+from ouroboros.cli.commands import cancel, config, init, mcp, run, status, tui
 from ouroboros.cli.formatters import console
 
 # Create the main Typer app
@@ -30,15 +30,24 @@ app.add_typer(init.app, name="init")
 app.add_typer(run.app, name="run")
 app.add_typer(config.app, name="config")
 app.add_typer(status.app, name="status")
+app.add_typer(cancel.app, name="cancel")
 app.add_typer(mcp.app, name="mcp")
 app.add_typer(tui.app, name="tui")
 
 
 # Top-level convenience aliases
 @app.command(hidden=True)
-def monitor() -> None:
+def monitor(
+    backend: Annotated[
+        str,
+        typer.Option(
+            "--backend",
+            help="TUI backend to use: 'python' (default) or 'slt' (native binary).",
+        ),
+    ] = "python",
+) -> None:
     """Launch the TUI monitor (shorthand for 'ouroboros tui monitor')."""
-    tui.monitor_command()
+    tui.monitor_command(backend=backend)
 
 
 def version_callback(value: bool) -> None:

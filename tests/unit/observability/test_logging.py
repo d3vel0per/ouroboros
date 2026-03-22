@@ -176,6 +176,24 @@ class TestConfigureLogging:
         # Log directory should not be created if file logging disabled
         # (Only if it doesn't already exist)
 
+    def test_configure_falls_back_when_file_handler_cannot_be_created(
+        self, temp_log_dir: Path, capsys: Any
+    ) -> None:
+        """configure_logging falls back to console logging on file errors."""
+        config = LoggingConfig(log_dir=temp_log_dir, enable_file_logging=True)
+
+        with patch(
+            "ouroboros.observability.logging.TimedRotatingFileHandler",
+            side_effect=PermissionError("denied"),
+        ):
+            configure_logging(config)
+
+        log = get_logger()
+        log.info("test.console.fallback")
+
+        captured = capsys.readouterr()
+        assert "test.console.fallback" in captured.err
+
 
 class TestGetLogger:
     """Test get_logger function."""

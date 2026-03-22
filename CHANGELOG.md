@@ -82,12 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RoutingContext` - Complexity-aware routing with learning from history
 - `ScheduledTask` - Task wrapper with priority, dependencies, and timeout support
 
-**State Management (`ouroboros.plugin.state`)**
-- `StateStore` - Atomic JSON file storage with schema migrations
-- `StateManager` - Session persistence with checkpoint/recovery
-- `RecoveryManager` - Auto-resume hooks after interruptions
-- `StateCompression` - Smart context compression when approaching limits
-- Support for multiple modes: AUTOPILOT, RALPH, ULTRAWORK, ULTRAPILOT, ECOMODE, SWARM, PIPELINE
+**State Management**
+- Removed: `StateStore`, `StateManager`, `RecoveryManager`, `StateCompression` (dead code — all runtime state managed by EventStore/SQLite)
 
 **TUI HUD Components (`ouroboros.tui.components`)**
 - `AgentsPanel` - Real-time agent pool status visualization

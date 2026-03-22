@@ -25,8 +25,10 @@ When the user types any of these commands, read the corresponding SKILL.md file 
 | `ooo tutorial` | Read `skills/tutorial/SKILL.md` and follow it |
 | `ooo setup` | Read `skills/setup/SKILL.md` and follow it |
 | `ooo welcome` | Read `skills/welcome/SKILL.md` and follow it |
+| `ooo cancel` | Read `skills/cancel/SKILL.md` and follow it |
 | `ooo qa` or `ooo qa ...` | Read `skills/qa/SKILL.md` and follow it |
 | `ooo help` | Read `skills/help/SKILL.md` and follow it |
+| `ooo update` | Read `skills/update/SKILL.md` and follow it |
 
 **Important**: Do NOT use the Skill tool. Read the file with the Read tool and execute its instructions directly.
 
@@ -35,7 +37,7 @@ When the user types any of these commands, read the corresponding SKILL.md file 
 Custom agents are in `agents/`. When a skill references an agent (e.g., `ouroboros:socratic-interviewer`), read its definition from `agents/{name}.md` and adopt that role.
 
 <!-- ooo:START -->
-<!-- ooo:VERSION:0.20.0 -->
+<!-- ooo:VERSION:0.25.1 -->
 # Ouroboros — Specification-First AI Development
 
 > Before telling AI what to build, define what should be built.
@@ -74,6 +76,7 @@ Each command loads its agent/MCP on-demand. Details in each skill file.
 | `ooo tutorial` | Interactive hands-on learning |
 | `ooo setup` | — |
 | `ooo help` | — |
+| `ooo update` | PyPI version check + upgrade |
 
 ## Agents
 

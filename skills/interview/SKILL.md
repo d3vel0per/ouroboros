@@ -45,21 +45,39 @@ Compare the result with the current version in `.claude-plugin/plugin.json`.
   }
   ```
   - If "Update now":
-    1. Run `claude plugin update ouroboros` via Bash (update plugin/skills). If this fails, inform the user and stop — do NOT proceed to step 2.
-    2. Detect the user's Python package manager and upgrade the MCP server:
+    1. Run `claude plugin marketplace update ouroboros` via Bash (refresh marketplace index). If this fails, tell the user "⚠️ Marketplace refresh failed, continuing…" and proceed.
+    2. Run `claude plugin update ouroboros@ouroboros` via Bash (update plugin/skills). If this fails, inform the user and stop — do NOT proceed to step 3.
+    3. Detect the user's Python package manager and upgrade the MCP server:
        - Check which tool installed `ouroboros-ai` by running these in order:
          - `uv tool list 2>/dev/null | grep "^ouroboros-ai "` → if found, use `uv tool upgrade ouroboros-ai`
          - `pipx list 2>/dev/null | grep "^  ouroboros-ai "` → if found, use `pipx upgrade ouroboros-ai`
          - Otherwise, print: "Also upgrade the MCP server: `pip install --upgrade ouroboros-ai`" (do NOT run pip automatically)
-    3. Tell the user: "Updated! Restart Claude Code to apply, then run `ooo interview` again."
+    4. Tell the user: "Updated! Restart Claude Code to apply, then run `ooo interview` again."
   - If "Skip": proceed immediately.
 - If versions match, the check fails (network error, timeout, rate limit 403/429), or parsing fails/returns empty: **silently skip** and proceed.
 
 Then choose the execution path:
 
+### Step 0.5: Load MCP Tools (Required before Path A/B decision)
+
+The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before deciding between Path A and Path B.**
+
+1. Use the `ToolSearch` tool to find and load the interview MCP tool:
+   ```
+   ToolSearch query: "+ouroboros interview"
+   ```
+   This searches for tools with "ouroboros" in the name related to "interview".
+
+2. The tool will typically be named `mcp__plugin_ouroboros_ouroboros__ouroboros_interview` (with a plugin prefix). After ToolSearch returns, the tool becomes callable.
+
+3. If ToolSearch finds the tool → proceed to **Path A**.
+   If ToolSearch returns no matching tools → proceed to **Path B**.
+
+**IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
+
 ### Path A: MCP Mode (Preferred)
 
-If the `ouroboros_interview` MCP tool is available, use it for persistent, structured interviews:
+If the `ouroboros_interview` MCP tool is available (loaded via ToolSearch above), use it for persistent, structured interviews:
 
 1. **Start a new interview**:
    ```

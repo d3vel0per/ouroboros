@@ -45,7 +45,7 @@ from ouroboros.observability.logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+    from ouroboros.orchestrator.adapter import AgentRuntime
     from ouroboros.plugin.agents.registry import AgentSpec
 
 log = get_logger(__name__)
@@ -266,7 +266,7 @@ class AgentPool:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         registry: Any | None = None,
         config: AgentPoolConfig | None = None,
         event_store: Any | None = None,
@@ -274,7 +274,7 @@ class AgentPool:
         """Initialize the agent pool.
 
         Args:
-            adapter: Claude Agent adapter for execution.
+            adapter: Agent runtime for execution.
             registry: Optional AgentRegistry for agent lookup.
             config: Pool configuration.
             event_store: Optional event store for state tracking.

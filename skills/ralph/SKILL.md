@@ -18,7 +18,7 @@ ooo ralph "<your request>"
 
 ## How It Works
 
-Ralph mode includes parallel execution + automatic verification + persistence:
+Ralph mode includes parallel execution + automatic verification:
 
 1. **Execute** (parallel where possible)
    - Independent tasks run concurrently
@@ -34,73 +34,73 @@ Ralph mode includes parallel execution + automatic verification + persistence:
    - Fix issues
    - Repeat from step 1
 
-4. **Persist** (checkpoint)
-   - Save state after each iteration
-   - Resume capability if interrupted
-   - Full audit trail
-
 ## Instructions
 
 When the user invokes this skill:
 
 1. **Parse the request**: Extract what needs to be done
 
-2. **Initialize state**: Create `.omc/state/ralph-state.json`:
-   ```json
-   {
-     "mode": "ralph",
-     "session_id": "<uuid>",
-     "request": "<user request>",
-     "status": "running",
-     "iteration": 0,
-     "max_iterations": 10,
-     "last_checkpoint": null,
-     "verification_history": []
-   }
-   ```
+2. **Initialize loop**:
+   - Generate a session_id (UUID)
+   - Track iteration, verification_history in conversation context
+   - No file I/O needed — evolve_step stores all execution data in EventStore
 
-3. **Enter the loop**:
+4. **Enter the loop** (non-blocking background execution):
 
    ```
    while iteration < max_iterations:
-       # Execute with parallel agents via evolve_step
-       # QA is built into ouroboros_evolve_step — the response
-       # includes a "### QA Verdict" section automatically.
-       result = await evolve_step(lineage_id, seed_content, execute=true)
+       # Start evolve_step in background — returns immediately
+       job = await start_evolve_step(lineage_id, seed_content, execute=true)
+       job_id = job.meta["job_id"]
+       cursor = job.meta["cursor"]
+
+       # Poll for progress (non-blocking, shows intermediate state)
+       # Use timeout_seconds=60 to reduce context consumption
+       while not terminal:
+           wait_result = await job_wait(job_id, cursor, timeout_seconds=60)
+           cursor = wait_result.meta["cursor"]
+           status = wait_result.meta["status"]
+           # Report progress concisely (one line per poll)
+           terminal = status in ("completed", "failed", "cancelled")
+
+       # Fetch final result
+       result = await job_result(job_id)
 
        # Parse QA from evolve_step response text
        # (EvolveStepHandler runs QA internally and appends verdict)
        verification.passed = (qa_verdict == "pass")
        verification.score = qa_score
 
-       # Record in history
-       state.verification_history.append({
+       # Record in conversation context
+       verification_history.append({
            "iteration": iteration,
            "passed": verification.passed,
            "score": verification.score,
-           "verdict": qa_verdict,
-           "timestamp": <now>
+           "verdict": qa_verdict
        })
 
        if verification.passed:
-           # SUCCESS - persist final checkpoint
-           await save_checkpoint("complete")
+           # SUCCESS
            break
 
        # Failed - analyze and continue
        iteration += 1
-       await save_checkpoint("iteration_{iteration}")
 
        if iteration >= max_iterations:
            # Max iterations reached
            break
    ```
 
-4. **On termination**, display a 📍 next-step:
-   - **Success** (QA passed): `📍 Next: ooo evaluate for formal 3-stage verification`
-   - **Max iterations reached**: `📍 Next: ooo interview to re-examine the problem — or ooo unstuck to try a different approach`
+   **Tool mapping:**
+   - `start_evolve_step` = `ouroboros_start_evolve_step`
+   - `job_wait` = `ouroboros_job_wait`
+   - `job_result` = `ouroboros_job_result`
 
-5. **Report progress** each iteration:
+4. **On termination**, display a next-step:
+   - **Success** (QA passed): `Next: ooo evaluate for formal 3-stage verification`
+   - **Max iterations reached**: `Next: ooo interview to re-examine the problem — or ooo unstuck to try a different approach`
+
+6. **Report progress** each iteration:
    ```
    [Ralph Iteration <i>/<max>]
    Execution complete. Running QA...
@@ -117,20 +117,9 @@ When the user invokes this skill:
    ```
 
 6. **Handle interruption**:
-   - If user says "stop": save checkpoint, exit gracefully
-   - If user says "continue": reload from last checkpoint
-   - State persists across session resets
-
-## Persistence
-
-State includes:
-- Current iteration number
-- Verification history for all iterations
-- Last successful checkpoint
-- Issues found in each iteration
-- Execution context for resume
-
-Resume command: "continue ralph" or "ralph continue"
+   - If user says "stop": exit gracefully
+   - If user says "continue": call `ouroboros_query_events(aggregate_id=<lineage_id>)`
+     to reconstruct iteration history from EventStore
 
 ## The Boulder Never Stops
 
@@ -145,9 +134,12 @@ This is the key phrase. Ralph does not give up:
 User: ooo ralph fix all failing tests
 
 [Ralph Iteration 1/10]
-Executing in parallel...
-Fixing test failures...
-Running QA...
+Started background execution (job_abc123)
+Polling progress...
+  Phase: Executing | AC Progress: 1/3
+  Phase: Executing | AC Progress: 2/3
+  Phase: Executing | AC Progress: 3/3
+Execution complete. Fetching result...
 
 QA Verdict: REVISE (score: 0.65)
 Differences:
@@ -181,7 +173,6 @@ QA Verdict: PASS (score: 1.0)
 Ralph COMPLETE
 ==============
 Request: Fix all failing tests
-Duration: 8m 32s
 Iterations: 3
 
 QA History:
@@ -191,11 +182,5 @@ QA History:
 
 All tests passing. Build successful.
 
-📍 Next: `ooo evaluate` for formal 3-stage verification
+Next: `ooo evaluate` for formal 3-stage verification
 ```
-
-## Cancellation
-
-Cancel with `/ouroboros:cancel --force` to clear state.
-
-Standard `/ouroboros:cancel` saves checkpoint for resume.

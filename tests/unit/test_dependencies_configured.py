@@ -52,7 +52,7 @@ def test_dev_dependencies_configured():
 
 
 def test_python_version_constraint():
-    """Test that Python version is set to >=3.14."""
+    """Test that Python version is set to >=3.12."""
     root = Path(__file__).parent.parent.parent
     pyproject_path = root / "pyproject.toml"
 
@@ -60,4 +60,4 @@ def test_python_version_constraint():
     pyproject = tomllib.loads(content)
 
     python_version = pyproject["project"]["requires-python"]
-    assert python_version == ">=3.14", f"Python version should be '>=3.14', got '{python_version}'"
+    assert python_version == ">=3.12", f"Python version should be '>=3.12', got '{python_version}'"
