@@ -65,23 +65,48 @@ fi
 # 2. Detect runtimes
 EXTRAS=""
 RUNTIME=""
+HAS_CODEX=false
+HAS_CLAUDE=false
 if command -v codex &>/dev/null; then
   echo "  Codex:  $(which codex)"
-  RUNTIME="codex"
+  HAS_CODEX=true
 fi
 if command -v claude &>/dev/null; then
   echo "  Claude: $(which claude)"
-  EXTRAS="[claude]"
-  RUNTIME="${RUNTIME:-claude}"
+  HAS_CLAUDE=true
 fi
 
-if [ -z "$RUNTIME" ]; then
+if [ "$HAS_CODEX" = true ] && [ "$HAS_CLAUDE" = true ]; then
+  if [ -t 0 ]; then
+    echo
+    echo "Both Codex and Claude detected. Which runtime do you want to use?"
+    echo "  [1] Claude  (pip install ${PACKAGE_NAME}[claude])  ← recommended"
+    echo "  [2] Codex   (pip install ${PACKAGE_NAME})"
+    echo "  [3] All     (pip install ${PACKAGE_NAME}[all])"
+    read -rp "Select [1]: " choice
+    case "${choice:-1}" in
+      2) EXTRAS=""; RUNTIME="codex" ;;
+      3) EXTRAS="[all]"; RUNTIME="" ;;
+      *) EXTRAS="[claude]"; RUNTIME="claude" ;;
+    esac
+  else
+    # Pipe mode: default to claude when both exist
+    EXTRAS="[claude]"
+    RUNTIME="claude"
+  fi
+elif [ "$HAS_CLAUDE" = true ]; then
+  EXTRAS="[claude]"
+  RUNTIME="claude"
+elif [ "$HAS_CODEX" = true ]; then
+  EXTRAS=""
+  RUNTIME="codex"
+else
   if [ -t 0 ]; then
     # Interactive mode: ask the user
     echo
     echo "No runtime CLI detected. Which runtime will you use?"
-    echo "  [1] Codex   (pip install ${PACKAGE_NAME})"
-    echo "  [2] Claude  (pip install ${PACKAGE_NAME}[claude])"
+    echo "  [1] Claude  (pip install ${PACKAGE_NAME}[claude])  ← recommended"
+    echo "  [2] Codex   (pip install ${PACKAGE_NAME})"
     echo "  [3] All     (pip install ${PACKAGE_NAME}[all])"
     read -rp "Select [1]: " choice
   else
@@ -92,9 +117,9 @@ if [ -z "$RUNTIME" ]; then
   fi
   case "${choice:-1}" in
     0) EXTRAS=""; RUNTIME="" ;;
-    2) EXTRAS="[claude]"; RUNTIME="claude" ;;
+    2) EXTRAS=""; RUNTIME="codex" ;;
     3) EXTRAS="[all]"; RUNTIME="" ;;
-    *) EXTRAS=""; RUNTIME="codex" ;;
+    *) EXTRAS="[claude]"; RUNTIME="claude" ;;
   esac
 fi
 
