@@ -157,9 +157,6 @@ def count_tokens(text: str, model: str = "gpt-4") -> int:
     Returns:
         The number of tokens in the text.
     """
-    if litellm is None:
-        return len(text) // 4
-
     try:
         import litellm
 
