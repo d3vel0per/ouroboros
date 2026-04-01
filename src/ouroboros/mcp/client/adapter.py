@@ -289,26 +289,21 @@ class MCPClientAdapter:
     async def disconnect(self) -> Result[None, MCPClientError]:
         """Disconnect from the current MCP server.
 
+        Releases both the MCP session and the underlying transport context
+        manager in reverse acquisition order.  Always attempts to close both
+        resources even when one teardown raises.
+
         Returns:
             Result containing None on success or MCPClientError on failure.
         """
         if self._session is None and self._transport_cm is None:
             return Result.ok(None)
 
-        session = self._session
-        transport_cm = self._transport_cm
-        self._session = None
-        self._transport_cm = None
-        self._read_stream = None
-        self._write_stream = None
-        self._server_info = None
+        server_name = self._config.name if self._config else "unknown"
 
         try:
-            if session is not None:
-                await session.__aexit__(None, None, None)
-            if transport_cm is not None:
-                await transport_cm.__aexit__(None, None, None)
-            log.info("mcp.disconnected", server=self._config.name if self._config else "unknown")
+            await self._reset_connection_state()
+            log.info("mcp.disconnected", server=server_name)
             return Result.ok(None)
         except Exception as e:
             return Result.err(
