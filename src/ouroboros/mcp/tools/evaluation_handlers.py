@@ -408,12 +408,28 @@ class EvaluateHandler:
             )
             working_dir_str = arguments.get("working_dir")
             working_dir = Path(working_dir_str).resolve() if working_dir_str else Path.cwd()
+            log.info(
+                "mcp.tool.evaluate.started",
+                session_id=session_id,
+                artifact_type=artifact_type,
+                working_dir=str(working_dir),
+                llm_backend=self.llm_backend,
+                adapter_type=type(llm_adapter).__name__,
+            )
 
             # Collect file-based artifacts for richer semantic evaluation.
             # working_dir is used as the project root for artifact resolution.
             from ouroboros.evaluation.artifact_collector import ArtifactCollector
 
-            artifact_bundle = ArtifactCollector().collect(artifact, str(working_dir))
+            try:
+                artifact_bundle = ArtifactCollector().collect(artifact, str(working_dir))
+            except Exception as exc:
+                log.warning(
+                    "mcp.tool.evaluate.artifact_collection_failed",
+                    error=str(exc),
+                    working_dir=str(working_dir),
+                )
+                artifact_bundle = None
 
             context = EvaluationContext(
                 execution_id=session_id,
@@ -435,9 +451,21 @@ class EvaluateHandler:
             result = await pipeline.evaluate(context)
 
             if result.is_err:
+                rendered_error = (
+                    result.error.format_details()
+                    if hasattr(result.error, "format_details")
+                    else str(result.error)
+                )
+                log.warning(
+                    "mcp.tool.evaluate.pipeline_failed",
+                    session_id=session_id,
+                    working_dir=str(working_dir),
+                    llm_backend=self.llm_backend,
+                    error=rendered_error,
+                )
                 return Result.err(
                     MCPToolError(
-                        f"Evaluation failed: {result.error}",
+                        f"Evaluation failed: {rendered_error}",
                         tool_name="ouroboros_evaluate",
                     )
                 )
