@@ -45,7 +45,7 @@ from ouroboros.observability.logging import get_logger
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+    from ouroboros.orchestrator.adapter import AgentRuntime
     from ouroboros.plugin.agents.registry import AgentSpec
 
 log = get_logger(__name__)
@@ -244,9 +244,9 @@ class AgentPool:
 
     Example:
         from ouroboros.plugin.agents.pool import AgentPool
-        from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+        from ouroboros.orchestrator import create_agent_runtime
 
-        adapter = ClaudeAgentAdapter()
+        adapter = create_agent_runtime(backend="claude")
         pool = AgentPool(adapter=adapter)
         await pool.start()
 
@@ -266,7 +266,7 @@ class AgentPool:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         registry: Any | None = None,
         config: AgentPoolConfig | None = None,
         event_store: Any | None = None,
@@ -274,7 +274,7 @@ class AgentPool:
         """Initialize the agent pool.
 
         Args:
-            adapter: Claude Agent adapter for execution.
+            adapter: Agent runtime for execution.
             registry: Optional AgentRegistry for agent lookup.
             config: Pool configuration.
             event_store: Optional event store for state tracking.
@@ -645,6 +645,7 @@ class AgentPool:
         """
         start_time = time.time()
         messages: list[str] = []
+        result: TaskResult | None = None
 
         try:
             log.debug(
@@ -662,6 +663,7 @@ class AgentPool:
             ):
                 messages.append(msg.content)
                 agent_msg_count += 1
+                agent.last_activity = time.time()
 
                 # Callback for progress
                 if task.callback:
@@ -705,6 +707,27 @@ class AgentPool:
                 message_count=agent_msg_count,
             )
 
+        except asyncio.CancelledError:
+            agent.tasks_failed += 1
+            agent.error_message = "Task cancelled"
+
+            duration = time.time() - start_time
+            result = TaskResult(
+                task_id=task.id,
+                success=False,
+                error_message="Task cancelled",
+                messages=tuple(messages),
+                duration_seconds=duration,
+            )
+            self._task_results[task.id] = result
+
+            log.warning(
+                "agents.pool.task_cancelled",
+                agent_id=agent.id,
+                task_id=task.id,
+                duration_seconds=duration,
+            )
+            raise
         except Exception as e:
             # Failure
             agent.tasks_failed += 1
@@ -752,8 +775,8 @@ class AgentPool:
                 {
                     "task_id": task.id,
                     "agent_id": agent.id,
-                    "success": result.success,
-                    "duration_seconds": result.duration_seconds,
+                    "success": result.success if result is not None else False,
+                    "duration_seconds": result.duration_seconds if result is not None else 0.0,
                 },
             )
 
@@ -769,7 +792,7 @@ class AgentPool:
                 await asyncio.sleep(self._config.health_check_interval)
 
                 idle_count = sum(1 for a in self._agents.values() if a.state == AgentState.IDLE)
-                len(self._agents) - idle_count
+                busy_count = len(self._agents) - idle_count  # noqa: F841
                 queue_size = self._task_queue.qsize()
 
                 # Scale up if needed
@@ -849,9 +872,9 @@ class AgentPool:
                                 task_id=agent.current_task,
                                 idle_seconds=idle_time,
                             )
-                            # Reset agent state
-                            agent.state = AgentState.IDLE
-                            agent.current_task = None
+                            running_task = self._running_tasks.get(agent.current_task)
+                            if running_task is not None and not running_task.done():
+                                running_task.cancel()
 
             except Exception as e:
                 log.exception(

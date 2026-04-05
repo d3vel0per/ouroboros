@@ -14,10 +14,16 @@ Output: Modified prompt with skill suggestion appended
 
 import json
 from pathlib import Path
+import re
 import sys
 
 # Skills that work without MCP setup (bypass the setup gate)
-SETUP_BYPASS_SKILLS = ["/ouroboros:setup", "/ouroboros:help"]
+# qa has a built-in fallback that adopts the qa-judge agent directly
+SETUP_BYPASS_SKILLS = [
+    "/ouroboros:setup",
+    "/ouroboros:help",
+    "/ouroboros:qa",
+]
 
 # Keyword → skill mapping
 # "ooo <cmd>" prefix always works; natural language keywords also supported
@@ -35,8 +41,22 @@ KEYWORD_MAP = [
     {"patterns": ["ooo welcome"], "skill": "/ouroboros:welcome"},
     {"patterns": ["ooo setup"], "skill": "/ouroboros:setup"},
     {"patterns": ["ooo help"], "skill": "/ouroboros:help"},
-    {"patterns": ["ooo qa"], "skill": "/ouroboros:qa"},
+    {"patterns": ["ooo pm", "ooo prd"], "skill": "/ouroboros:pm"},
+    {"patterns": ["ooo qa", "qa check", "quality check"], "skill": "/ouroboros:qa"},
+    {"patterns": ["ooo cancel", "ooo abort"], "skill": "/ouroboros:cancel"},
+    {"patterns": ["ooo update", "ooo upgrade"], "skill": "/ouroboros:update"},
+    {"patterns": ["ooo brownfield"], "skill": "/ouroboros:brownfield"},
     # Natural language triggers
+    # PM triggers must precede generic interview to avoid "pm interview" being shadowed
+    {
+        "patterns": [
+            "write prd",
+            "pm interview",
+            "product requirements",
+            "create prd",
+        ],
+        "skill": "/ouroboros:pm",
+    },
     {
         "patterns": [
             "interview me",
@@ -90,6 +110,26 @@ KEYWORD_MAP = [
     },
     {"patterns": ["ouroboros setup", "setup ouroboros"], "skill": "/ouroboros:setup"},
     {"patterns": ["ouroboros help"], "skill": "/ouroboros:help"},
+    {
+        "patterns": ["update ouroboros", "upgrade ouroboros"],
+        "skill": "/ouroboros:update",
+    },
+    {
+        "patterns": [
+            "cancel execution",
+            "stop job",
+            "kill stuck",
+            "abort execution",
+        ],
+        "skill": "/ouroboros:cancel",
+    },
+    {
+        "patterns": [
+            "brownfield defaults",
+            "brownfield scan",
+        ],
+        "skill": "/ouroboros:brownfield",
+    },
 ]
 
 
@@ -116,13 +156,18 @@ def is_first_time() -> bool:
         return True
 
 
+def _word_boundary_match(pattern: str, text: str) -> bool:
+    """Match pattern using word boundaries to avoid false positives."""
+    return bool(re.search(r"(?:^|\b)" + re.escape(pattern) + r"(?:\b|$)", text))
+
+
 def detect_keywords(text: str) -> dict:
     """Detect keywords in user prompt text."""
     lower = text.lower().strip()
 
     for entry in KEYWORD_MAP:
         for pattern in entry["patterns"]:
-            if pattern in lower:
+            if _word_boundary_match(pattern, lower):
                 return {
                     "detected": True,
                     "keyword": pattern,

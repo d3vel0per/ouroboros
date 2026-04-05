@@ -333,6 +333,7 @@ class WorkflowProgressUpdated(Message):
         tool_calls_count: Total tool calls made.
         estimated_tokens: Estimated token usage.
         estimated_cost_usd: Estimated cost in USD.
+        last_update: Normalized artifact snapshot from the latest runtime message.
     """
 
     def __init__(
@@ -351,6 +352,7 @@ class WorkflowProgressUpdated(Message):
         tool_calls_count: int = 0,
         estimated_tokens: int = 0,
         estimated_cost_usd: float = 0.0,
+        last_update: dict[str, Any] | None = None,
     ) -> None:
         """Initialize WorkflowProgressUpdated message."""
         super().__init__()
@@ -368,6 +370,7 @@ class WorkflowProgressUpdated(Message):
         self.tool_calls_count = tool_calls_count
         self.estimated_tokens = estimated_tokens
         self.estimated_cost_usd = estimated_cost_usd
+        self.last_update = last_update or {}
 
 
 class SubtaskUpdated(Message):
@@ -654,6 +657,22 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             data=data,
         )
 
+    elif event_type == "orchestrator.session.cancelled":
+        return ExecutionUpdated(
+            execution_id=data.get("execution_id", event.aggregate_id),
+            session_id=event.aggregate_id,
+            status="cancelled",
+            data=data,
+        )
+
+    elif event_type == "execution.terminal":
+        return ExecutionUpdated(
+            execution_id=event.aggregate_id,
+            session_id=data.get("session_id", ""),
+            status=data.get("status", "completed"),
+            data=data,
+        )
+
     elif event_type == "execution.phase.completed":
         return PhaseChanged(
             execution_id=event.aggregate_id,
@@ -764,6 +783,7 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             tool_calls_count=data.get("tool_calls_count", 0),
             estimated_tokens=data.get("estimated_tokens", 0),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
+            last_update=data.get("last_update"),
         )
 
     elif event_type == "execution.subtask.updated":

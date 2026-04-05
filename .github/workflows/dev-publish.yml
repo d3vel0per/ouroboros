@@ -1,0 +1,81 @@
+name: Dev Publish
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/*-beta'
+    tags-ignore:
+      - 'v*'
+
+jobs:
+  dev-publish:
+    name: Publish Dev Build to PyPI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if dev version
+        id: check
+        run: |
+          # Skip if HEAD is exactly on a tag (release.yml handles that)
+          if git describe --exact-match HEAD 2>/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install uv
+        if: steps.check.outputs.skip == 'false'
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Sync plugin version
+        if: steps.check.outputs.skip == 'false'
+        run: python scripts/sync-plugin-version.py --write
+
+      - name: Build package
+        if: steps.check.outputs.skip == 'false'
+        id: build
+        run: |
+          uv build
+          VERSION=$(python -c "
+          import re, pathlib
+          for f in pathlib.Path('dist').iterdir():
+              if f.suffix == '.whl':
+                  m = re.match(r'[^-]+-([^-]+)-', f.name)
+                  if m: print(m.group(1))
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::📦 Dev version: $VERSION"
+
+      - name: Smoke test
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          uv pip install dist/*.whl --system
+          python -c "
+          import ouroboros
+          v = ouroboros.__version__
+          print(f'Runtime version: {v}')
+          assert 'dev' in v or 'unknown' not in v, f'Unexpected version: {v}'
+          "
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.skip == 'false'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          uv publish --check-url https://pypi.org/simple/ dist/*
+          echo "::notice::✅ Published ouroboros-ai==${{ steps.build.outputs.version }} to PyPI"
+          echo "::notice::Install: pip install ouroboros-ai==${{ steps.build.outputs.version }}"

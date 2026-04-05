@@ -71,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `ralph` - Self-referential loop with verifier verification (includes ultrawork)
   - `ultrapilot` - Parallel autopilot with file ownership partitioning
   - `ecomode` - Token-efficient execution using haiku and sonnet
-  - `swarm` - N coordinated agents using Claude Code native teams
+  - `swarm` - N coordinated agents using native runtime teams
   - `pipeline` - Sequential agent chaining with data passing
   - `tutorial` - Interactive guided tour for new users
   - `swarm` - Team coordination mode
@@ -82,12 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RoutingContext` - Complexity-aware routing with learning from history
 - `ScheduledTask` - Task wrapper with priority, dependencies, and timeout support
 
-**State Management (`ouroboros.plugin.state`)**
-- `StateStore` - Atomic JSON file storage with schema migrations
-- `StateManager` - Session persistence with checkpoint/recovery
-- `RecoveryManager` - Auto-resume hooks after interruptions
-- `StateCompression` - Smart context compression when approaching limits
-- Support for multiple modes: AUTOPILOT, RALPH, ULTRAWORK, ULTRAPILOT, ECOMODE, SWARM, PIPELINE
+**State Management**
+- Removed: `StateStore`, `StateManager`, `RecoveryManager`, `StateCompression` (dead code — all runtime state managed by EventStore/SQLite)
 
 **TUI HUD Components (`ouroboros.tui.components`)**
 - `AgentsPanel` - Real-time agent pool status visualization
@@ -228,7 +224,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resilience (Phase 3) - Stagnation detection and lateral thinking
 - Evaluation (Phase 4) - Mechanical, semantic, and consensus evaluation
 - Secondary Loop (Phase 5) - TODO registry and batch scheduler
-- Orchestrator (Epic 8) - Claude Agent SDK integration
+- Orchestrator (Epic 8) - Runtime abstraction and orchestration
 - CLI interface with Typer
 - Event sourcing with SQLite persistence
 - Structured logging with structlog

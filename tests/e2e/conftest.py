@@ -23,7 +23,7 @@ from ouroboros.core.seed import (
     Seed,
     SeedMetadata,
 )
-from ouroboros.orchestrator.adapter import AgentMessage
+from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
 from ouroboros.providers.base import CompletionConfig, CompletionResponse, Message, UsageInfo
 
 # =============================================================================
@@ -268,6 +268,18 @@ class MockClaudeAgentAdapter:
     _execution_count: int = field(default=0, init=False)
     _execution_history: list[dict[str, Any]] = field(default_factory=list, init=False)
 
+    @property
+    def runtime_backend(self) -> str:
+        return "claude"
+
+    @property
+    def working_directory(self) -> str | None:
+        return None
+
+    @property
+    def permission_mode(self) -> str | None:
+        return "default"
+
     def add_execution_sequence(self, messages: list[AgentMessage]) -> MockClaudeAgentAdapter:
         """Add a sequence of messages for a single execution."""
         self.message_sequences.append(messages)
@@ -320,6 +332,8 @@ class MockClaudeAgentAdapter:
         prompt: str,
         tools: list[str] | None = None,
         system_prompt: str | None = None,
+        cwd: str | None = None,
+        resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
     ) -> AsyncIterator[AgentMessage]:
         """Simulate Claude Agent execution."""
@@ -328,6 +342,8 @@ class MockClaudeAgentAdapter:
                 "prompt": prompt,
                 "tools": tools,
                 "system_prompt": system_prompt,
+                "cwd": cwd,
+                "resume_handle": resume_handle,
                 "resume_session_id": resume_session_id,
             }
         )

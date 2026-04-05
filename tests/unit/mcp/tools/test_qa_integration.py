@@ -10,12 +10,20 @@ Verifies that:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import yaml
+
+from ouroboros.core.seed import Seed
 from ouroboros.core.types import Result
+from ouroboros.evaluation.verification_artifacts import VerificationArtifacts
 from ouroboros.mcp.tools.definitions import EvolveStepHandler, ExecuteSeedHandler
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.adapter import DELEGATED_PARENT_CWD_ARG
+from ouroboros.orchestrator.session import SessionTracker
 
 # ---------------------------------------------------------------------------
 # Fixtures: minimal seed YAML
@@ -45,8 +53,38 @@ metadata:
   interview_id: null
 """
 
+VALID_SEED_YAML_WITH_RELATIVE_PRIMARY_REF = """\
+goal: Test task
+constraints:
+  - Python 3.14+
+acceptance_criteria:
+  - All tests pass
+  - No lint errors
+ontology_schema:
+  name: TestOntology
+  description: Test ontology
+  fields:
+    - name: test_field
+      field_type: string
+      description: A test field
+evaluation_principles: []
+exit_conditions: []
+metadata:
+  seed_id: test-seed-qa
+  version: "1.0.0"
+  created_at: "2024-01-01T00:00:00Z"
+  ambiguity_score: 0.1
+  interview_id: null
+brownfield_context:
+  project_type: brownfield
+  context_references:
+    - path: repo-root
+      role: primary
+      summary: ""
+"""
+
 # Fake QA result that QAHandler.handle() would return
-FAKE_QA_RESULT = Result.ok(
+FAKE_QA_RESULT: Result = Result.ok(
     MCPToolResult(
         content=(
             MCPContentItem(
@@ -86,9 +124,16 @@ FAKE_QA_RESULT = Result.ok(
     )
 )
 
+FAKE_VERIFICATION_ARTIFACTS = VerificationArtifacts(
+    artifact="Structured verification artifact",
+    reference="Raw verification reference",
+    artifact_dir="/tmp/ouroboros-artifacts/exec-test",
+    manifest_path="/tmp/ouroboros-artifacts/exec-test/manifest.json",
+)
+
 
 # ---------------------------------------------------------------------------
-# ExecuteSeedHandler tests
+# ExecuteSeedHandler tests — new background launch pattern
 # ---------------------------------------------------------------------------
 
 
@@ -105,24 +150,48 @@ class FakeExecResult:
     summary: dict = field(default_factory=dict)
 
 
+def _make_prepared_tracker() -> SessionTracker:
+    return SessionTracker.create("exec-test", "test-seed-qa", session_id="sess-test")
+
+
+def _make_seed() -> Seed:
+    return Seed.from_dict(yaml.safe_load(VALID_SEED_YAML))
+
+
 class TestExecuteSeedHandlerQA:
-    """Test QA integration in ExecuteSeedHandler."""
+    """Test QA integration in ExecuteSeedHandler.
+
+    The new handler returns immediately with a 'LAUNCHED' response and runs
+    execution + QA in a background task.  Tests must await those background
+    tasks to verify QA behaviour.
+    """
 
     async def test_qa_called_on_success(self) -> None:
-        """QA is called after successful execution and result includes verdict."""
+        """QA is called in background after successful execution."""
         handler = ExecuteSeedHandler()
 
-        fake_exec = FakeExecResult()
-        mock_runner = AsyncMock()
-        mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+        fake_exec = FakeExecResult(
+            summary={
+                "verification_report": "### AC 1: [PASS] All tests pass\nResult:\nDetailed proof"
+            }
+        )
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
 
         with (
-            patch("ouroboros.mcp.tools.definitions.ClaudeAgentAdapter"),
-            patch("ouroboros.mcp.tools.definitions.EventStore") as mock_es_cls,
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
             patch(
-                "ouroboros.mcp.tools.definitions.OrchestratorRunner",
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
                 return_value=mock_runner,
             ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
             patch(
                 "ouroboros.mcp.tools.qa.QAHandler.handle",
                 new_callable=AsyncMock,
@@ -132,40 +201,150 @@ class TestExecuteSeedHandlerQA:
             mock_es_cls.return_value.initialize = AsyncMock()
 
             result = await handler.handle({"seed_content": VALID_SEED_YAML})
+            # Drain background tasks so QA runs
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
 
         assert result.is_ok, f"Expected ok, got: {result.error}"
+        assert "Seed Execution LAUNCHED" in result.value.text_content
 
-        # QA handler was called
+        # QA handler was called in background
         mock_qa_handle.assert_awaited_once()
         qa_args = mock_qa_handle.call_args[0][0]
+        mock_verification.assert_awaited_once_with(
+            fake_exec.execution_id,
+            fake_exec.summary["verification_report"],
+            Path.cwd(),
+        )
+        assert qa_args["artifact"] == "Structured verification artifact"
+        assert qa_args["reference"] == "Raw verification reference"
         assert qa_args["artifact_type"] == "test_output"
         assert "All tests pass" in qa_args["quality_bar"]
         assert "No lint errors" in qa_args["quality_bar"]
 
-        # Response text includes QA verdict
-        text = result.value.content[0].text
-        assert "QA Verdict" in text
-        assert "Score: 0.85" in text
+    async def test_qa_uses_delegated_parent_cwd_for_verification(self) -> None:
+        """Delegated execute_seed should verify in the inherited parent cwd."""
+        handler = ExecuteSeedHandler()
+        delegated_cwd = Path("/tmp/delegated-parent-cwd")
 
-        # Meta includes QA
-        assert "qa" in result.value.meta
-        assert result.value.meta["qa"]["score"] == 0.85
-        assert result.value.meta["qa"]["verdict"] == "pass"
+        fake_exec = FakeExecResult(
+            summary={
+                "verification_report": "### AC 1: [PASS] All tests pass\nResult:\nDetailed proof"
+            }
+        )
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
+
+        with (
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
+                return_value=mock_runner,
+            ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ),
+        ):
+            mock_es_cls.return_value.initialize = AsyncMock()
+
+            result = await handler.handle(
+                {
+                    "seed_content": VALID_SEED_YAML,
+                    DELEGATED_PARENT_CWD_ARG: str(delegated_cwd),
+                }
+            )
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
+
+        assert result.is_ok
+        mock_verification.assert_awaited_once_with(
+            fake_exec.execution_id,
+            fake_exec.summary["verification_report"],
+            delegated_cwd.resolve(),
+        )
+
+    async def test_qa_resolves_relative_seed_project_dir_against_dispatch_cwd(self) -> None:
+        """Relative seed paths should resolve against the dispatched execution cwd."""
+        handler = ExecuteSeedHandler()
+        dispatch_cwd = Path("/tmp/dispatch-root")
+
+        fake_exec = FakeExecResult(
+            summary={
+                "verification_report": "### AC 1: [PASS] All tests pass\nResult:\nDetailed proof"
+            }
+        )
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
+
+        with (
+            patch("ouroboros.mcp.tools.execution_handlers.Path.cwd", return_value=dispatch_cwd),
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
+                return_value=mock_runner,
+            ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ),
+        ):
+            mock_es_cls.return_value.initialize = AsyncMock()
+
+            result = await handler.handle(
+                {
+                    "seed_content": VALID_SEED_YAML_WITH_RELATIVE_PRIMARY_REF,
+                }
+            )
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
+
+        assert result.is_ok
+        mock_verification.assert_awaited_once_with(
+            fake_exec.execution_id,
+            fake_exec.summary["verification_report"],
+            (dispatch_cwd / "repo-root").resolve(),
+        )
 
     async def test_skip_qa_bypasses_qa(self) -> None:
-        """skip_qa=True prevents QA from running."""
+        """skip_qa=True prevents QA from running in background."""
         handler = ExecuteSeedHandler()
 
         fake_exec = FakeExecResult()
-        mock_runner = AsyncMock()
-        mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
 
         with (
-            patch("ouroboros.mcp.tools.definitions.ClaudeAgentAdapter"),
-            patch("ouroboros.mcp.tools.definitions.EventStore") as mock_es_cls,
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
             patch(
-                "ouroboros.mcp.tools.definitions.OrchestratorRunner",
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
                 return_value=mock_runner,
+            ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
             ),
             patch(
                 "ouroboros.mcp.tools.qa.QAHandler.handle",
@@ -174,31 +353,34 @@ class TestExecuteSeedHandlerQA:
         ):
             mock_es_cls.return_value.initialize = AsyncMock()
 
-            result = await handler.handle(
-                {
-                    "seed_content": VALID_SEED_YAML,
-                    "skip_qa": True,
-                }
-            )
+            result = await handler.handle({"seed_content": VALID_SEED_YAML, "skip_qa": True})
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
 
         assert result.is_ok
         mock_qa_handle.assert_not_awaited()
-        assert "qa" not in result.value.meta
 
     async def test_qa_not_called_on_failure(self) -> None:
         """QA is not called when execution fails."""
         handler = ExecuteSeedHandler()
 
         fake_exec = FakeExecResult(success=False, final_message="Build failed")
-        mock_runner = AsyncMock()
-        mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
 
         with (
-            patch("ouroboros.mcp.tools.definitions.ClaudeAgentAdapter"),
-            patch("ouroboros.mcp.tools.definitions.EventStore") as mock_es_cls,
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
             patch(
-                "ouroboros.mcp.tools.definitions.OrchestratorRunner",
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
                 return_value=mock_runner,
+            ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
             ),
             patch(
                 "ouroboros.mcp.tools.qa.QAHandler.handle",
@@ -208,28 +390,38 @@ class TestExecuteSeedHandlerQA:
             mock_es_cls.return_value.initialize = AsyncMock()
 
             result = await handler.handle({"seed_content": VALID_SEED_YAML})
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
 
-        assert result.is_ok  # returns ok with is_error=True in MCPToolResult
+        assert result.is_ok
+        # QA should NOT be called because execution failed
         mock_qa_handle.assert_not_awaited()
 
     async def test_qa_failure_degrades_gracefully(self) -> None:
-        """If QA handler returns error, execution result is still returned."""
+        """If QA handler raises, background task does not crash."""
         handler = ExecuteSeedHandler()
 
         fake_exec = FakeExecResult()
-        mock_runner = AsyncMock()
-        mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner = MagicMock()
+        mock_runner.prepare_session = AsyncMock(return_value=Result.ok(_make_prepared_tracker()))
+        mock_runner.execute_precreated_session = AsyncMock(return_value=Result.ok(fake_exec))
+        mock_runner.resume_session = AsyncMock()
 
         from ouroboros.mcp.errors import MCPToolError
 
-        qa_error = Result.err(MCPToolError("LLM failed", tool_name="ouroboros_qa"))
+        qa_error: Result = Result.err(MCPToolError("LLM failed", tool_name="ouroboros_qa"))
 
         with (
-            patch("ouroboros.mcp.tools.definitions.ClaudeAgentAdapter"),
-            patch("ouroboros.mcp.tools.definitions.EventStore") as mock_es_cls,
+            patch("ouroboros.mcp.tools.execution_handlers.create_agent_runtime"),
+            patch("ouroboros.mcp.tools.execution_handlers.EventStore") as mock_es_cls,
             patch(
-                "ouroboros.mcp.tools.definitions.OrchestratorRunner",
+                "ouroboros.mcp.tools.execution_handlers.OrchestratorRunner",
                 return_value=mock_runner,
+            ),
+            patch(
+                "ouroboros.mcp.tools.execution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
             ),
             patch(
                 "ouroboros.mcp.tools.qa.QAHandler.handle",
@@ -240,11 +432,13 @@ class TestExecuteSeedHandlerQA:
             mock_es_cls.return_value.initialize = AsyncMock()
 
             result = await handler.handle({"seed_content": VALID_SEED_YAML})
+            # Background task should complete without raising
+            background_tasks = tuple(handler._background_tasks)
+            await asyncio.gather(*background_tasks)
 
-        # Execution result is still returned successfully, just without QA
+        # Immediate response is still LAUNCHED (not affected by QA failure)
         assert result.is_ok
-        assert "qa" not in result.value.meta
-        assert "Seed Execution SUCCESS" in result.value.content[0].text
+        assert "Seed Execution LAUNCHED" in result.value.text_content
 
     def test_derive_quality_bar(self) -> None:
         """_derive_quality_bar extracts AC from seed."""
@@ -277,11 +471,12 @@ class FakeEvalSummary:
     score = 0.90
     drift_score = 0.05
     failure_reason = None
-    ac_results = []
+    ac_results: list[str] = []
 
 
 class FakeGeneration:
     generation_number = 3
+    seed = _make_seed()
     phase = MagicMock(value="reflect")
     execution_output = "All 5 tests passed."
     evaluation_summary = FakeEvalSummary()
@@ -303,22 +498,41 @@ class FakeStepResult:
     next_generation = 4
 
 
+def _make_mock_loop(project_dir: str | None = None) -> AsyncMock:
+    mock_loop = AsyncMock()
+    mock_loop.event_store.initialize = AsyncMock()
+    mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+    mock_loop.set_project_dir = MagicMock(return_value="project-dir-token")
+    mock_loop.get_project_dir = MagicMock(return_value=project_dir)
+    mock_loop.reset_project_dir = MagicMock()
+    return mock_loop
+
+
 class TestEvolveStepHandlerQA:
     """Test QA integration in EvolveStepHandler."""
 
     async def test_qa_called_on_continue_with_execute(self) -> None:
         """QA is called when action=continue and execute=True."""
-        mock_loop = AsyncMock()
-        mock_loop.event_store.initialize = AsyncMock()
-        mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+        mock_loop = _make_mock_loop()
 
         handler = EvolveStepHandler(evolutionary_loop=mock_loop)
 
-        with patch(
-            "ouroboros.mcp.tools.qa.QAHandler.handle",
-            new_callable=AsyncMock,
-            return_value=FAKE_QA_RESULT,
-        ) as mock_qa:
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ) as mock_qa,
+        ):
             result = await handler.handle(
                 {
                     "lineage_id": "lin_test",
@@ -329,6 +543,14 @@ class TestEvolveStepHandlerQA:
 
         assert result.is_ok, f"Expected ok, got: {result.error}"
         mock_qa.assert_awaited_once()
+        mock_verification.assert_awaited_once_with(
+            "lin_test-gen-3",
+            FakeGeneration.execution_output,
+            Path.cwd(),
+        )
+        qa_args = mock_qa.call_args[0][0]
+        assert qa_args["artifact"] == "Structured verification artifact"
+        assert qa_args["reference"] == "Raw verification reference"
 
         # QA verdict in text
         text = result.value.content[0].text
@@ -339,18 +561,64 @@ class TestEvolveStepHandlerQA:
         assert "qa" in result.value.meta
         assert result.value.meta["qa"]["score"] == 0.85
 
+    async def test_qa_resolves_relative_loop_project_dir_against_cwd(self) -> None:
+        """Relative configured loop dirs should resolve against a stable cwd base."""
+        mock_loop = _make_mock_loop(project_dir="relative-project")
+        handler = EvolveStepHandler(evolutionary_loop=mock_loop)
+        fake_cwd = Path("/tmp/evolve-root")
+
+        with (
+            patch("ouroboros.mcp.tools.evolution_handlers.Path.cwd", return_value=fake_cwd),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ),
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "lin_test",
+                    "execute": True,
+                }
+            )
+
+        assert result.is_ok
+        mock_verification.assert_awaited_once_with(
+            "lin_test-gen-3",
+            FakeGeneration.execution_output,
+            (fake_cwd / "relative-project").resolve(),
+        )
+
     async def test_skip_qa_bypasses_evolve_qa(self) -> None:
         """skip_qa=True prevents QA in evolve_step."""
-        mock_loop = AsyncMock()
-        mock_loop.event_store.initialize = AsyncMock()
-        mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+        mock_loop = _make_mock_loop()
 
         handler = EvolveStepHandler(evolutionary_loop=mock_loop)
 
-        with patch(
-            "ouroboros.mcp.tools.qa.QAHandler.handle",
-            new_callable=AsyncMock,
-        ) as mock_qa:
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+            ) as mock_qa,
+        ):
             result = await handler.handle(
                 {
                     "lineage_id": "lin_test",
@@ -365,16 +633,21 @@ class TestEvolveStepHandlerQA:
 
     async def test_no_qa_when_execute_false(self) -> None:
         """QA is not called when execute=False (ontology-only mode)."""
-        mock_loop = AsyncMock()
-        mock_loop.event_store.initialize = AsyncMock()
-        mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+        mock_loop = _make_mock_loop()
 
         handler = EvolveStepHandler(evolutionary_loop=mock_loop)
 
-        with patch(
-            "ouroboros.mcp.tools.qa.QAHandler.handle",
-            new_callable=AsyncMock,
-        ) as mock_qa:
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+            ) as mock_qa,
+        ):
             result = await handler.handle(
                 {
                     "lineage_id": "lin_test",
@@ -387,17 +660,26 @@ class TestEvolveStepHandlerQA:
 
     async def test_qa_uses_seed_ac_for_quality_bar(self) -> None:
         """When seed is provided, QA quality bar is derived from AC."""
-        mock_loop = AsyncMock()
-        mock_loop.event_store.initialize = AsyncMock()
-        mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+        mock_loop = _make_mock_loop()
 
         handler = EvolveStepHandler(evolutionary_loop=mock_loop)
 
-        with patch(
-            "ouroboros.mcp.tools.qa.QAHandler.handle",
-            new_callable=AsyncMock,
-            return_value=FAKE_QA_RESULT,
-        ) as mock_qa:
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ) as mock_qa,
+        ):
             await handler.handle(
                 {
                     "lineage_id": "lin_test",
@@ -412,17 +694,26 @@ class TestEvolveStepHandlerQA:
 
     async def test_qa_without_seed_uses_default_bar(self) -> None:
         """Without seed, QA uses default quality bar."""
-        mock_loop = AsyncMock()
-        mock_loop.event_store.initialize = AsyncMock()
-        mock_loop.evolve_step = AsyncMock(return_value=Result.ok(FakeStepResult()))
+        mock_loop = _make_mock_loop()
 
         handler = EvolveStepHandler(evolutionary_loop=mock_loop)
 
-        with patch(
-            "ouroboros.mcp.tools.qa.QAHandler.handle",
-            new_callable=AsyncMock,
-            return_value=FAKE_QA_RESULT,
-        ) as mock_qa:
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ) as mock_qa,
+        ):
             await handler.handle(
                 {
                     "lineage_id": "lin_test",
@@ -432,3 +723,40 @@ class TestEvolveStepHandlerQA:
 
         qa_args = mock_qa.call_args[0][0]
         assert "improve upon previous" in qa_args["quality_bar"]
+
+    async def test_qa_uses_loop_project_dir_for_gen2_without_seed_content(self) -> None:
+        """Gen2+ evolve_step should verify in the loop project dir."""
+        project_dir = "/tmp/gen2-project"
+        mock_loop = _make_mock_loop(project_dir=project_dir)
+
+        handler = EvolveStepHandler(evolutionary_loop=mock_loop)
+
+        with (
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.build_verification_artifacts",
+                new_callable=AsyncMock,
+                return_value=FAKE_VERIFICATION_ARTIFACTS,
+            ) as mock_verification,
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.mcp.tools.qa.QAHandler.handle",
+                new_callable=AsyncMock,
+                return_value=FAKE_QA_RESULT,
+            ),
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "lin_test",
+                    "execute": True,
+                }
+            )
+
+        assert result.is_ok
+        mock_verification.assert_awaited_once_with(
+            "lin_test-gen-3",
+            FakeGeneration.execution_output,
+            Path(project_dir).resolve(),
+        )

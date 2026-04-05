@@ -13,6 +13,7 @@ from ouroboros.tui.events import (
     PhaseChanged,
     ResumeRequested,
     TUIState,
+    WorkflowProgressUpdated,
     create_message_from_event,
 )
 
@@ -353,6 +354,35 @@ class TestCreateMessageFromEvent:
         assert msg.combined_drift == 0.12
         assert msg.is_acceptable is True
 
+    def test_workflow_progress_event_preserves_last_update(self) -> None:
+        """Workflow progress events should retain the normalized latest artifact snapshot."""
+        event = BaseEvent(
+            type="workflow.progress.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "acceptance_criteria": [],
+                "completed_count": 1,
+                "total_count": 3,
+                "last_update": {
+                    "message_type": "tool_result",
+                    "content_preview": "Tool completed successfully.",
+                    "tool_name": "Edit",
+                    "ac_tracking": {"started": [], "completed": [1]},
+                },
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, WorkflowProgressUpdated)
+        assert msg.last_update == {
+            "message_type": "tool_result",
+            "content_preview": "Tool completed successfully.",
+            "tool_name": "Edit",
+            "ac_tracking": {"started": [], "completed": [1]},
+        }
+
     def test_ac_event(self) -> None:
         """Test converting AC-related events."""
         event = BaseEvent(
@@ -405,6 +435,38 @@ class TestCreateMessageFromEvent:
         assert msg.total_tokens == 0
         assert msg.total_cost_usd == 0.0
         assert msg.tokens_this_phase == 0
+
+    def test_session_cancelled_event(self) -> None:
+        """Test converting session.cancelled event to ExecutionUpdated with cancelled status."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456", "reason": "user_request"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_456"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "cancelled"
+        assert msg.data["reason"] == "user_request"
+
+    def test_session_cancelled_event_without_execution_id(self) -> None:
+        """Test cancelled event falls back to aggregate_id when execution_id missing."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"reason": "stale_cleanup"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "sess_123"
+        assert msg.status == "cancelled"
 
     def test_unhandled_event_returns_none(self) -> None:
         """Test that unhandled event types return None."""

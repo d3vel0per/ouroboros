@@ -19,6 +19,7 @@ from ouroboros.bigbang.ambiguity import (
     is_ready_for_seed,
 )
 from ouroboros.bigbang.interview import InterviewRound, InterviewState
+from ouroboros.config.loader import get_clarification_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.providers.base import CompletionResponse, UsageInfo
@@ -305,7 +306,7 @@ class TestAmbiguityScorerInit:
         scorer = AmbiguityScorer(llm_adapter=mock_adapter)
 
         assert scorer.llm_adapter == mock_adapter
-        assert scorer.model == "claude-opus-4-6"
+        assert scorer.model == get_clarification_model()
         assert scorer.temperature == SCORING_TEMPERATURE
         assert scorer.initial_max_tokens == 2048
         assert scorer.max_retries == 10  # Default to 10 retries
@@ -664,6 +665,68 @@ class TestAmbiguityScorerParseResponse:
 
         with pytest.raises(ValueError, match="Missing required field"):
             scorer._parse_scoring_response(response)
+
+    def test_parse_response_missing_success_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing success justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.9, "goal_clarity_justification": "Good goal.", '
+            '"constraint_clarity_score": 0.8, "constraint_clarity_justification": '
+            '"Clear constraints.", "success_criteria_clarity_score": 0.7}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response)
+
+        assert breakdown.success_criteria_clarity.clarity_score == 0.7
+        assert (
+            breakdown.success_criteria_clarity.justification
+            == "Success Criteria Clarity justification not provided by model."
+        )
+
+    def test_parse_response_missing_goal_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing goal justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.85, "constraint_clarity_score": 0.75, '
+            '"constraint_clarity_justification": "Good constraints.", '
+            '"success_criteria_clarity_score": 0.65, '
+            '"success_criteria_clarity_justification": "Clear criteria."}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response)
+
+        assert breakdown.goal_clarity.clarity_score == 0.85
+        assert (
+            breakdown.goal_clarity.justification
+            == "Goal Clarity justification not provided by model."
+        )
+
+    def test_parse_brownfield_response_missing_context_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing brownfield context justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.9, "goal_clarity_justification": "Good goal.", '
+            '"constraint_clarity_score": 0.8, "constraint_clarity_justification": '
+            '"Clear constraints.", "success_criteria_clarity_score": 0.7, '
+            '"success_criteria_clarity_justification": "Clear criteria.", '
+            '"context_clarity_score": 0.6}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response, is_brownfield=True)
+
+        assert breakdown.context_clarity is not None
+        assert breakdown.context_clarity.clarity_score == 0.6
+        assert breakdown.context_clarity.weight == 0.15
+        assert (
+            breakdown.context_clarity.justification
+            == "Context Clarity justification not provided by model."
+        )
 
     def test_parse_response_invalid_json(self) -> None:
         """_parse_scoring_response raises error for invalid JSON."""
@@ -1087,3 +1150,202 @@ class TestMaxTokenLimit:
         assert configs[0].max_tokens == 4096
         assert configs[1].max_tokens == 8192  # Doubled
         assert configs[2].max_tokens == 16384  # Doubled again, no cap
+
+
+class TestAmbiguityScorerAdditionalContext:
+    """Test AmbiguityScorer.score() additional_context parameter."""
+
+    async def test_score_accepts_additional_context_param(self) -> None:
+        """score() accepts additional_context string parameter."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(
+                    content=create_valid_scoring_response(
+                        goal_score=0.9,
+                        constraint_score=0.85,
+                        success_score=0.8,
+                    )
+                )
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        result = await scorer.score(
+            state,
+            additional_context="Decide-later: What database should we use?",
+        )
+
+        assert result.is_ok
+        assert isinstance(result.value, AmbiguityScore)
+
+    async def test_score_additional_context_included_in_prompt(self) -> None:
+        """additional_context text appears in the user prompt sent to the LLM."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(
+            state,
+            additional_context="Decide-later items:\n- What caching strategy?\n- Which auth provider?",
+        )
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+
+        assert "What caching strategy?" in user_message
+        assert "Which auth provider?" in user_message
+        assert "intentional deferrals" in user_message
+
+    async def test_score_empty_additional_context_not_in_prompt(self) -> None:
+        """Empty additional_context does not add deferral section to prompt."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(state, additional_context="")
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+
+        assert "intentional deferrals" not in user_message
+
+    async def test_score_default_additional_context_is_empty(self) -> None:
+        """Default additional_context is empty string (backward compatible)."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        # Call without additional_context — should work as before
+        result = await scorer.score(state)
+
+        assert result.is_ok
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+        assert "intentional deferrals" not in user_message
+
+    async def test_score_system_prompt_contains_deferral_instruction(self) -> None:
+        """System prompt instructs LLM not to penalise intentional deferrals."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(
+            state,
+            additional_context="Decide-later: What database?",
+        )
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        system_message = messages[0].content
+
+        assert "intentional deferrals" in system_message.lower() or "INTENTIONAL" in system_message
+        assert "penali" in system_message.lower()  # "penalise" or "penalize"
+
+    async def test_score_decide_later_items_no_penalty(self) -> None:
+        """Decide-later items passed as additional_context produce same score as without.
+
+        This verifies the *mechanism* — the scorer passes the decide-later context
+        to the LLM with the no-penalty instruction. The LLM's actual behaviour
+        is tested by the system prompt assertions above; here we verify the score
+        calculation itself is unaffected (no code-level penalty).
+        """
+        mock_adapter = MagicMock()
+        # Same high scores regardless of decide-later items
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(
+                    content=create_valid_scoring_response(
+                        goal_score=0.9,
+                        constraint_score=0.85,
+                        success_score=0.8,
+                    )
+                )
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        # Score without additional context
+        result_without = await scorer.score(state)
+        # Score with decide-later context
+        result_with = await scorer.score(
+            state,
+            additional_context="Decide-later items:\n- What database?\n- Which cloud provider?",
+        )
+
+        assert result_without.is_ok
+        assert result_with.is_ok
+        # The code-level calculation is identical — no programmatic penalty
+        assert result_without.value.overall_score == result_with.value.overall_score
+
+    async def test_score_additional_context_with_brownfield(self) -> None:
+        """additional_context works correctly with is_brownfield=True."""
+        mock_adapter = MagicMock()
+        import json
+
+        brownfield_response = json.dumps(
+            {
+                "goal_clarity_score": 0.9,
+                "goal_clarity_justification": "Clear goal.",
+                "constraint_clarity_score": 0.85,
+                "constraint_clarity_justification": "Clear constraints.",
+                "success_criteria_clarity_score": 0.8,
+                "success_criteria_clarity_justification": "Clear criteria.",
+                "context_clarity_score": 0.75,
+                "context_clarity_justification": "Good context.",
+            }
+        )
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(create_mock_completion_response(content=brownfield_response))
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        result = await scorer.score(
+            state,
+            is_brownfield=True,
+            additional_context="Decide-later: Which deployment strategy?",
+        )
+
+        assert result.is_ok
+
+        # Verify both additional_context and brownfield context in prompt
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+        system_message = messages[0].content
+
+        assert "Which deployment strategy?" in user_message
+        assert "Context Clarity" in system_message

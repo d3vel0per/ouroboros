@@ -1,55 +1,60 @@
 [project]
 name = "ouroboros-ai"
 dynamic = ["version"]
-description = "Self-Improving AI Workflow System"
+description = "Specification-first workflow engine for AI coding agents. Works with Claude Code and Codex CLI."
 readme = "README.md"
 authors = [
     { name = "Q00", email = "jqyu.lee@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.20.0",
-    "anthropic>=0.52.0",
-    "cachetools>=5.0.0",
-    "claude-agent-sdk>=0.1.0",
-    "filelock>=3.13.0",
-    "httpx>=0.27.0",
-    "litellm>=1.80.0",
-    "mcp>=1.26.0",
-    "prompt-toolkit>=3.0.0",
     "pydantic>=2.0.0",
-    "python-dotenv>=1.2.1",
     "pyyaml>=6.0.0",
     "rich>=13.0.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "stamina>=25.1.0",
     "structlog>=24.0.0",
-    "textual>=1.0.0",
     "typer>=0.12.0",
 ]
 
 [project.optional-dependencies]
-dashboard = [
-    "streamlit>=1.40.0",
-    "plotly>=5.24.0",
-    "pandas>=2.2.0",
-]
+claude = ["claude-agent-sdk>=0.1.0", "anthropic>=0.52.0"]
+litellm = ["litellm>=1.80.0,<=1.82.6"]
+mcp = ["mcp>=1.26.0"]
+tui = ["textual>=1.0.0"]
+all = ["ouroboros-ai[claude,litellm,mcp,tui]"]
 
 [project.scripts]
 ouroboros = "ouroboros.cli.main:app"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "src/ouroboros/__init__.py"
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ouroboros/_version.py"
+
+[tool.hatch.build]
+exclude = [
+    "/.smoke-home",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ouroboros"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"skills" = "ouroboros/codex/skills"
+
 [dependency-groups]
 dev = [
+    "ouroboros-ai[claude,litellm,mcp,tui]",
     "mypy>=1.19.1",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
@@ -60,7 +65,7 @@ dev = [
 ]
 
 [tool.mypy]
-python_version = "3.14"
+python_version = "3.12"
 ignore_missing_imports = true
 disable_error_code = [
     "union-attr",
@@ -82,6 +87,7 @@ disable_error_code = [
 [tool.pytest.ini_options]
 # asyncio_mode = "auto" per project-context.md
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
@@ -89,7 +95,8 @@ python_functions = ["test_*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py312"
+exclude = ["src/ouroboros/_version.py"]
 
 [tool.ruff.lint]
 select = [

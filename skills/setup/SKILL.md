@@ -7,6 +7,10 @@ description: "Guided onboarding wizard for Ouroboros setup"
 
 Guided onboarding wizard that converts users into power users.
 
+> **Standalone users** (Codex, pip install): Use `ouroboros setup --runtime codex` in your terminal instead.
+> This skill runs inside a Claude Code session. For other runtime backends, the CLI `ouroboros setup` command handles configuration.
+> For full install and onboarding instructions, see [Getting Started](docs/getting-started.md).
+
 ## Usage
 
 ```
@@ -93,13 +97,13 @@ which uvx 2>/dev/null && uvx --version 2>/dev/null
 which claude 2>/dev/null
 ```
 
-**IMPORTANT: If system Python is < 3.14 but uvx is available, also check uv-managed Python:**
+**IMPORTANT: If system Python is < 3.12 but uvx is available, also check uv-managed Python:**
 
 ```bash
-uv python list 2>/dev/null | grep "cpython-3.14"
+uv python list 2>/dev/null | grep "cpython-3.1[2-9]"
 ```
 
-If `uv python list` shows Python 3.14+ available, this counts as **Full Mode** because `uvx ouroboros-ai mcp serve` automatically uses uv-managed Python 3.14+ (not system Python).
+If `uv python list` shows Python >= 3.12 available, this counts as **Full Mode** because `uvx ouroboros-ai mcp serve` automatically uses uv-managed Python >= 3.12 (not system Python).
 
 **Report results with personality:**
 
@@ -107,32 +111,60 @@ If `uv python list` shows Python 3.14+ available, this counts as **Full Mode** b
 Environment Detected:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-System Python 3.13         [!] Below 3.14
-uv Python 3.14+            [✓] Available (uvx will use this)
+System Python 3.11         [!] Below 3.12
+uv Python 3.12+            [✓] Available (uvx will use this)
 uvx package runner         [✓] Available
-Claude Code CLI            [✓] Detected
+Runtime backend            [✓] Detected
 
-→ Full Mode Available (via uvx + uv-managed Python 3.14)
+→ Full Mode Available (via uvx + uv-managed Python >= 3.12)
 ```
 
 **Decision Matrix:**
 
 | Environment | Mode | Action |
 |:------------|:-----|:-------|
-| uvx + uv Python 3.14+ | **Ready** | Proceed to MCP registration |
-| System Python 3.14+ | **Ready** | Proceed to MCP registration |
-| uvx + Python < 3.14 only | **Install needed** | Run `uv python install 3.14` then proceed |
-| No uvx | **Install needed** | Run `curl -LsSf https://astral.sh/uv/install.sh \| sh` then `uv python install 3.14` |
+| uvx + Python >= 3.12 | **Ready** | Proceed to MCP registration (uvx mode — extras always included) |
+| No uvx + `ouroboros` binary in PATH | **Check deps** | Verify `[claude]` extras, then proceed (binary mode) |
+| No uvx + Python >= 3.12 + `python3 -m ouroboros` works | **Check deps** | Verify `[claude]` extras, then proceed (pip mode) |
+| uvx + Python < 3.12 only | **Install needed** | Run `uv python install 3.12` then proceed |
+| No uvx + no ouroboros binary + no pip package | **Install needed** | Install uv first, then proceed |
 
-**IMPORTANT**: If Python 3.14+ is not available, DO NOT skip to "Plugin-Only mode". Guide the user to install the prerequisites. MCP is required for the full Ouroboros experience.
+**For binary/pip modes — verify `[claude]` extras are installed:**
+
+Check method depends on how ouroboros was installed:
+```bash
+# Detect install method
+pipx list 2>/dev/null | grep -q ouroboros && echo "PIPX" || echo "NOT_PIPX"
+```
+
+- **pipx users** (binary mode, installed via pipx):
+  ```bash
+  pipx runpip ouroboros-ai show claude-agent-sdk 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
+  ```
+  If `DEPS_MISSING`: `pipx install --force ouroboros-ai[claude]`
+
+- **pip users** (pip mode):
+  ```bash
+  python3 -c "import claude_agent_sdk" 2>/dev/null && echo "DEPS_OK" || echo "DEPS_MISSING"
+  ```
+  If `DEPS_MISSING`: `python3 -m pip install ouroboros-ai[claude]`
+
+If deps are missing and the user doesn't want to fix manually, recommend uvx:
+```
+Or install uvx (recommended — handles deps automatically):
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+Then re-run: ooo setup
+```
+
+**IMPORTANT**: The MCP server requires one of: (1) uvx, (2) ouroboros binary in PATH, or (3) ouroboros pip-installed. For options 2 and 3, the `[claude]` extra must also be installed. If none are available, guide the user to install uv — do NOT write a non-working fallback to mcp.json.
 
 **If prerequisites are missing, show:**
 ```
-Ouroboros requires Python 3.14+ for the MCP server.
+Ouroboros requires uvx (recommended) or the ouroboros package installed.
 
 Quick install (< 1 minute):
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  uv python install 3.14
+  uv python install 3.12
 
 Then re-run: ooo setup
 ```
@@ -158,7 +190,7 @@ ls -la ~/.claude/mcp.json 2>/dev/null && echo "EXISTS" || echo "NOT_FOUND"
   Registering MCP Server...
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Connecting Ouroboros Python core to Claude Code.
+Connecting Ouroboros Python core to your runtime backend.
 This enables:
 
   Visual TUI Dashboard    [Watch execution in real-time]
@@ -167,19 +199,15 @@ This enables:
   Session Replay         [Debug any execution from events]
 ```
 
-**Automatically create or update `~/.claude/mcp.json`** (user-level, works across all projects):
-```json
-{
-  "mcpServers": {
-    "ouroboros": {
-      "command": "uvx",
-      "args": ["--from", "ouroboros-ai", "ouroboros", "mcp", "serve"]
-    }
-  }
-}
-```
+**Automatically create or update `~/.claude/mcp.json`** (user-level, works across all projects).
 
-If `~/.claude/mcp.json` already exists, merge intelligently (preserve other servers).
+Choose the MCP command based on how ouroboros is installed (check in order):
+1. If `which uvx` succeeds: `{"command": "uvx", "args": ["--from", "ouroboros-ai[claude]", "ouroboros", "mcp", "serve"]}`
+2. If `which ouroboros` succeeds: `{"command": "ouroboros", "args": ["mcp", "serve"]}`
+3. If `python3 -c "import ouroboros"` succeeds: `{"command": "python3", "args": ["-m", "ouroboros", "mcp", "serve"]}`
+4. If none of the above → **do NOT write to mcp.json**. Instead show the prerequisites message from Step 1 and stop.
+
+If `~/.claude/mcp.json` already exists, read it, **always overwrite the `ouroboros` key** with the entry above (to fix stale args from older versions), and preserve all other server entries.
 
 **Celebration Checkpoint 2:**
 ```
@@ -218,7 +246,7 @@ A backup will be created: CLAUDE.md.bak
 **If "Preview first", show:**
 ````markdown
 <!-- ooo:START -->
-<!-- ooo:VERSION:0.14.0 -->
+<!-- ooo:VERSION:0.27.1 -->
 # Ouroboros — Specification-First AI Development
 
 > Before telling AI what to build, define what should be built.
@@ -295,7 +323,7 @@ ls skills/ | wc -l  # Should show 12+ skills
 
 Check agents are available:
 ```bash
-ls agents/ | wc -l  # Should show 9+ agents
+ls src/ouroboros/agents/*.md | wc -l  # Should show 20+ bundled agents
 ```
 
 Check MCP registration (if enabled):
@@ -314,7 +342,7 @@ Display with celebration:
   Ouroboros Setup Complete!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Mode:                     Full Mode (Python 3.14 + MCP)
+Mode:                     Full Mode (Python >= 3.12 + MCP)
 Skills Registered:        15 workflow skills
 Agents Available:         9 specialized agents
 MCP Server:               ✓ Registered
@@ -335,6 +363,116 @@ Try the interactive tutorial:
 
 Join the community:
   Star us on GitHub! github.com/Q00/ouroboros
+```
+
+---
+
+### Step 5.5: Brownfield Repository Scan
+
+Scan the user's home directory for existing git repositories and register them in the Ouroboros DB. This enables interviews to use brownfield context for existing projects.
+
+**Show scanning indicator:**
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Scanning for Existing Projects...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Looking for git repositories in your home directory.
+Only GitHub-hosted repos will be registered.
+This may take a moment...
+```
+
+**Implementation — use MCP tools only, do NOT use CLI or Python scripts:**
+
+1. Load the brownfield MCP tool: `ToolSearch query: "+ouroboros brownfield"`
+2. Call scan+register:
+   ```
+   Tool: ouroboros_brownfield
+   Arguments: { "action": "scan" }
+   ```
+   This scans `~/` for GitHub repos and registers them in DB. Existing defaults are preserved.
+
+The scan response `text` already contains a pre-formatted numbered list with `[default]` markers. **Do NOT make any additional MCP calls to list or query repos.**
+
+**Display the repos in a plain-text 2-column grid** (NOT a markdown table). Use a code block so columns align. Example:
+
+```
+Scan complete. 8 repositories registered.
+
+ 1. repo-alpha                   5. repo-epsilon
+ 2. repo-bravo *                 6. repo-foxtrot
+ 3. repo-charlie                 7. repo-golf *
+ 4. repo-delta                   8. repo-hotel
+```
+
+Include `*` markers for defaults exactly as they appear in the scan response. Do not summarize or truncate the list. The user needs to see all repo numbers to pick defaults.
+
+**If no repos found**, skip the default selection prompt and proceed to Step 6.
+
+**Default repo selection — IMMEDIATELY after showing the list:**
+
+Use `AskUserQuestion` with the current default numbers from the scan response.
+
+**If defaults exist**, show them as the recommended option:
+
+```json
+{
+  "questions": [{
+    "question": "Which repos to set as default for interviews? Enter numbers like '6, 18, 19'.",
+    "header": "Default Repos",
+    "options": [
+      {"label": "<current default numbers> (Recommended)", "description": "<current default names>"},
+      {"label": "None", "description": "Clear all defaults — interviews will run in greenfield mode"},
+      {"label": "Select repos", "description": "Type repo numbers to set as default"}
+    ],
+    "multiSelect": false
+  }]
+}
+```
+
+**If no defaults exist**, do NOT show a "(Recommended)" option — offer "None" and "Select repos" instead:
+
+```json
+{
+  "questions": [{
+    "question": "Which repos to set as default for interviews? Enter numbers like '6, 18, 19'.",
+    "header": "Default Repos",
+    "options": [
+      {"label": "None", "description": "No default repos — interviews will run in greenfield mode"},
+      {"label": "Select repos", "description": "Type repo numbers to set as default"}
+    ],
+    "multiSelect": false
+  }]
+}
+```
+
+The user can select the recommended defaults (if any), choose "None", or type custom numbers.
+
+After the user responds, use ONE MCP call to update all defaults at once:
+
+```
+Tool: ouroboros_brownfield
+Arguments: { "action": "set_defaults", "indices": "<comma-separated IDs>" }
+```
+
+Example: if the user picks IDs 6, 18, 19 → `{ "action": "set_defaults", "indices": "6,18,19" }`
+
+This clears all existing defaults and sets the selected repos as default in one call.
+
+If "none" → `{ "action": "set_defaults", "indices": "" }` to clear all defaults.
+
+**Celebration Checkpoint 5.5:**
+```
+Brownfield defaults updated!
+Defaults: podo-app, podo-backend, grape
+
+These repos will be used as context in interviews.
+```
+
+Or if "none" selected:
+```
+No default repos set. interviews will run in greenfield mode.
+You can set defaults anytime by running ooo setup again.
 ```
 
 ---
@@ -419,9 +557,9 @@ Plugin mode still works! You can use:
 - ooo seed
 - ooo unstuck
 
-For Full Mode, install Python 3.14+:
-  macOS: brew install python@3.14
-  Ubuntu: sudo apt install python3.14
+For Full Mode, install Python >= 3.12:
+  macOS: brew install python@3.12
+  Ubuntu: sudo apt install python3.12
   Windows: python.org/downloads
 ```
 
@@ -429,7 +567,7 @@ For Full Mode, install Python 3.14+:
 ```
 uvx is recommended but not required. Alternative:
 
-Install Ouroboros globally:
+Install Ouroboros globally (see docs/getting-started.md for all options):
   pip install ouroboros-ai
 
 Then update ~/.claude/mcp.json with:
@@ -455,6 +593,8 @@ Track these checkpoints for conversion optimization:
 - [ ] MCP server registration accepted
 - [ ] CLAUDE.md integration accepted
 - [ ] Verification passed
+- [ ] Brownfield repos scanned and registered
+- [ ] Default brownfield repo selected
 - [ ] First project started (ooo interview)
 - [ ] First seed generated (ooo seed)
 - [ ] First execution completed (ooo run)

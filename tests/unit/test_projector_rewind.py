@@ -56,7 +56,7 @@ class TestFindResumePointRewind:
             ),
         ]
 
-        gen, phase = projector.find_resume_point(events)
+        gen, phase, _ = projector.find_resume_point(events)
 
         # The "rewound" event should be skipped; last valid state is gen 1 completed
         assert gen == 1
@@ -96,7 +96,7 @@ class TestFindResumePointRewind:
             # but the completed event for gen 2 was the last, so gen=2 COMPLETED
         ]
 
-        gen, phase = projector.find_resume_point(events)
+        gen, phase, _ = projector.find_resume_point(events)
 
         assert gen == 2
         assert phase == GenerationPhase.COMPLETED
@@ -114,7 +114,7 @@ class TestFindResumePointRewind:
             ),
         ]
 
-        gen, phase = projector.find_resume_point(events)
+        gen, phase, _ = projector.find_resume_point(events)
 
         # Unknown phase skipped; defaults remain
         assert gen == 0
@@ -228,6 +228,50 @@ class TestProjectRewind:
         # Rewind from gen 1 to gen 1 means no discarded generations
         assert len(lineage.rewind_history) == 1
         assert lineage.rewind_history[0].discarded_generations == ()
+
+    def test_completed_event_backfills_seed_quality_canary_feedback_from_evaluation(self) -> None:
+        """Replay should preserve depth-warning canaries even for legacy events."""
+        projector = LineageProjector()
+
+        ontology = {
+            "name": "Test",
+            "description": "Test model",
+            "fields": [
+                {"name": "x", "field_type": "string", "description": "field", "required": True},
+            ],
+        }
+
+        events = [
+            _make_event("lineage.created", {"goal": "Build something"}),
+            _make_event(
+                "lineage.generation.completed",
+                {
+                    "generation_number": 1,
+                    "seed_id": "seed_1",
+                    "ontology_snapshot": ontology,
+                    "evaluation_summary": {
+                        "final_approved": False,
+                        "highest_stage_passed": 2,
+                        "feedback_metadata": [
+                            {
+                                "code": "decomposition_depth_warning",
+                                "severity": "warning",
+                                "message": "Depth safety net forced atomic execution.",
+                                "source": "parallel_executor",
+                                "details": {"max_depth": 3, "affected_count": 1},
+                            }
+                        ],
+                    },
+                },
+            ),
+        ]
+
+        lineage = projector.project(events)
+
+        assert lineage is not None
+        assert [
+            feedback.code for feedback in lineage.generations[0].seed_quality_canary_feedback
+        ] == ["decomposition_depth_warning"]
 
     def test_failure_error_preserved(self) -> None:
         """failure_error from lineage.generation.failed event is stored in GenerationRecord."""

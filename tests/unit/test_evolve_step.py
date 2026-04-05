@@ -1,13 +1,15 @@
 """Unit tests for evolve_step() — single-generation stepping API."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ouroboros.core.errors import OuroborosError
 from ouroboros.core.lineage import (
     EvaluationSummary,
+    FeedbackMetadata,
     GenerationPhase,
     GenerationRecord,
     OntologyDelta,
@@ -22,6 +24,7 @@ from ouroboros.core.seed import (
     SeedMetadata,
 )
 from ouroboros.core.types import Result
+from ouroboros.core.worktree import WorktreeError
 from ouroboros.events.lineage import lineage_created, lineage_generation_completed
 from ouroboros.evolution.convergence import ConvergenceSignal
 from ouroboros.evolution.loop import (
@@ -33,6 +36,7 @@ from ouroboros.evolution.loop import (
 )
 from ouroboros.evolution.reflect import ReflectOutput
 from ouroboros.evolution.wonder import WonderOutput
+from ouroboros.mcp.server.adapter import _extract_feedback_metadata_from_artifact
 from ouroboros.persistence.event_store import EventStore
 
 # -- Helpers --
@@ -180,7 +184,8 @@ class TestStepTypes:
         assert StepAction.STAGNATED == "stagnated"
         assert StepAction.EXHAUSTED == "exhausted"
         assert StepAction.FAILED == "failed"
-        assert len(StepAction) == 5
+        assert StepAction.INTERRUPTED == "interrupted"
+        assert len(StepAction) == 6
 
     def test_step_result_is_frozen(self) -> None:
         """StepResult is frozen dataclass."""
@@ -268,6 +273,132 @@ class TestEvolveStepGen1:
         reconstructed = Seed.from_dict(json.loads(completed.data["seed_json"]))
         assert reconstructed.goal == seed.goal
         assert reconstructed.metadata.seed_id == seed.metadata.seed_id
+
+    @pytest.mark.asyncio
+    async def test_gen1_records_depth_warning_as_seed_quality_canary_feedback(self) -> None:
+        """Evaluate-stage depth warnings should reach loop canary state unchanged."""
+        store = await create_event_store()
+        seed = make_seed()
+        expected_warning = FeedbackMetadata(
+            code="decomposition_depth_warning",
+            severity="warning",
+            message="Depth safety net forced atomic execution.",
+            source="parallel_executor",
+            details={"max_depth": 3, "affected_count": 2},
+        )
+        artifact = """
+Parallel Execution Verification Report
+Success: 1/1
+
+## Feedback Metadata
+Feedback Metadata JSON: {"feedback_metadata": [{"code": "decomposition_depth_warning", "details": {"affected_count": 2, "max_depth": 3}, "message": "Depth safety net forced atomic execution.", "severity": "warning", "source": "parallel_executor"}]}
+
+## AC Results
+### AC 1: [PASS] Tasks can be created
+""".strip()
+
+        async def fake_executor(*_args, **_kwargs):
+            return Result.ok(
+                SimpleNamespace(
+                    summary={"verification_report": artifact},
+                    final_message="unused",
+                    duration_seconds=0.01,
+                    messages_processed=1,
+                    success=True,
+                )
+            )
+
+        async def fake_evaluator(_seed: Seed, execution_output: str | None) -> EvaluationSummary:
+            assert execution_output == artifact
+            return EvaluationSummary(
+                final_approved=True,
+                highest_stage_passed=3,
+                score=1.0,
+                feedback_metadata=_extract_feedback_metadata_from_artifact(execution_output or ""),
+            )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                max_generations=30,
+                convergence_threshold=0.95,
+                stagnation_window=3,
+                min_generations=2,
+            ),
+            executor=fake_executor,
+            evaluator=fake_evaluator,
+        )
+
+        result = await loop.evolve_step("lin_test_canary", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.evaluation_summary is not None
+        assert step.generation_result.evaluation_summary.feedback_metadata == (expected_warning,)
+        assert step.lineage.generations[0].seed_quality_canary_feedback == (expected_warning,)
+
+        events = await store.replay_lineage("lin_test_canary")
+        completed = [e for e in events if e.type == "lineage.generation.completed"][0]
+        assert completed.data["seed_quality_canary_feedback"] == [
+            expected_warning.model_dump(mode="json")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gen1_omits_seed_quality_canary_feedback_without_depth_warning(self) -> None:
+        """Loop canary state stays empty when evaluation emits no depth warning."""
+        store = await create_event_store()
+        seed = make_seed()
+        artifact = """
+Parallel Execution Verification Report
+Success: 1/1
+
+## AC Results
+### AC 1: [PASS] Tasks can be created
+""".strip()
+
+        async def fake_executor(*_args, **_kwargs):
+            return Result.ok(
+                SimpleNamespace(
+                    summary={"verification_report": artifact},
+                    final_message="unused",
+                    duration_seconds=0.01,
+                    messages_processed=1,
+                    success=True,
+                )
+            )
+
+        async def fake_evaluator(_seed: Seed, execution_output: str | None) -> EvaluationSummary:
+            assert execution_output == artifact
+            return EvaluationSummary(
+                final_approved=True,
+                highest_stage_passed=3,
+                score=1.0,
+                feedback_metadata=_extract_feedback_metadata_from_artifact(execution_output or ""),
+            )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            config=EvolutionaryLoopConfig(
+                max_generations=30,
+                convergence_threshold=0.95,
+                stagnation_window=3,
+                min_generations=2,
+            ),
+            executor=fake_executor,
+            evaluator=fake_evaluator,
+        )
+
+        result = await loop.evolve_step("lin_test_no_canary", initial_seed=seed)
+
+        assert result.is_ok
+        step = result.value
+        assert step.generation_result.evaluation_summary is not None
+        assert step.generation_result.evaluation_summary.feedback_metadata == ()
+        assert step.lineage.generations[0].seed_quality_canary_feedback == ()
+
+        events = await store.replay_lineage("lin_test_no_canary")
+        completed = [e for e in events if e.type == "lineage.generation.completed"][0]
+        assert "seed_quality_canary_feedback" not in completed.data
 
 
 class TestEvolveStepGen2:
@@ -718,16 +849,123 @@ class TestEvolveStepHandler:
 
         import yaml
 
-        result = await handler.handle(
-            {
-                "lineage_id": "lin_handler_test",
-                "seed_content": yaml.dump(seed.to_dict()),
-            }
-        )
+        with patch(
+            "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+            return_value=None,
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "lin_handler_test",
+                    "seed_content": yaml.dump(seed.to_dict()),
+                    "skip_qa": True,
+                }
+            )
 
         assert result.is_ok
         assert "Generation 1" in result.value.text_content
         assert result.value.meta["action"] == "continue"
+
+    @pytest.mark.asyncio
+    async def test_handler_resets_project_dir_after_call(self) -> None:
+        """Handler should not leak project_dir between evolve_step calls."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        import yaml
+
+        result = await handler.handle(
+            {
+                "lineage_id": "lin_handler_project_dir",
+                "seed_content": yaml.dump(seed.to_dict()),
+                "project_dir": "/tmp/test-project",
+                "skip_qa": True,
+            }
+        )
+
+        assert result.is_ok
+        assert loop.get_project_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_handler_without_project_dir_succeeds_outside_git_repo(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Handler should still run when server cwd is not a git repo."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        monkeypatch.chdir(tmp_path)
+
+        store = await create_event_store()
+        seed = make_seed()
+
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        import yaml
+
+        result = await handler.handle(
+            {
+                "lineage_id": "lin_handler_non_git_cwd",
+                "seed_content": yaml.dump(seed.to_dict()),
+                "skip_qa": True,
+            }
+        )
+
+        assert result.is_ok
+        assert loop.get_project_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_task_workspace_error_for_invalid_lineage_id(self) -> None:
+        """Invalid worktree-backed lineage IDs should fail as structured task workspace errors."""
+        from ouroboros.mcp.tools.definitions import EvolveStepHandler
+
+        store = await create_event_store()
+        seed = make_seed()
+        gen_result = GenerationResult(
+            generation_number=1,
+            seed=seed,
+            evaluation_summary=make_eval_summary(),
+            phase=GenerationPhase.COMPLETED,
+            success=True,
+        )
+        loop = make_loop(store, gen_result=gen_result)
+        handler = EvolveStepHandler(evolutionary_loop=loop)
+
+        with (
+            patch("ouroboros.mcp.tools.evolution_handlers.is_git_repo", return_value=True),
+            patch(
+                "ouroboros.mcp.tools.evolution_handlers.maybe_restore_task_workspace",
+                side_effect=WorktreeError("Invalid durable task identifier for git worktree"),
+            ),
+        ):
+            result = await handler.handle(
+                {
+                    "lineage_id": "bad id",
+                    "project_dir": "/tmp/test-project",
+                    "skip_qa": True,
+                }
+            )
+
+        assert result.is_err
+        assert "Task workspace error" in str(result.error)
 
     @pytest.mark.asyncio
     async def test_handler_no_loop_returns_error(self) -> None:

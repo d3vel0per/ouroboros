@@ -2,17 +2,26 @@
 
 > The serpent that devours itself to be reborn anew.
 
-Ouroboros is a self-improving AI workflow system that transforms ambiguous human requirements into clear, executable specifications through Socratic questioning and ontological analysis.
+Ouroboros is a specification-first workflow engine for AI coding agents. It transforms ambiguous human requirements into clear, executable specifications through Socratic questioning and ontological analysis -- then runs them on your choice of runtime backend.
 
 ## Documentation Index
 
 ### Getting Started
 
-- [Getting Started Guide](./getting-started.md) - Installation, configuration, and quick start tutorial
+- **[Getting Started Guide](./getting-started.md)** - **Single source of truth for onboarding**: installation, configuration, first-run flow, and troubleshooting
+- [Platform Support](./platform-support.md) - Python versions, OS compatibility, and supported runtime backends
+
+### Runtime Guides
+
+- [Claude Code](./runtime-guides/claude-code.md) - Backend-specific configuration and CLI options (see [Getting Started](./getting-started.md) for install/onboarding)
+- [Codex CLI](./runtime-guides/codex.md) - Backend-specific configuration and CLI options (see [Getting Started](./getting-started.md) for install/onboarding)
+- [Runtime Capability Matrix](./runtime-capability-matrix.md) - Feature comparison across runtime backends
 
 ### Architecture
 
-- [System Architecture](./architecture.md) - Overview of the six-phase architecture and core concepts
+- [System Architecture](./architecture.md) - Six-phase architecture, runtime abstraction layer, and core concepts
+- [CLI Reference](./cli-reference.md) - Command-line interface flags and options
+- [Configuration Reference](./config-reference.md) - All `config.yaml` options and environment variables
 
 ### API Reference
 
@@ -22,11 +31,10 @@ Ouroboros is a self-improving AI workflow system that transforms ambiguous human
 
 ### Guides
 
-- [Quick Start](./guides/quick-start.md) - Get running in under 10 minutes
 - [Seed Authoring Guide](./guides/seed-authoring.md) - YAML structure, field reference, examples
+- [Evolutionary Loop & Ralph](./guides/evolution-loop.md) - Wonder/Reflect cycle, convergence detection, persistent evolution
+- [Evaluation Pipeline Guide](./guides/evaluation-pipeline.md) - Three-stage evaluation, failure modes, and configuration
 - [TUI Usage Guide](./guides/tui-usage.md) - Dashboard, screens, keyboard shortcuts
-- [CLI Usage Guide](./guides/cli-usage.md) - Command-line interface reference
-- [Common Workflows](./guides/common-workflows.md) - Recipes for typical scenarios
 
 ### Contributing
 
@@ -34,13 +42,9 @@ Ouroboros is a self-improving AI workflow system that transforms ambiguous human
 - [Architecture for Contributors](./contributing/architecture-overview.md) - How modules connect
 - [Testing Guide](./contributing/testing-guide.md) - Writing and running tests
 - [Key Patterns](./contributing/key-patterns.md) - Result type, immutability, event sourcing, protocols
+- [Findings Registry](./contributing/findings-registry.md) - Documentation audit findings registry
+- [Issue Quality Policy](./contributing/issue-quality-policy.md) - Quality bar for actionable issues and PRD-lite feature requests
 
-### Design Documents
-
-- [Execution Deep Dive](./design/execution-deep-dive.md) - Recursive decomposition, atomicity, parallel execution
-- [Evaluation Pipeline Deep Dive](./design/evaluation-pipeline-deep-dive.md) - Three stages, trigger matrix, deliberative consensus
-- [Evaluation Pipeline Flexibility](./design/evaluation-pipeline-flexibility.md) - Supporting non-code workflows
-- [CLI UX Redesign](./design/cli-ux-redesign.md) - v0.8.0 CLI shorthand and orchestrator defaults
 
 ## Key Concepts
 
@@ -70,7 +74,7 @@ Ouroboros is a self-improving AI workflow system that transforms ambiguous human
 ## Quick Links
 
 - [GitHub Repository](https://github.com/Q00/ouroboros)
-- [PyPI Package](https://pypi.org/project/ouroboros/)
+- [PyPI Package](https://pypi.org/project/ouroboros-ai/)
 
 ## License
 

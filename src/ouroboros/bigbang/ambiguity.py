@@ -9,7 +9,7 @@ The scoring algorithm evaluates three key components:
 - Success Criteria Clarity (30%): How measurable the success criteria are
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
@@ -18,10 +18,10 @@ from pydantic import BaseModel, Field
 import structlog
 
 from ouroboros.bigbang.interview import InterviewState
+from ouroboros.config import get_clarification_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
-from ouroboros.providers.base import CompletionConfig, Message, MessageRole
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
 
 log = structlog.get_logger()
 
@@ -38,8 +38,6 @@ BROWNFIELD_GOAL_CLARITY_WEIGHT = 0.35
 BROWNFIELD_CONSTRAINT_CLARITY_WEIGHT = 0.25
 BROWNFIELD_SUCCESS_CRITERIA_CLARITY_WEIGHT = 0.25
 BROWNFIELD_CONTEXT_CLARITY_WEIGHT = 0.15
-
-DEFAULT_MODEL = "claude-opus-4-6"
 
 # Temperature for reproducible scoring
 SCORING_TEMPERATURE = 0.1
@@ -134,7 +132,7 @@ class AmbiguityScorer:
         max_retries: Maximum retry attempts, or None for unlimited (default).
 
     Example:
-        scorer = AmbiguityScorer(llm_adapter=LiteLLMAdapter())
+        scorer = AmbiguityScorer(llm_adapter=adapter)
 
         result = await scorer.score(interview_state)
         if result.is_ok:
@@ -147,8 +145,8 @@ class AmbiguityScorer:
                 questions = scorer.generate_clarification_questions(ambiguity.breakdown)
     """
 
-    llm_adapter: LiteLLMAdapter
-    model: str = DEFAULT_MODEL
+    llm_adapter: LLMAdapter
+    model: str = field(default_factory=get_clarification_model)
     temperature: float = SCORING_TEMPERATURE
     initial_max_tokens: int = 2048
     max_retries: int | None = 10  # Default to 10 retries (None = unlimited)
@@ -158,6 +156,7 @@ class AmbiguityScorer:
         self,
         state: InterviewState,
         is_brownfield: bool = False,
+        additional_context: str = "",
     ) -> Result[AmbiguityScore, ProviderError]:
         """Calculate ambiguity score for interview state.
 
@@ -169,8 +168,17 @@ class AmbiguityScorer:
         Uses adaptive token allocation: starts with initial_max_tokens and
         doubles on parse failure, up to max_retries attempts.
 
+        Items explicitly deferred via ``additional_context`` (e.g. decide-later
+        items from a PM interview) are treated as **intentional deferrals** and
+        must not reduce the clarity score.  The LLM is instructed to score only
+        what is present and answerable, not penalise deliberate gaps.
+
         Args:
             state: The interview state to score.
+            is_brownfield: Whether this is a brownfield project.
+            additional_context: Extra context appended to the user prompt.
+                Useful for supplying decide-later items or other metadata
+                that should inform scoring without penalty.
 
         Returns:
             Result containing AmbiguityScore or ProviderError.
@@ -189,7 +197,10 @@ class AmbiguityScorer:
 
         # Create scoring prompt
         system_prompt = self._build_scoring_system_prompt(is_brownfield=is_brownfield)
-        user_prompt = self._build_scoring_user_prompt(context)
+        user_prompt = self._build_scoring_user_prompt(
+            context,
+            additional_context=additional_context,
+        )
 
         messages = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -328,8 +339,13 @@ class AmbiguityScorer:
         Returns:
             System prompt string.
         """
+        deferral_instruction = """
+
+IMPORTANT: If the additional context lists "decide-later" or "deferred" items, these are INTENTIONAL deferrals — the team has deliberately chosen to postpone those decisions. Do NOT penalise the clarity score for intentionally deferred items. Score only what is present and answerable."""
+
         if is_brownfield:
-            return """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+            return (
+                """You are an expert requirements analyst. Evaluate the clarity of software requirements.
 
 Evaluate four components:
 1. Goal Clarity (35%): Is the goal specific and well-defined?
@@ -338,13 +354,18 @@ Evaluate four components:
 4. Context Clarity (15%): Is the existing codebase context clear? Are referenced codebases, patterns, and conventions well understood?
 
 Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+                + deferral_instruction
+                + """
 
 RESPOND ONLY WITH VALID JSON. No other text before or after.
 
 Required JSON format:
 {"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string", "context_clarity_score": 0.0, "context_clarity_justification": "string"}"""
+            )
 
-        return """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+        return (
+            """You are an expert requirements analyst. Evaluate the clarity of software requirements.
 
 Evaluate three components:
 1. Goal Clarity (40%): Is the goal specific and well-defined?
@@ -352,28 +373,45 @@ Evaluate three components:
 3. Success Criteria Clarity (30%): Are success criteria measurable?
 
 Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+            + deferral_instruction
+            + """
 
 RESPOND ONLY WITH VALID JSON. No other text before or after.
 
 Required JSON format:
 {"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string"}"""
+        )
 
-    def _build_scoring_user_prompt(self, context: str) -> str:
+    def _build_scoring_user_prompt(
+        self,
+        context: str,
+        additional_context: str = "",
+    ) -> str:
         """Build user prompt with interview context.
 
         Args:
             context: Formatted interview context.
+            additional_context: Extra context (e.g. decide-later items).
 
         Returns:
             User prompt string.
         """
-        return f"""Please evaluate the clarity of the following requirements conversation:
+        prompt = f"""Please evaluate the clarity of the following requirements conversation:
 
 ---
 {context}
----
+---"""
 
-Analyze each component and provide scores with justifications."""
+        if additional_context:
+            prompt += f"""
+
+Additional context (intentional deferrals — do not penalise):
+{additional_context}"""
+
+        prompt += "\n\nAnalyze each component and provide scores with justifications."
+
+        return prompt
 
     def _parse_scoring_response(
         self,
@@ -410,17 +448,14 @@ Analyze each component and provide scores with justifications."""
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON response: {e}") from e
 
-        # Validate all required fields are present
-        required_fields = [
+        # Numeric score fields must be present. Missing justifications are recoverable.
+        required_score_fields = [
             "goal_clarity_score",
-            "goal_clarity_justification",
             "constraint_clarity_score",
-            "constraint_clarity_justification",
             "success_criteria_clarity_score",
-            "success_criteria_clarity_justification",
         ]
 
-        for field_name in required_fields:
+        for field_name in required_score_fields:
             if field_name not in data:
                 raise ValueError(f"Missing required field: {field_name}")
 
@@ -428,6 +463,15 @@ Analyze each component and provide scores with justifications."""
         def clamp_score(value: Any) -> float:
             score = float(value)
             return max(0.0, min(1.0, score))
+
+        def justification_for(field_name: str, component_name: str) -> str:
+            value = data.get(field_name)
+            if value is None:
+                return f"{component_name} justification not provided by model."
+            text = str(value).strip()
+            if not text:
+                return f"{component_name} justification not provided by model."
+            return text
 
         # Select weights based on project type
         if is_brownfield:
@@ -446,7 +490,10 @@ Analyze each component and provide scores with justifications."""
                 name="Context Clarity",
                 clarity_score=clamp_score(data["context_clarity_score"]),
                 weight=BROWNFIELD_CONTEXT_CLARITY_WEIGHT,
-                justification=str(data.get("context_clarity_justification", "")),
+                justification=justification_for(
+                    "context_clarity_justification",
+                    "Context Clarity",
+                ),
             )
 
         return ScoreBreakdown(
@@ -454,19 +501,28 @@ Analyze each component and provide scores with justifications."""
                 name="Goal Clarity",
                 clarity_score=clamp_score(data["goal_clarity_score"]),
                 weight=goal_weight,
-                justification=str(data["goal_clarity_justification"]),
+                justification=justification_for(
+                    "goal_clarity_justification",
+                    "Goal Clarity",
+                ),
             ),
             constraint_clarity=ComponentScore(
                 name="Constraint Clarity",
                 clarity_score=clamp_score(data["constraint_clarity_score"]),
                 weight=constraint_weight,
-                justification=str(data["constraint_clarity_justification"]),
+                justification=justification_for(
+                    "constraint_clarity_justification",
+                    "Constraint Clarity",
+                ),
             ),
             success_criteria_clarity=ComponentScore(
                 name="Success Criteria Clarity",
                 clarity_score=clamp_score(data["success_criteria_clarity_score"]),
                 weight=criteria_weight,
-                justification=str(data["success_criteria_clarity_justification"]),
+                justification=justification_for(
+                    "success_criteria_clarity_justification",
+                    "Success Criteria Clarity",
+                ),
             ),
             context_clarity=context_clarity,
         )
