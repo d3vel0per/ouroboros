@@ -1598,10 +1598,47 @@ class TestOrchestratorRunner:
         mock_create_llm_adapter.assert_called_once_with(
             backend="opencode",
             permission_mode="acceptEdits",
+            cli_path=None,
             cwd="/tmp/project",
             max_turns=1,
         )
         dependency_analyzer_cls.assert_called_once_with(llm_adapter=llm_adapter)
+
+    def test_build_dependency_analyzer_reuses_resolved_codex_cli_path(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Nested dependency analysis should inherit the runtime's resolved Codex CLI path."""
+        mock_adapter.runtime_backend = "codex"
+        mock_adapter.cli_path = "/tmp/real-codex"
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        llm_adapter = object()
+        dependency_analyzer_cls = MagicMock()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                return_value=llm_adapter,
+            ) as mock_create_llm_adapter,
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer",
+                dependency_analyzer_cls,
+            ),
+        ):
+            analyzer = runner._build_dependency_analyzer()
+
+        assert analyzer is dependency_analyzer_cls.return_value
+        mock_create_llm_adapter.assert_called_once_with(
+            backend="codex",
+            permission_mode="acceptEdits",
+            cli_path="/tmp/real-codex",
+            cwd="/tmp/project",
+            max_turns=1,
+        )
 
     @pytest.mark.asyncio
     async def test_execute_seed_uses_inherited_runtime_handle(

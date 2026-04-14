@@ -583,10 +583,13 @@ class OrchestratorRunner:
             if isinstance(llm_backend, str) and llm_backend
             else (self._adapter.runtime_backend)
         )
+        cli_path = getattr(self._adapter, "cli_path", None)
+        resolved_cli_path = cli_path if isinstance(cli_path, str) and cli_path else None
         try:
             llm_adapter = create_llm_adapter(
                 backend=backend,
                 permission_mode=self._adapter.permission_mode,
+                cli_path=resolved_cli_path,
                 cwd=self._effective_cwd(),
                 max_turns=1,
             )
