@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from enum import StrEnum
 import os
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from ouroboros.mcp.types import MCPToolDefinition
+from ouroboros.observability.logging import get_logger
 from ouroboros.orchestrator.mcp_tools import (
     SessionToolCatalog,
     SessionToolCatalogEntry,
     ToolCatalogSourceMetadata,
 )
+
+log = get_logger(__name__)
 
 
 class CapabilityMutationClass(StrEnum):
@@ -251,24 +254,38 @@ def _coerce_capability_semantics(
     raw: Mapping[str, Any],
     *,
     fallback: CapabilitySemantics | None = None,
+    context: str | None = None,
 ) -> CapabilitySemantics:
+    """Build semantics from a raw mapping, treating missing keys as fallback.
+
+    Any unrecognized enum value raises ``ValueError``; callers that want
+    lenient behavior should catch and log, not silence.
+    """
     base = fallback or _default_attached_semantics()
-    return CapabilitySemantics(
-        mutation_class=CapabilityMutationClass(
-            str(raw.get("mutation_class", base.mutation_class.value))
-        ),
-        parallel_safety=CapabilityParallelSafety(
-            str(raw.get("parallel_safety", base.parallel_safety.value))
-        ),
-        interruptibility=CapabilityInterruptibility(
-            str(raw.get("interruptibility", base.interruptibility.value))
-        ),
-        approval_class=CapabilityApprovalClass(
-            str(raw.get("approval_class", base.approval_class.value))
-        ),
-        origin=CapabilityOrigin(str(raw.get("origin", base.origin.value))),
-        scope=CapabilityScope(str(raw.get("scope", base.scope.value))),
-    )
+    try:
+        return CapabilitySemantics(
+            mutation_class=CapabilityMutationClass(
+                str(raw.get("mutation_class", base.mutation_class.value))
+            ),
+            parallel_safety=CapabilityParallelSafety(
+                str(raw.get("parallel_safety", base.parallel_safety.value))
+            ),
+            interruptibility=CapabilityInterruptibility(
+                str(raw.get("interruptibility", base.interruptibility.value))
+            ),
+            approval_class=CapabilityApprovalClass(
+                str(raw.get("approval_class", base.approval_class.value))
+            ),
+            origin=CapabilityOrigin(str(raw.get("origin", base.origin.value))),
+            scope=CapabilityScope(str(raw.get("scope", base.scope.value))),
+        )
+    except ValueError as exc:
+        log.warning(
+            "capability_override.invalid_enum",
+            context=context,
+            error=str(exc),
+        )
+        raise
 
 
 def _default_tool_capability_override_path() -> Path:
@@ -278,10 +295,74 @@ def _default_tool_capability_override_path() -> Path:
     return Path.home() / ".ouroboros" / "tool_capabilities.yaml"
 
 
+# Mapping from resolved override path to (mtime, raw overrides).  Invalidated by
+# mtime so edits to ~/.ouroboros/tool_capabilities.yaml take effect without a
+# process restart, while repeated graph builds in the same process avoid
+# re-reading and re-parsing the YAML file on every call.
+_RAW_OVERRIDES_CACHE: dict[Path, tuple[float, dict[str, Mapping[str, Any]]]] = {}
+
+
+def _read_raw_tool_capability_overrides(path: Path) -> dict[str, Mapping[str, Any]]:
+    """Read and parse the override YAML, returning raw per-tool mappings."""
+    if not path.exists():
+        return {}
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, Mapping):
+        return {}
+
+    raw_tools = raw.get("tools", raw)
+    if not isinstance(raw_tools, Mapping):
+        return {}
+
+    parsed: dict[str, Mapping[str, Any]] = {}
+    for key, value in raw_tools.items():
+        if not isinstance(key, str) or not isinstance(value, Mapping):
+            continue
+        parsed[key] = dict(value)
+    return parsed
+
+
+def _load_raw_tool_capability_overrides(
+    path: str | Path | None = None,
+) -> dict[str, Mapping[str, Any]]:
+    """Load raw override mappings with mtime-based caching."""
+    config_path = (
+        Path(path).expanduser() if path is not None else _default_tool_capability_override_path()
+    )
+    try:
+        mtime = config_path.stat().st_mtime
+    except FileNotFoundError:
+        _RAW_OVERRIDES_CACHE.pop(config_path, None)
+        return {}
+    except OSError as exc:
+        log.warning(
+            "capability_override.read_failed",
+            path=str(config_path),
+            error=str(exc),
+        )
+        return {}
+
+    cached = _RAW_OVERRIDES_CACHE.get(config_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    raw = _read_raw_tool_capability_overrides(config_path)
+    _RAW_OVERRIDES_CACHE[config_path] = (mtime, raw)
+    return raw
+
+
 def load_tool_capability_overrides(
     path: str | Path | None = None,
 ) -> dict[str, CapabilitySemantics]:
     """Load user-defined capability semantics overrides from YAML.
+
+    The returned mapping contains fully coerced semantics for each declared
+    tool, with missing fields filled from the default attached-semantics.
+    When integrating into :func:`build_capability_graph` the override is
+    applied *on top of inferred* semantics via
+    :func:`_apply_raw_override_to_semantics`; this function is retained for
+    external callers (tests, diagnostics) that want pre-coerced semantics.
 
     Expected format:
 
@@ -293,30 +374,36 @@ def load_tool_capability_overrides(
         interruptibility: none
         approval_class: default
     ```
+
+    Invalid enum values are logged and the affected entry skipped.
     """
-    config_path = (
-        Path(path).expanduser() if path is not None else _default_tool_capability_override_path()
-    )
-    if not config_path.exists():
-        return {}
-
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping):
-        return {}
-
-    raw_tools = raw.get("tools", raw)
-    if not isinstance(raw_tools, Mapping):
-        return {}
-
-    overrides: dict[str, CapabilitySemantics] = {}
-    for key, value in raw_tools.items():
-        if not isinstance(key, str) or not isinstance(value, Mapping):
-            continue
+    raw_overrides = _load_raw_tool_capability_overrides(path)
+    coerced: dict[str, CapabilitySemantics] = {}
+    for key, value in raw_overrides.items():
         try:
-            overrides[key] = _coerce_capability_semantics(value)
+            coerced[key] = _coerce_capability_semantics(value, context=f"tool:{key}")
         except ValueError:
             continue
-    return overrides
+    return coerced
+
+
+def _apply_raw_override_to_semantics(
+    inferred: CapabilitySemantics,
+    raw: Mapping[str, Any],
+    *,
+    context: str,
+) -> CapabilitySemantics:
+    """Merge raw override fields onto already-inferred semantics.
+
+    Unlike wholesale replacement, this preserves inferred values for any
+    dimension the user did not explicitly set in their override YAML.  When
+    the override declares an invalid enum value, the inferred semantics are
+    returned unchanged (the warning is logged).
+    """
+    try:
+        return _coerce_capability_semantics(raw, fallback=inferred, context=context)
+    except ValueError:
+        return inferred
 
 
 def _semantics_for_entry(
@@ -350,20 +437,28 @@ def _descriptor_from_tool(
     source: ToolCatalogSourceMetadata | None = None,
     *,
     stable_id: str | None = None,
-    capability_overrides: Mapping[str, CapabilitySemantics] | None = None,
+    raw_capability_overrides: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> CapabilityDescriptor:
     resolved_source = source or _fallback_source_metadata(tool)
     resolved_stable_id = stable_id or _stable_id(tool, resolved_source)
     semantics = _semantics_for_entry(tool, resolved_source)
-    if resolved_source.kind != "builtin" and capability_overrides:
-        override = _match_capability_override(
+    # Built-in tools deliberately bypass user overrides: their semantics are
+    # part of the engine contract (e.g., Bash must remain EXTERNAL_SIDE_EFFECT
+    # regardless of user YAML) so that role envelopes cannot be silently
+    # widened.  Attached and provider-native tools are reclassifiable.
+    if resolved_source.kind != "builtin" and raw_capability_overrides:
+        raw = _match_raw_capability_override(
             tool,
             resolved_source,
             resolved_stable_id,
-            capability_overrides,
+            raw_capability_overrides,
         )
-        if override is not None:
-            semantics = override
+        if raw is not None:
+            semantics = _apply_raw_override_to_semantics(
+                semantics,
+                raw,
+                context=f"tool:{resolved_stable_id}",
+            )
     return CapabilityDescriptor(
         stable_id=resolved_stable_id,
         name=tool.name,
@@ -376,12 +471,12 @@ def _descriptor_from_tool(
     )
 
 
-def _match_capability_override(
+def _match_raw_capability_override(
     tool: MCPToolDefinition,
     source: ToolCatalogSourceMetadata,
     stable_id: str,
-    capability_overrides: Mapping[str, CapabilitySemantics],
-) -> CapabilitySemantics | None:
+    raw_capability_overrides: Mapping[str, Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
     source_name = source.server_name or source.name
     candidates = (
         stable_id,
@@ -391,8 +486,8 @@ def _match_capability_override(
         tool.name,
     )
     for candidate in candidates:
-        if candidate in capability_overrides:
-            return capability_overrides[candidate]
+        if candidate in raw_capability_overrides:
+            return raw_capability_overrides[candidate]
     return None
 
 
@@ -417,12 +512,21 @@ def build_capability_graph(
     *,
     capability_overrides: Mapping[str, CapabilitySemantics] | None = None,
 ) -> CapabilityGraph:
-    """Build a deterministic capability graph from the current tool surface."""
+    """Build a deterministic capability graph from the current tool surface.
+
+    ``capability_overrides`` accepts pre-coerced semantics (wholesale
+    replacement) for backward compatibility.  When omitted, raw overrides
+    are loaded from ``~/.ouroboros/tool_capabilities.yaml`` (cached by
+    mtime) and merged *onto* the inferred semantics so callers can override
+    only the specific dimensions they care about.
+    """
     descriptors: list[CapabilityDescriptor] = []
-    resolved_overrides = (
-        capability_overrides
-        if capability_overrides is not None
-        else load_tool_capability_overrides()
+    # When explicit fully-coerced overrides are passed, we honor wholesale
+    # replacement (preserves the legacy external contract).  Otherwise we
+    # load the raw YAML once per graph build and merge per-field.
+    legacy_overrides = capability_overrides
+    raw_overrides: Mapping[str, Mapping[str, Any]] = (
+        {} if legacy_overrides is not None else _load_raw_tool_capability_overrides()
     )
 
     inherited_capabilities: frozenset[str] = frozenset()
@@ -434,26 +538,46 @@ def build_capability_graph(
 
     for entry in entries:
         if isinstance(entry, SessionToolCatalogEntry):
-            descriptors.append(
-                _descriptor_from_tool(
-                    entry.tool,
-                    entry.source,
-                    stable_id=entry.stable_id,
-                    capability_overrides=resolved_overrides,
-                )
+            descriptor = _descriptor_from_tool(
+                entry.tool,
+                entry.source,
+                stable_id=entry.stable_id,
+                raw_capability_overrides=raw_overrides,
             )
         else:
-            descriptors.append(
-                _descriptor_from_tool(
-                    entry,
-                    capability_overrides=resolved_overrides,
-                )
+            descriptor = _descriptor_from_tool(
+                entry,
+                raw_capability_overrides=raw_overrides,
             )
+        if legacy_overrides is not None and descriptor.source_kind != "builtin":
+            replacement = _match_legacy_override(descriptor, legacy_overrides)
+            if replacement is not None:
+                descriptor = replace(descriptor, semantics=replacement)
+        descriptors.append(descriptor)
 
     for capability_name in sorted(inherited_capabilities):
         descriptors.append(_descriptor_from_inherited_capability(capability_name))
 
     return CapabilityGraph(capabilities=tuple(descriptors))
+
+
+def _match_legacy_override(
+    descriptor: CapabilityDescriptor,
+    capability_overrides: Mapping[str, CapabilitySemantics],
+) -> CapabilitySemantics | None:
+    """Resolve pre-coerced legacy-style overrides against a descriptor."""
+    source_name = descriptor.server_name or descriptor.source_name
+    candidates = (
+        descriptor.stable_id,
+        f"{descriptor.source_kind}:{source_name}:{descriptor.name}",
+        f"{source_name}:{descriptor.name}",
+        descriptor.original_name,
+        descriptor.name,
+    )
+    for candidate in candidates:
+        if candidate in capability_overrides:
+            return capability_overrides[candidate]
+    return None
 
 
 def serialize_capability_graph(

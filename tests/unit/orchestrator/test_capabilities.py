@@ -102,3 +102,72 @@ tools:
     assert descriptor.semantics.mutation_class is CapabilityMutationClass.READ_ONLY
     assert descriptor.semantics.parallel_safety is CapabilityParallelSafety.SAFE
     assert descriptor.semantics.approval_class is CapabilityApprovalClass.DEFAULT
+
+
+def test_partial_override_merges_onto_inferred_semantics(
+    tmp_path, monkeypatch
+) -> None:
+    """Partial overrides should retain inferred fields the user did not set."""
+    override_path = tmp_path / "tool_capabilities.yaml"
+    override_path.write_text(
+        """
+tools:
+  browser:chrome_screenshot:
+    mutation_class: read_only
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_TOOL_CAPABILITIES", str(override_path))
+    catalog = assemble_session_tool_catalog(
+        attached_tools=(
+            MCPToolDefinition(
+                name="chrome_screenshot",
+                description="Capture a screenshot",
+                server_name="browser",
+            ),
+        ),
+    )
+
+    graph = build_capability_graph(catalog)
+
+    descriptor = graph.capabilities[0]
+    # User only reclassified the mutation_class; remaining dimensions come
+    # from the conservative inferred defaults for an attached MCP tool.
+    assert descriptor.semantics.mutation_class is CapabilityMutationClass.READ_ONLY
+    assert descriptor.semantics.origin is CapabilityOrigin.ATTACHED_MCP
+    assert descriptor.semantics.scope is CapabilityScope.ATTACHMENT
+    assert descriptor.semantics.approval_class is not None
+
+
+def test_invalid_override_enum_value_is_logged_and_skipped(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Malformed overrides should log a warning instead of being silenced."""
+    override_path = tmp_path / "tool_capabilities.yaml"
+    override_path.write_text(
+        """
+tools:
+  browser:chrome_navigate:
+    mutation_class: totally-not-a-real-enum
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_TOOL_CAPABILITIES", str(override_path))
+    catalog = assemble_session_tool_catalog(
+        attached_tools=(
+            MCPToolDefinition(
+                name="chrome_navigate",
+                description="Navigate the browser",
+                server_name="browser",
+            ),
+        ),
+    )
+
+    graph = build_capability_graph(catalog)
+
+    # Graph still produced with inferred semantics (fail-open classification
+    # rather than silent discard of the tool itself).
+    assert len(graph.capabilities) == 1
+    # A structlog warning was emitted so user typos do not go unnoticed.
+    captured = capsys.readouterr()
+    assert "capability_override.invalid_enum" in captured.err
