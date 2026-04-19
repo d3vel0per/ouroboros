@@ -236,3 +236,35 @@ def test_unreadable_override_path_does_not_break_capability_graph(tmp_path, monk
     graph = build_capability_graph(catalog)
 
     assert [descriptor.name for descriptor in graph.capabilities] == ["Read"]
+
+
+def test_fifo_override_path_does_not_hang_capability_graph(tmp_path, monkeypatch) -> None:
+    """A FIFO at the override location must not block ``read_text()``.
+
+    Regression guard for the reviewer's blocking finding on PR #353:
+    ``read_text()`` on a FIFO (or other non-regular file that has no
+    EOF — socket, character device) blocks indefinitely.  Because the
+    override loader sits on the default capability-graph construction
+    path, such a path would wedge interview/evaluation/execution
+    startup.  The loader must stat-check and refuse non-regular files
+    before attempting to read them.
+    """
+    import os
+    import sys
+
+    if sys.platform == "win32":
+        import pytest
+
+        pytest.skip("os.mkfifo is not available on Windows")
+
+    fifo_path = tmp_path / "tool_capabilities.yaml"
+    os.mkfifo(fifo_path)
+    monkeypatch.setenv("OUROBOROS_TOOL_CAPABILITIES", str(fifo_path))
+    catalog = assemble_session_tool_catalog(["Read"])
+
+    # If the guard is missing, this call hangs forever waiting on the FIFO
+    # write end.  With the guard in place it returns immediately with the
+    # inferred builtin semantics and no user overrides applied.
+    graph = build_capability_graph(catalog)
+
+    assert [descriptor.name for descriptor in graph.capabilities] == ["Read"]

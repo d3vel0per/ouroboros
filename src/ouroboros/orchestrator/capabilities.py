@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -300,15 +301,39 @@ _RAW_OVERRIDES_CACHE: dict[Path, tuple[float, dict[str, Mapping[str, Any]]]] = {
 def _read_raw_tool_capability_overrides(path: Path) -> dict[str, Mapping[str, Any]]:
     """Read and parse the override YAML, returning raw per-tool mappings.
 
-    Every failure mode — missing file, unreadable file, malformed YAML,
-    unexpected top-level shape — is handled locally.  A broken user
-    config must never propagate out of this function, because the override
-    loader sits on the default capability-graph construction path and is
+    Every failure mode — missing file, non-regular file (FIFO, socket,
+    device, directory), unreadable file, malformed YAML, unexpected
+    top-level shape — is handled locally.  A broken user config must
+    never propagate out of this function, because the override loader
+    sits on the default capability-graph construction path and is
     therefore reached from interview, evaluation, and execution sessions
-    alike.  A single malformed YAML line in ``~/.ouroboros/`` would
-    otherwise take down unrelated orchestration paths.
+    alike.  A single malformed YAML line — or a ``OUROBOROS_TOOL_CAPABILITIES``
+    variable pointing at a FIFO — would otherwise take down unrelated
+    orchestration paths or hang startup indefinitely on ``read_text()``.
     """
-    if not path.exists():
+    try:
+        stat_result = path.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        log.warning(
+            "capability_override.stat_failed",
+            path=str(path),
+            error=str(exc),
+        )
+        return {}
+
+    # Refuse to open non-regular files.  ``read_text()`` on a FIFO or
+    # character device will block indefinitely because those paths have no
+    # EOF, and on a directory will raise ``IsADirectoryError`` too late
+    # (after the caller already paid the syscall).  Stop here so the
+    # override layer cannot wedge the orchestrator hot path.
+    if not stat.S_ISREG(stat_result.st_mode):
+        log.warning(
+            "capability_override.not_regular_file",
+            path=str(path),
+            mode=oct(stat_result.st_mode),
+        )
         return {}
 
     try:
@@ -371,7 +396,7 @@ def _load_raw_tool_capability_overrides(
         return {}
 
     try:
-        mtime = config_path.stat().st_mtime
+        stat_result = config_path.stat()
     except FileNotFoundError:
         _RAW_OVERRIDES_CACHE.pop(config_path, None)
         return {}
@@ -383,6 +408,19 @@ def _load_raw_tool_capability_overrides(
         )
         return {}
 
+    # Defense in depth: ``_read_raw_tool_capability_overrides`` also checks
+    # this, but rejecting non-regular files before we even touch the cache
+    # means a FIFO path cannot poison the cache with a bogus mtime entry.
+    if not stat.S_ISREG(stat_result.st_mode):
+        _RAW_OVERRIDES_CACHE.pop(config_path, None)
+        log.warning(
+            "capability_override.not_regular_file",
+            path=str(config_path),
+            mode=oct(stat_result.st_mode),
+        )
+        return {}
+
+    mtime = stat_result.st_mtime
     cached = _RAW_OVERRIDES_CACHE.get(config_path)
     if cached is not None and cached[0] == mtime:
         return cached[1]
