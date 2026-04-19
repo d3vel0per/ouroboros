@@ -234,9 +234,17 @@ def allowed_runtime_builtin_tool_names(
     *,
     builtin_tools: tuple[str, ...] | None = None,
 ) -> list[str]:
-    """Return executable built-in runtime tools for a policy context."""
-    tool_names = builtin_tools or tuple(
-        definition.name for definition in enumerate_runtime_builtin_tool_definitions()
+    """Return executable built-in runtime tools for a policy context.
+
+    ``builtin_tools=None`` falls back to the runtime's full builtin set.
+    An explicit empty tuple is respected and means "this backend exposes
+    no runtime builtins" — not "re-use the default", which would silently
+    widen the envelope for backends that legitimately have none.
+    """
+    tool_names = (
+        builtin_tools
+        if builtin_tools is not None
+        else tuple(definition.name for definition in enumerate_runtime_builtin_tool_definitions())
     )
     graph = build_capability_graph(assemble_session_tool_catalog(tool_names))
     return allowed_capability_names(graph, context)

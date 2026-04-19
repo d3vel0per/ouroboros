@@ -169,6 +169,26 @@ def test_read_only_roles_derive_runtime_builtin_envelope_from_policy() -> None:
     assert "Bash" not in allowed
 
 
+def test_empty_builtin_tools_is_respected_not_defaulted() -> None:
+    """An explicit empty tuple means "this backend has no runtime builtins".
+
+    Regression guard for the reviewer's non-blocking finding on
+    PR #353: the earlier ``builtin_tools or ...`` idiom coerced an
+    empty tuple to the default full builtin set, which would silently
+    widen the envelope for a backend that legitimately exposes nothing.
+    """
+    allowed = allowed_runtime_builtin_tool_names(
+        PolicyContext(
+            runtime_backend="hypothetical_no_builtins_backend",
+            session_role=PolicySessionRole.EVALUATION,
+            execution_phase=PolicyExecutionPhase.EVALUATION,
+        ),
+        builtin_tools=(),
+    )
+
+    assert allowed == []
+
+
 def test_coordinator_hides_unknown_side_effecting_provider_native() -> None:
     """Regression guard: unknown side-effecting provider-native tools must
     stay hidden from COORDINATOR even when they satisfy the origin filter.

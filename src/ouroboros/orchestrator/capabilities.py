@@ -6,8 +6,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 import os
-import stat
 from pathlib import Path
+import stat
 from typing import Any
 
 import yaml
