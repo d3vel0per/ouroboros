@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import inspect
 import json
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from ouroboros.core.types import Result
+from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
 from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+import ouroboros.orchestrator.opencode_runtime as opencode_runtime_module
 from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
+from ouroboros.router import Resolved, ResolveRequest
+from ouroboros.router import resolve_skill_dispatch as shared_resolve_skill_dispatch
 
 
 class _FakeStream:
@@ -73,6 +80,33 @@ class _FakeProcess:
 
     def kill(self) -> None:
         self.returncode = self._returncode
+
+
+def _write_skill(
+    skills_dir: Path,
+    skill_name: str,
+    frontmatter_lines: list[str],
+) -> Path:
+    skill_dir = skills_dir / skill_name
+    skill_dir.mkdir(parents=True)
+    skill_md = skill_dir / "SKILL.md"
+    frontmatter = "\n".join(frontmatter_lines)
+    skill_md.write_text(
+        f"---\n{frontmatter}\n---\n\n# {skill_name}\n",
+        encoding="utf-8",
+    )
+    return skill_md
+
+
+def _fake_opencode_text_process(content: str = "OpenCode fallback completed.") -> _FakeProcess:
+    text_event = json.dumps(
+        {
+            "type": "text",
+            "sessionID": "sess-fallback",
+            "part": {"type": "text", "text": content},
+        }
+    )
+    return _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
 
 
 class TestOpenCodeRuntimeProperties:
@@ -193,6 +227,881 @@ class TestOpenCodeRuntimeHandleManagement:
         assert updated is not None
         assert updated.native_session_id == "sess-new"
         assert updated.backend == "opencode"
+
+
+class TestOpenCodeRuntimeDispatchBoundary:
+    def test_runtime_does_not_expose_local_dispatch_parser_helpers(self) -> None:
+        obsolete_helpers = {
+            "_extract_first_argument",
+            "_load_skill_frontmatter",
+            "_normalize_mcp_frontmatter",
+            "_resolve_dispatch_templates",
+            "_resolve_skill_dispatch",
+            "_resolve_skill_intercept",
+        }
+
+        assert obsolete_helpers.isdisjoint(dir(OpenCodeRuntime))
+
+    def test_runtime_source_does_not_reference_removed_dispatch_parser_helpers(self) -> None:
+        """Removed local parser helpers should not remain referenced by the runtime."""
+        runtime_source = inspect.getsource(opencode_runtime_module)
+        obsolete_helper_references = {
+            "_extract_first_argument(",
+            "_load_skill_frontmatter(",
+            "_normalize_mcp_frontmatter(",
+            "_resolve_dispatch_templates(",
+            "_resolve_skill_dispatch(",
+            "_resolve_skill_intercept(",
+            "SkillInterceptRequest",
+        }
+
+        assert all(reference not in runtime_source for reference in obsolete_helper_references)
+
+
+class TestOpenCodeRuntimeSkillDispatch:
+    """Test shared-router skill dispatch integration."""
+
+    @pytest.mark.asyncio
+    async def test_execute_task_uses_dispatcher_for_valid_intercept(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with patch("asyncio.create_subprocess_exec") as mock_exec:
+            messages = [
+                message async for message in runtime.execute_task('ooo run "seed spec.yaml"')
+            ]
+
+        dispatcher.assert_awaited_once()
+        mock_exec.assert_not_called()
+        intercept = dispatcher.await_args.args[0]
+        assert isinstance(intercept, Resolved)
+        assert intercept.skill_name == "run"
+        assert intercept.command_prefix == "ooo run"
+        assert intercept.first_argument == "seed spec.yaml"
+        assert intercept.mcp_args == {"seed_path": "seed spec.yaml"}
+        assert messages[-1].content == "Intercepted"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_uses_shared_router_for_normalized_ooo_dispatch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+                '  cwd: "$CWD"',
+                '  label: "cwd=$CWD seed=$1"',
+                "  nested:",
+                "    values:",
+                '      - "$1"',
+                '      - "$CWD"',
+            ],
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        prompt = ' \tOOO   Run\t"seed spec.yaml" --max-iterations 2'
+        observed_requests: list[object] = []
+
+        def resolve_spy(request, *, skills_dir=None, cwd=None):
+            observed_requests.append(request)
+            return shared_resolve_skill_dispatch(request, skills_dir=skills_dir, cwd=cwd)
+
+        with (
+            patch.object(
+                opencode_runtime_module,
+                "resolve_skill_dispatch",
+                side_effect=resolve_spy,
+            ),
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task(prompt)]
+
+        assert len(observed_requests) == 1
+        resolve_request = observed_requests[0]
+        assert isinstance(resolve_request, ResolveRequest)
+        assert resolve_request.prompt == prompt
+        assert resolve_request.cwd == "/tmp/project"
+        assert resolve_request.skills_dir == tmp_path
+        dispatcher.assert_awaited_once()
+        mock_exec.assert_not_called()
+        intercept = dispatcher.await_args.args[0]
+        assert isinstance(intercept, Resolved)
+        assert intercept.skill_name == "run"
+        assert intercept.command_prefix == "ooo run"
+        assert intercept.prompt == prompt
+        assert intercept.first_argument == "seed spec.yaml"
+        assert intercept.mcp_args == {
+            "seed_path": "seed spec.yaml",
+            "cwd": "/tmp/project",
+            "label": "cwd=/tmp/project seed=seed spec.yaml",
+            "nested": {"values": ["seed spec.yaml", "/tmp/project"]},
+        }
+        assert messages[-1].content == "Intercepted"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_passes_resolved_router_result_to_dispatcher_without_reconstruction(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """OpenCode runtime should pass the router's Resolved object through directly."""
+        resolved = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run seed.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            first_argument="resolved-first-argument",
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch.object(
+                opencode_runtime_module,
+                "resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_resolve.assert_called_once()
+        request = mock_resolve.call_args.args[0]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo run seed.yaml"
+        assert request.cwd == "/tmp/project"
+        assert request.skills_dir == tmp_path
+        dispatcher.assert_awaited_once()
+        assert dispatcher.await_args.args[0] is resolved
+        assert dispatcher.await_args.args[1] is None
+        mock_exec.assert_not_called()
+        assert [message.content for message in messages] == ["Dispatching", "Intercepted"]
+
+    @pytest.mark.asyncio
+    async def test_execute_task_builtin_dispatcher_uses_resolved_router_payload_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Built-in dispatch should not reparse or reconstruct prompt-derived fields."""
+        resolved = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run prompt-derived.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            first_argument="resolved-first-argument",
+        )
+        fake_handler = AsyncMock()
+        fake_handler.handle = AsyncMock(
+            return_value=Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="Router dispatch"),),
+                    meta={"execution_id": "exec-router"},
+                )
+            )
+        )
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+        )
+
+        with (
+            patch.object(
+                opencode_runtime_module,
+                "resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch.object(
+                runtime,
+                "_get_mcp_tool_handler",
+                return_value=fake_handler,
+            ) as mock_lookup,
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            messages = [
+                message async for message in runtime.execute_task("ooo run prompt-derived.yaml")
+            ]
+
+        mock_resolve.assert_called_once()
+        request = mock_resolve.call_args.args[0]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo run prompt-derived.yaml"
+        assert request.cwd == "/tmp/project"
+        assert request.skills_dir == tmp_path
+        mock_lookup.assert_called_once_with("router_only_tool")
+        fake_handler.handle.assert_awaited_once_with(
+            {
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            }
+        )
+        mock_exec.assert_not_called()
+        mock_warning.assert_not_called()
+        assert len(messages) == 2
+        assert messages[0].type == "assistant"
+        assert messages[0].tool_name == "router_only_tool"
+        assert messages[0].content == "Calling tool: router_only_tool"
+        assert messages[0].data == {
+            "tool_input": {
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            }
+        }
+        assert messages[1].type == "result"
+        assert messages[1].content == "Router dispatch"
+        assert messages[1].data == {
+            "subtype": "success",
+            "tool_name": "router_only_tool",
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_task_builtin_dispatcher_uses_resolved_first_argument(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Built-in dispatch should consume router Resolved fields for interview answers."""
+        resolved = Resolved(
+            skill_name="interview",
+            command_prefix="ooo interview",
+            prompt="ooo interview prompt-derived-answer",
+            skill_path=tmp_path / "interview" / "SKILL.md",
+            mcp_tool="ouroboros_interview",
+            mcp_args={"initial_context": "resolved-by-router"},
+            first_argument="resolved-answer",
+        )
+        fake_handler = AsyncMock()
+        fake_handler.handle = AsyncMock(
+            return_value=Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="Interview dispatch"),),
+                    meta={},
+                )
+            )
+        )
+        resume_handle = RuntimeHandle(
+            backend="opencode",
+            metadata={"ouroboros_interview_session_id": "interview-session"},
+        )
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+        )
+
+        with (
+            patch.object(
+                opencode_runtime_module,
+                "resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch.object(
+                runtime,
+                "_get_mcp_tool_handler",
+                return_value=fake_handler,
+            ),
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            messages = [
+                message
+                async for message in runtime.execute_task(
+                    "ooo interview prompt-derived-answer",
+                    resume_handle=resume_handle,
+                )
+            ]
+
+        mock_resolve.assert_called_once()
+        request = mock_resolve.call_args.args[0]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo interview prompt-derived-answer"
+        fake_handler.handle.assert_awaited_once_with(
+            {
+                "initial_context": "resolved-by-router",
+                "session_id": "interview-session",
+                "answer": "resolved-answer",
+            }
+        )
+        mock_exec.assert_not_called()
+        assert messages[0].data == {
+            "tool_input": {
+                "initial_context": "resolved-by-router",
+                "session_id": "interview-session",
+                "answer": "resolved-answer",
+            }
+        }
+        assert messages[1].content == "Interview dispatch"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_bypasses_invalid_frontmatter(self, tmp_path: Path) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  - "$1"',
+            ],
+        )
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project", skills_dir=tmp_path)
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "opencode_runtime.skill_intercept_frontmatter_invalid"
+        )
+        assert (
+            mock_warning.call_args.kwargs["error"]
+            == "mcp_args must be a mapping with string keys and YAML-safe values"
+        )
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_bypasses_non_mapping_frontmatter_with_legacy_log_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_dir = tmp_path / "run"
+        skill_dir.mkdir(parents=True)
+        skill_path = skill_dir / "SKILL.md"
+        skill_path.write_text("---\n- not\n- a\n- mapping\n---\n", encoding="utf-8")
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project", skills_dir=tmp_path)
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "opencode_runtime.skill_intercept_frontmatter_invalid"
+        )
+        assert mock_warning.call_args.kwargs == {
+            "skill": "run",
+            "error": f"Frontmatter must be a mapping in {skill_path}",
+        }
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_maps_granular_mcp_args_errors_to_legacy_log_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                "  created_at: 2026-04-20",
+            ],
+        )
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project", skills_dir=tmp_path)
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "opencode_runtime.skill_intercept_frontmatter_invalid"
+        )
+        assert mock_warning.call_args.kwargs == {
+            "skill": "run",
+            "error": "mcp_args must be a mapping with string keys and YAML-safe values",
+        }
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_preserves_dispatch_failure_log_event_name(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        dispatcher = AsyncMock(side_effect=RuntimeError("dispatch failed"))
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        dispatcher.assert_awaited_once()
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert mock_warning.call_args[0][0] == "opencode_runtime.skill_intercept_dispatch_failed"
+        assert mock_warning.call_args.kwargs["skill"] == "run"
+        assert mock_warning.call_args.kwargs["error"] == "dispatch failed"
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_emits_missing_frontmatter_warning_for_opencode(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_path = _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+            ],
+        )
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project", skills_dir=tmp_path)
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "opencode_runtime.skill_intercept_frontmatter_missing"
+        )
+        assert mock_warning.call_args.kwargs["skill"] == "run"
+        assert (
+            mock_warning.call_args.kwargs["error"] == "missing required frontmatter key: mcp_args"
+        )
+        assert skill_path.exists()
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_falls_through_when_router_returns_not_handled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-fallback",
+                "part": {"type": "text", "text": "OpenCode fallback completed."},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        dispatcher = AsyncMock()
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo missing seed.yaml")]
+
+        dispatcher.assert_not_awaited()
+        mock_exec.assert_called_once()
+        mock_warning.assert_not_called()
+        assert b"ooo missing seed.yaml" in process.stdin.written
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_emits_no_dispatch_logs_or_task_started_on_dispatch_success(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        events: list[tuple[str, str]] = []
+
+        async def dispatch_success(
+            intercept: Resolved,
+            current_handle: RuntimeHandle | None,
+        ) -> tuple[AgentMessage, ...]:
+            events.append(("dispatcher", intercept.skill_name))
+            return (
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+
+        dispatcher = AsyncMock(side_effect=dispatch_success)
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch("ouroboros.orchestrator.opencode_runtime.log.info") as mock_info,
+            patch("asyncio.create_subprocess_exec") as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        dispatcher.assert_awaited_once()
+        mock_warning.assert_not_called()
+        mock_info.assert_not_called()
+        mock_exec.assert_not_called()
+        assert events == [("dispatcher", "run")]
+        assert messages[-1].content == "Intercepted"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_logs_invalid_frontmatter_before_fallback_start(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  - "$1"',
+            ],
+        )
+        process = _fake_opencode_text_process()
+        events: list[tuple[str, str]] = []
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project", skills_dir=tmp_path)
+
+        async def start_process(*args, **kwargs):
+            events.append(("subprocess", "start"))
+            return process
+
+        def record_warning(event_name: str, **kwargs) -> None:
+            events.append(("warning", event_name))
+
+        def record_info(event_name: str, **kwargs) -> None:
+            events.append(("info", event_name))
+
+        with (
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.warning",
+                side_effect=record_warning,
+            ) as mock_warning,
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.info",
+                side_effect=record_info,
+            ) as mock_info,
+            patch("asyncio.create_subprocess_exec", side_effect=start_process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_warning.assert_called_once()
+        mock_info.assert_called_once()
+        mock_exec.assert_called_once()
+        assert events == [
+            ("warning", "opencode_runtime.skill_intercept_frontmatter_invalid"),
+            ("info", "opencode_runtime.task_started"),
+            ("subprocess", "start"),
+        ]
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_logs_dispatch_failure_before_fallback_start(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        process = _fake_opencode_text_process()
+        events: list[tuple[str, str]] = []
+
+        async def dispatch_failure(
+            intercept: Resolved,
+            current_handle: RuntimeHandle | None,
+        ) -> tuple[AgentMessage, ...]:
+            events.append(("dispatcher", intercept.skill_name))
+            raise RuntimeError("dispatch failed")
+
+        dispatcher = AsyncMock(side_effect=dispatch_failure)
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        async def start_process(*args, **kwargs):
+            events.append(("subprocess", "start"))
+            return process
+
+        def record_warning(event_name: str, **kwargs) -> None:
+            events.append(("warning", event_name))
+
+        def record_info(event_name: str, **kwargs) -> None:
+            events.append(("info", event_name))
+
+        with (
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.warning",
+                side_effect=record_warning,
+            ) as mock_warning,
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.info",
+                side_effect=record_info,
+            ) as mock_info,
+            patch("asyncio.create_subprocess_exec", side_effect=start_process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        dispatcher.assert_awaited_once()
+        mock_warning.assert_called_once()
+        mock_info.assert_called_once()
+        mock_exec.assert_called_once()
+        assert events == [
+            ("dispatcher", "run"),
+            ("warning", "opencode_runtime.skill_intercept_dispatch_failed"),
+            ("info", "opencode_runtime.task_started"),
+            ("subprocess", "start"),
+        ]
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_starts_fallback_after_recoverable_dispatch_result(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        process = _fake_opencode_text_process()
+        events: list[tuple[str, str]] = []
+
+        async def dispatch_recoverable(
+            intercept: Resolved,
+            current_handle: RuntimeHandle | None,
+        ) -> tuple[AgentMessage, ...]:
+            events.append(("dispatcher", intercept.skill_name))
+            return (
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(
+                    type="result",
+                    content="Recoverable dispatch error",
+                    data={"subtype": "error", "recoverable": True},
+                ),
+            )
+
+        dispatcher = AsyncMock(side_effect=dispatch_recoverable)
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        async def start_process(*args, **kwargs):
+            events.append(("subprocess", "start"))
+            return process
+
+        def record_info(event_name: str, **kwargs) -> None:
+            events.append(("info", event_name))
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.info",
+                side_effect=record_info,
+            ) as mock_info,
+            patch("asyncio.create_subprocess_exec", side_effect=start_process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        dispatcher.assert_awaited_once()
+        mock_warning.assert_not_called()
+        mock_info.assert_called_once()
+        mock_exec.assert_called_once()
+        assert events == [
+            ("dispatcher", "run"),
+            ("info", "opencode_runtime.task_started"),
+            ("subprocess", "start"),
+        ]
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_logs_only_task_started_for_not_handled_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        process = _fake_opencode_text_process()
+        events: list[tuple[str, str]] = []
+        dispatcher = AsyncMock()
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        async def start_process(*args, **kwargs):
+            events.append(("subprocess", "start"))
+            return process
+
+        def record_info(event_name: str, **kwargs) -> None:
+            events.append(("info", event_name))
+
+        with (
+            patch("ouroboros.orchestrator.opencode_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.opencode_runtime.log.info",
+                side_effect=record_info,
+            ) as mock_info,
+            patch("asyncio.create_subprocess_exec", side_effect=start_process) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo missing seed.yaml")]
+
+        dispatcher.assert_not_awaited()
+        mock_warning.assert_not_called()
+        mock_info.assert_called_once()
+        mock_exec.assert_called_once()
+        assert events == [
+            ("info", "opencode_runtime.task_started"),
+            ("subprocess", "start"),
+        ]
+        assert any(message.content == "OpenCode fallback completed." for message in messages)
 
 
 class TestOpenCodeRuntimeEventConversion:
@@ -482,60 +1391,6 @@ class TestOpenCodeRuntimeExecuteTask:
         [m for m in messages if m.type == "assistant" and m.tool_name is None]
         assert len(tool_msgs) >= 1
         assert tool_msgs[0].tool_name == "Read"
-
-
-class TestResolveDispatchTemplates:
-    """Test ``$1`` / ``$CWD`` template expansion in skill-intercept args."""
-
-    def test_string_dollar_one_replaced(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates("$1", first_argument="seed.yaml")
-        assert result == "seed.yaml"
-
-    def test_string_dollar_cwd_replaced(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates("$CWD", first_argument=None)
-        assert result == "/project"
-
-    def test_string_dollar_one_none_becomes_empty(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates("$1", first_argument=None)
-        assert result == ""
-
-    def test_plain_string_unchanged(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates("hello", first_argument="x")
-        assert result == "hello"
-
-    def test_dict_recursive(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates(
-            {"seed_path": "$1", "cwd": "$CWD", "keep": "value"},
-            first_argument="my.yaml",
-        )
-        assert result == {"seed_path": "my.yaml", "cwd": "/project", "keep": "value"}
-
-    def test_list_recursive(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates(
-            ["$1", "$CWD", "literal"],
-            first_argument="arg",
-        )
-        assert result == ["arg", "/project", "literal"]
-
-    def test_nested_dict_in_list(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        result = runtime._resolve_dispatch_templates(
-            [{"path": "$1"}],
-            first_argument="file.txt",
-        )
-        assert result == [{"path": "file.txt"}]
-
-    def test_non_string_passthrough(self) -> None:
-        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/project")
-        assert runtime._resolve_dispatch_templates(42, first_argument="x") == 42
-        assert runtime._resolve_dispatch_templates(None, first_argument="x") is None
-        assert runtime._resolve_dispatch_templates(True, first_argument="x") is True
 
 
 class TestExitCodeDeterminesSuccess:

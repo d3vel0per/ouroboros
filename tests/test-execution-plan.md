@@ -118,7 +118,6 @@ uv run pytest \
   tests/unit/resilience \
   tests/unit/evolution \
   tests/unit/hermes \
-  tests/unit/openclaw \
   tests/unit/pm \
   -q
 ```
@@ -224,7 +223,7 @@ These rules are the main value of the plan. They prevent low-value downstream ex
 - If `tests/unit/cli/` fails, skip `tests/e2e/test_cli_commands.py`.
 - If `tests/unit/bigbang/` fails, skip PM/interview/init-style CLI paths until it is fixed.
 - If only `tests/unit/tui/` or `src/ouroboros/tui/**` is relevant, do not spend context on MCP, integration, or e2e.
-- If only `src/ouroboros/openclaw/**`, `src/ouroboros/hermes/**`, or plugin registry code changed, run those isolated suites before repo-wide phases and expand only if shared core code was touched.
+- If only `src/ouroboros/hermes/**` or plugin registry code changed, run those isolated suites before repo-wide phases and expand only if shared core code was touched.
 
 ## Change-Scoped Minimum Orders
 

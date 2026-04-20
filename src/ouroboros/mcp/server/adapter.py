@@ -44,8 +44,8 @@ VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 def _safe_cwd() -> Path:
     """Return cwd if it looks like a usable project directory, else fall back to home.
 
-    OpenClaw gateways spawn the MCP server with ``cwd=/``, which is not a
-    writable project root.  This helper centralises the fallback so every
+    Some launchers can spawn the MCP server with ``cwd=/``, which is not a
+    writable project root. This helper centralises the fallback so every
     consumer inside ``create_ouroboros_server`` uses the same safe directory.
     """
     cwd = Path.cwd()
@@ -788,7 +788,6 @@ def create_ouroboros_server(
         ACTreeHUDHandler,
         CancelExecutionHandler,
         CancelJobHandler,
-        ChannelWorkflowHandler,
         EvaluateHandler,
         EvolveRewindHandler,
         EvolveStepHandler,
@@ -809,7 +808,6 @@ def create_ouroboros_server(
     from ouroboros.mcp.tools.pm_handler import PMInterviewHandler
     from ouroboros.mcp.tools.qa import QAHandler
     from ouroboros.mcp.tools.registry import ToolRegistry
-    from ouroboros.openclaw.workflow import ChannelRepoRegistry, ChannelWorkflowManager
     from ouroboros.orchestrator import create_agent_runtime, resolve_agent_runtime_backend
     from ouroboros.orchestrator.runner import (
         OrchestratorRunner,
@@ -826,8 +824,8 @@ def create_ouroboros_server(
         opencode_mode = get_opencode_mode()
 
     # Resolve a safe working directory once so all consumers agree.
-    # When the MCP server is spawned with cwd=/ (OpenClaw gateways), Path.cwd()
-    # is unusable as a project root — _safe_cwd() falls back to $HOME.
+    # When the MCP server is spawned with cwd=/, Path.cwd() is unusable as a
+    # project root, so _safe_cwd() falls back to $HOME.
     effective_cwd = _safe_cwd()
 
     # Materialize the default runtime once at server creation so backend wiring
@@ -1322,9 +1320,6 @@ def create_ouroboros_server(
         validator=_evolution_validator,
     )
     job_manager = JobManager(event_store)
-    openclaw_db_path = Path.home() / ".ouroboros" / "ouroboros.db"
-    workflow_manager = ChannelWorkflowManager(openclaw_db_path)
-    repo_registry = ChannelRepoRegistry(openclaw_db_path)
 
     # Create tool registry for dependency injection
     registry = ToolRegistry()
@@ -1403,47 +1398,6 @@ def create_ouroboros_server(
             opencode_mode=opencode_mode,
         ),
         BrownfieldHandler(),
-        ChannelWorkflowHandler(
-            workflow_manager=workflow_manager,
-            repo_registry=repo_registry,
-            default_repo=str(effective_cwd) if str(effective_cwd) != "/" else None,
-            interview_handler=InterviewHandler(
-                interview_engine=interview_engine,
-                event_store=event_store,
-                llm_adapter=llm_adapter,
-                llm_backend=llm_backend,
-                agent_runtime_backend=resolved_runtime_backend,
-                opencode_mode=opencode_mode,
-            ),
-            generate_seed_handler=GenerateSeedHandler(
-                interview_engine=interview_engine,
-                seed_generator=seed_generator,
-                llm_adapter=llm_adapter,
-                llm_backend=llm_backend,
-                event_store=event_store,
-                agent_runtime_backend=resolved_runtime_backend,
-                opencode_mode=opencode_mode,
-            ),
-            start_execute_seed_handler=StartExecuteSeedHandler(
-                execute_handler=execute_seed,
-                event_store=event_store,
-                job_manager=job_manager,
-                agent_runtime_backend=resolved_runtime_backend,
-                opencode_mode=opencode_mode,
-            ),
-            job_status_handler=JobStatusHandler(
-                event_store=event_store,
-                job_manager=job_manager,
-            ),
-            job_wait_handler=JobWaitHandler(
-                event_store=event_store,
-                job_manager=job_manager,
-            ),
-            job_result_handler=JobResultHandler(
-                event_store=event_store,
-                job_manager=job_manager,
-            ),
-        ),
         EvaluateHandler(
             event_store=event_store,
             llm_backend=llm_backend,

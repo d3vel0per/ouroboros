@@ -983,10 +983,10 @@ def _setup_opencode(opencode_path: str, mode: str = "plugin") -> bool:
     orch["runtime_backend"] = "opencode"
     orch["opencode_cli_path"] = opencode_path
 
-    # Set llm.backend=opencode so subprocess-forced paths (e.g.
-    # channel_workflow inner handlers) don't fall back to claude_code.
-    # Without this, get_llm_backend() returns "claude_code" and those
-    # paths try to invoke Claude — which fails on OpenCode-only machines.
+    # Set llm.backend=opencode so subprocess fallback paths don't fall
+    # back to claude_code. Without this, get_llm_backend() returns
+    # "claude_code" and those paths try to invoke Claude, which fails on
+    # OpenCode-only machines.
     llm = config_dict.get("llm")
     if not isinstance(llm, dict):
         llm = {}

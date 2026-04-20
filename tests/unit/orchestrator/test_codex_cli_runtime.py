@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,10 @@ from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPToolError
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
 from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+import ouroboros.orchestrator.codex_cli_runtime as codex_cli_runtime_module
 from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
+from ouroboros.router import Resolved, ResolveRequest
+from ouroboros.router.dispatch import SkillDispatchRouter as SharedSkillDispatchRouter
 
 
 class _FakeStream:
@@ -371,161 +375,159 @@ class TestCodexCliRuntime:
         assert message.tool_name == "Bash"
         assert message.data["tool_input"]["command"] == "pytest -q"
 
-    def test_resolve_skill_intercept_requires_exact_prefix_match(self, tmp_path: Path) -> None:
-        """Only exact `ooo` and `/ouroboros:` prefixes are intercept candidates."""
-        self._write_skill(
-            tmp_path,
-            "run",
-            [
-                "name: run",
-                'description: "Execute a Seed specification through the workflow engine"',
-                "mcp_tool: ouroboros_execute_seed",
-                "mcp_args:",
-                '  seed_path: "$1"',
-            ],
-        )
-        runtime = CodexCliRuntime(cli_path="codex", skills_dir=tmp_path)
-
-        intercept = runtime._resolve_skill_intercept('ooo run "seed spec.yaml"')
-
-        assert intercept is not None
-        assert intercept.skill_name == "run"
-        assert intercept.command_prefix == "ooo run"
-        assert intercept.first_argument == "seed spec.yaml"
-        assert intercept.mcp_args == {"seed_path": "seed spec.yaml"}
-        assert runtime._resolve_skill_intercept('please ooo run "seed spec.yaml"') is None
-        assert runtime._resolve_skill_intercept("ooo:run seed.yaml") is None
-
-    def test_resolve_skill_intercept_maps_interview_argument_to_initial_context(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        """`ooo interview <topic>` resolves frontmatter templates before dispatch."""
-        self._write_skill(
-            tmp_path,
-            "interview",
-            [
-                "name: interview",
-                'description: "Socratic interview to crystallize vague requirements"',
-                "mcp_tool: ouroboros_interview",
-                "mcp_args:",
-                '  initial_context: "$1"',
-                '  cwd: "$CWD"',
-            ],
-        )
-        runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project", skills_dir=tmp_path)
-
-        intercept = runtime._resolve_skill_intercept('ooo interview "Build a REST API"')
-
-        assert intercept is not None
-        assert intercept.mcp_tool == "ouroboros_interview"
-        assert intercept.first_argument == "Build a REST API"
-        assert intercept.mcp_args == {
-            "initial_context": "Build a REST API",
-            "cwd": "/tmp/project",
+    def test_runtime_does_not_expose_local_dispatch_parser_helpers(self) -> None:
+        """Dispatch parsing and metadata resolution live in the shared router."""
+        obsolete_helpers = {
+            "_extract_first_argument",
+            "_load_skill_frontmatter",
+            "_normalize_mcp_frontmatter",
+            "_resolve_dispatch_templates",
+            "_resolve_skill_dispatch",
+            "_resolve_skill_intercept",
         }
 
-    def test_resolve_skill_intercept_uses_packaged_skill_helper_without_override(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        """Default intercept resolution should read packaged skills via the shared helper."""
-        skill_md_path = self._write_skill(
-            tmp_path,
-            "interview",
-            [
-                "name: interview",
-                'description: "Socratic interview to crystallize vague requirements"',
-                "mcp_tool: ouroboros_interview",
-                "mcp_args:",
-                '  initial_context: "$1"',
-                '  cwd: "$CWD"',
-            ],
-        )
-        runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project")
+        assert obsolete_helpers.isdisjoint(dir(CodexCliRuntime))
 
-        def fake_resolve_packaged_skill(skill_name: str, *, skills_dir: Path | None = None):
-            assert skill_name == "interview"
-            assert skills_dir is None
-
-            class _ResolvedSkill:
-                def __enter__(self) -> Path:
-                    return skill_md_path
-
-                def __exit__(self, exc_type, exc, tb) -> None:
-                    return None
-
-            return _ResolvedSkill()
-
-        with patch(
-            "ouroboros.orchestrator.codex_cli_runtime.resolve_packaged_codex_skill_path",
-            side_effect=fake_resolve_packaged_skill,
-        ) as mock_resolve:
-            intercept = runtime._resolve_skill_intercept('ooo interview "Build a REST API"')
-
-        mock_resolve.assert_called_once_with("interview", skills_dir=None)
-        assert intercept is not None
-        assert intercept.mcp_tool == "ouroboros_interview"
-        assert intercept.mcp_args == {
-            "initial_context": "Build a REST API",
-            "cwd": "/tmp/project",
+    def test_runtime_source_does_not_reference_removed_dispatch_parser_helpers(self) -> None:
+        """Removed local parser helpers should not remain referenced by the runtime."""
+        runtime_source = inspect.getsource(codex_cli_runtime_module)
+        obsolete_helper_references = {
+            "_extract_first_argument(",
+            "_load_skill_frontmatter(",
+            "_normalize_mcp_frontmatter(",
+            "_resolve_dispatch_templates(",
+            "_resolve_skill_dispatch(",
+            "_resolve_skill_intercept(",
+            "SkillInterceptRequest",
         }
 
-    def test_resolve_skill_intercept_bypasses_incomplete_frontmatter(self, tmp_path: Path) -> None:
-        """Missing `mcp_tool` or `mcp_args` disables deterministic intercept."""
-        self._write_skill(
-            tmp_path,
-            "help",
-            [
-                "name: help",
-                'description: "Full reference guide for Ouroboros commands and agents"',
-                "mcp_tool: ouroboros_help",
-            ],
-        )
-        runtime = CodexCliRuntime(cli_path="codex", skills_dir=tmp_path)
+        assert all(reference not in runtime_source for reference in obsolete_helper_references)
 
-        with patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning:
-            intercept = runtime._resolve_skill_intercept("ooo help")
-
-        assert intercept is None
-        mock_warning.assert_called_once()
-        assert (
-            mock_warning.call_args[0][0] == "codex_cli_runtime.skill_intercept_frontmatter_missing"
-        )
-        assert (
-            mock_warning.call_args.kwargs["error"] == "missing required frontmatter key: mcp_args"
-        )
-
-    def test_resolve_skill_intercept_bypasses_invalid_mcp_tool_frontmatter(
+    @pytest.mark.asyncio
+    async def test_execute_task_routes_ooo_input_through_shared_stateless_router(
         self,
         tmp_path: Path,
     ) -> None:
-        """Invalid `mcp_tool` values disable deterministic intercept."""
-        self._write_skill(
-            tmp_path,
-            "help",
-            [
-                "name: help",
-                'description: "Full reference guide for Ouroboros commands and agents"',
-                'mcp_tool: "ouroboros help"',
-                "mcp_args:",
-                '  query: "$1"',
-            ],
+        """Codex CLI runtime should pass through the router's Resolved result."""
+        resolved_sentinel = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run seed.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            first_argument="resolved-first-argument",
         )
-        runtime = CodexCliRuntime(cli_path="codex", skills_dir=tmp_path)
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = CodexCliRuntime(
+            cli_path="codex",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
 
-        with patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning:
-            intercept = runtime._resolve_skill_intercept("ooo help topic")
+        with (
+            patch.object(
+                SharedSkillDispatchRouter,
+                "resolve",
+                autospec=True,
+                return_value=resolved_sentinel,
+            ) as mock_resolve,
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
 
-        assert intercept is None
-        mock_warning.assert_called_once()
-        assert (
-            mock_warning.call_args[0][0] == "codex_cli_runtime.skill_intercept_frontmatter_invalid"
+        mock_resolve.assert_called_once()
+        assert isinstance(mock_resolve.call_args.args[0], SharedSkillDispatchRouter)
+        request = mock_resolve.call_args.args[1]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo run seed.yaml"
+        assert request.cwd == "/tmp/project"
+        assert request.skills_dir == tmp_path
+        dispatcher.assert_awaited_once()
+        intercept_request = dispatcher.await_args.args[0]
+        assert intercept_request is resolved_sentinel
+        assert dispatcher.await_args.args[1] is None
+        mock_exec.assert_not_called()
+        assert [message.content for message in messages] == ["Dispatching", "Intercepted"]
+
+    @pytest.mark.asyncio
+    async def test_execute_task_builtin_dispatcher_consumes_resolved_router_result(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Built-in dispatch should consume Resolved metadata without re-parsing."""
+        resolved = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run prompt-derived.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            first_argument="resolved-first-argument",
         )
-        assert (
-            mock_warning.call_args.kwargs["error"]
-            == "mcp_tool must contain only letters, digits, and underscores"
+        fake_handler = AsyncMock()
+        fake_handler.handle = AsyncMock(
+            return_value=Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="Router dispatch"),),
+                    meta={"execution_id": "exec-router"},
+                )
+            )
         )
+        runtime = CodexCliRuntime(
+            cli_path="codex",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch.object(
+                runtime, "_get_mcp_tool_handler", return_value=fake_handler
+            ) as mock_lookup,
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            ) as mock_exec,
+        ):
+            messages = [
+                message async for message in runtime.execute_task("ooo run prompt-derived.yaml")
+            ]
+
+        mock_resolve.assert_called_once()
+        mock_lookup.assert_called_once_with("router_only_tool")
+        fake_handler.handle.assert_awaited_once_with(
+            {
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            }
+        )
+        mock_exec.assert_not_called()
+        assert messages[0].tool_name == "router_only_tool"
+        assert messages[0].data["tool_input"] == {
+            "seed_path": "resolved-by-router.yaml",
+            "nested": {"source": "router"},
+        }
+        assert messages[0].data["skill_name"] == "router-skill"
+        assert messages[0].data["command_prefix"] == "ooo router-skill"
+        assert messages[1].content == "Router dispatch"
+        assert messages[1].data["execution_id"] == "exec-router"
 
     @pytest.mark.asyncio
     async def test_execute_task_streams_messages_and_final_result(self) -> None:
@@ -660,8 +662,150 @@ class TestCodexCliRuntime:
         assert messages[-1].content == "Codex fallback"
 
     @pytest.mark.asyncio
+    async def test_execute_task_logs_legacy_frontmatter_missing_event_name(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Missing MCP metadata preserves the legacy Codex structured log event."""
+        self._write_skill(
+            tmp_path,
+            "help",
+            [
+                "name: help",
+                'description: "Full reference guide for Ouroboros commands and agents"',
+                "mcp_tool: ouroboros_help",
+            ],
+        )
+        dispatcher = AsyncMock()
+        runtime = CodexCliRuntime(
+            cli_path="codex",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        captured_processes: list[_FakeProcess] = []
+
+        async def fake_create_subprocess_exec(*command: str, **kwargs: object) -> _FakeProcess:
+            output_index = command.index("--output-last-message") + 1
+            Path(command[output_index]).write_text("Codex fallback", encoding="utf-8")
+            proc = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+            captured_processes.append(proc)
+            return proc
+
+        with (
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo help")]
+
+        assert captured_processes[0].stdin.written == b"ooo help"
+        dispatcher.assert_not_awaited()
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "codex_cli_runtime.skill_intercept_frontmatter_missing"
+        )
+        assert (
+            mock_warning.call_args.kwargs["error"] == "missing required frontmatter key: mcp_args"
+        )
+        assert messages[-1].content == "Codex fallback"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_falls_through_when_router_returns_not_handled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Router NotHandled outcomes preserve normal Codex pass-through behavior."""
+        dispatcher = AsyncMock()
+        runtime = CodexCliRuntime(
+            cli_path="codex",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        captured_processes: list[_FakeProcess] = []
+
+        async def fake_create_subprocess_exec(*command: str, **kwargs: object) -> _FakeProcess:
+            output_index = command.index("--output-last-message") + 1
+            Path(command[output_index]).write_text("Codex fallback", encoding="utf-8")
+            proc = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+            captured_processes.append(proc)
+            return proc
+
+        with (
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning,
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.info") as mock_info,
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo missing seed.yaml")]
+
+        assert captured_processes[0].stdin.written == b"ooo missing seed.yaml"
+        dispatcher.assert_not_awaited()
+        mock_exec.assert_called_once()
+        mock_warning.assert_not_called()
+        mock_info.assert_called_once()
+        assert mock_info.call_args.args[0] == "codex_cli_runtime.task_started"
+        assert messages[-1].content == "Codex fallback"
+
+    @pytest.mark.asyncio
     async def test_execute_task_uses_dispatcher_for_valid_intercepts(self, tmp_path: Path) -> None:
         """Exact prefixes with valid frontmatter dispatch before Codex CLI."""
+        self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                'description: "Execute a Seed specification through the workflow engine"',
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = CodexCliRuntime(
+            cli_path="codex",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning,
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.info") as mock_info,
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        dispatcher.assert_awaited_once()
+        intercept_request = dispatcher.await_args.args[0]
+        assert isinstance(intercept_request, Resolved)
+        assert intercept_request.skill_name == "run"
+        assert intercept_request.mcp_tool == "ouroboros_execute_seed"
+        assert intercept_request.first_argument == "seed.yaml"
+        assert intercept_request.mcp_args == {"seed_path": "seed.yaml"}
+        mock_exec.assert_not_called()
+        mock_warning.assert_not_called()
+        mock_info.assert_not_called()
+        assert [message.content for message in messages] == ["Dispatching", "Intercepted"]
+
+    @pytest.mark.asyncio
+    async def test_execute_task_uses_dispatcher_for_slash_prefix_intercepts(
+        self, tmp_path: Path
+    ) -> None:
+        """Legacy slash prefixes remain routed through the shared router."""
         self._write_skill(
             tmp_path,
             "run",
@@ -689,12 +833,15 @@ class TestCodexCliRuntime:
         with patch(
             "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
         ) as mock_exec:
-            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+            messages = [
+                message async for message in runtime.execute_task("/ouroboros:run seed.yaml")
+            ]
 
         dispatcher.assert_awaited_once()
         intercept_request = dispatcher.await_args.args[0]
+        assert isinstance(intercept_request, Resolved)
         assert intercept_request.skill_name == "run"
-        assert intercept_request.mcp_tool == "ouroboros_execute_seed"
+        assert intercept_request.command_prefix == "/ouroboros:run"
         assert intercept_request.first_argument == "seed.yaml"
         assert intercept_request.mcp_args == {"seed_path": "seed.yaml"}
         mock_exec.assert_not_called()
@@ -1196,6 +1343,7 @@ class TestCodexCliRuntime:
 
         with (
             patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning,
+            patch("ouroboros.orchestrator.codex_cli_runtime.log.info") as mock_info,
             patch(
                 "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
                 side_effect=fake_create_subprocess_exec,
@@ -1223,6 +1371,8 @@ class TestCodexCliRuntime:
         assert mock_warning.call_args.kwargs["error_type"] == "RuntimeError"
         assert mock_warning.call_args.kwargs["error"] == "tool unavailable"
         assert mock_warning.call_args.kwargs["exc_info"] is True
+        mock_info.assert_called_once()
+        assert mock_info.call_args.args[0] == "codex_cli_runtime.task_started"
         assert messages[-1].content == "Codex fallback"
 
     @pytest.mark.asyncio
@@ -1283,30 +1433,6 @@ class TestCodexCliRuntime:
         assert mock_warning.call_args.kwargs["tool"] == "ouroboros_interview"
         assert mock_warning.call_args.kwargs["error"] == "Interview session unavailable"
         assert messages[-1].content == "Codex fallback"
-
-    def test_template_resolver_returns_empty_string_for_null_first_argument(
-        self, tmp_path: Path
-    ) -> None:
-        """$1 resolves to empty string when no argument is given, not None."""
-        self._write_skill(
-            tmp_path,
-            "run",
-            [
-                "name: run",
-                'description: "Execute a Seed specification"',
-                "mcp_tool: ouroboros_execute_seed",
-                "mcp_args:",
-                '  seed_path: "$1"',
-            ],
-        )
-        runtime = CodexCliRuntime(cli_path="codex", skills_dir=tmp_path)
-
-        intercept = runtime._resolve_skill_intercept("ooo run")
-
-        assert intercept is not None
-        # $1 with no argument should be empty string, not None
-        assert intercept.mcp_args["seed_path"] == ""
-        assert intercept.first_argument is None
 
     def test_llm_backend_propagated_to_builtin_handlers(self) -> None:
         """llm_backend param is used in _get_builtin_mcp_handlers, not hardcoded."""

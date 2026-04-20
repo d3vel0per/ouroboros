@@ -35,20 +35,6 @@
   <a href="#아홉-개의-사고">에이전트</a>
 </p>
 
----
-
-> **New: OpenClaw 연동** — Ouroboros가 이제 채팅 플랫폼 안에서 직접 실행됩니다. [OpenClaw 가이드](./docs/guides/openclaw-channel-workflow.md)
-> 스킬을 설치하고 MCP를 연결하면, 팀원 누구나 Slack·Discord 등 OpenClaw 지원 채널에서 `ooo` 명령어를 바로 사용할 수 있습니다.
->
-> ```bash
-> clawhub install ouroboros
-> openclaw mcp set ouroboros '{"command":"uvx","args":["--from","ouroboros-ai[mcp]","ouroboros","mcp","serve"]}'
-> ```
->
-> `openclaw mcp set` 명령어가 없다면 `openclaw update`로 최신 버전으로 업데이트하세요.
-
----
-
 > *AI는 무엇이든 만들 수 있다. 어려운 건 무엇을 만들어야 하는지 아는 것이다.*
 
 Ouroboros는 **명세 우선 AI 개발 시스템**입니다. 이 시스템은 소크라테스식 질문법과 온톨로지 분석을 적용하여, 단 한 줄의 코드도 작성하기 전에 사용자의 숨겨진 가정을 드러냅니다.

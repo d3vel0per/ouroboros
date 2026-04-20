@@ -1,8 +1,8 @@
 # Event Payload Schema Reference
 
 This document defines the stable payload fields for Ouroboros EventStore
-events. Consumers that read events — TUI, `ooo status`, `ooo resume`,
-OpenClaw channel workflows, `ouroboros_query_events` — can rely on these
+events. Consumers that read events -- TUI, `ooo status`, `ooo resume`,
+`ouroboros_query_events` -- can rely on these
 fields not being removed or renamed within a given `event_version`.
 
 ## Versioning

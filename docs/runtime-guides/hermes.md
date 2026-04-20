@@ -43,6 +43,12 @@ hermes chat -q "ooo interview 'Build a new CLI tool'"
 hermes chat -q "ooo run seed.yaml"
 ```
 
+Hermes uses the shared stateless `ouroboros.router` resolver for exact `ooo`
+and `/ouroboros:` skill dispatch. Adding or changing a command only requires
+updating the relevant `SKILL.md` frontmatter; the runtime keeps logging,
+message assembly, and MCP invocation local. See
+[Shared `ooo` Skill Dispatch Router](../guides/ooo-skill-dispatch-router.md).
+
 ## Configuration
 
 You can customize the Hermes CLI path in `~/.ouroboros/config.yaml`:

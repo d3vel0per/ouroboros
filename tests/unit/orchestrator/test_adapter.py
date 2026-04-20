@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from types import ModuleType
-from typing import Any
+from typing import Any, get_args, get_origin, get_type_hints
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -13,10 +14,15 @@ from ouroboros.orchestrator.adapter import (
     AgentMessage,
     ClaudeAgentAdapter,
     RuntimeHandle,
+    SkillDispatchHandler,
     TaskResult,
     _clone_runtime_handle_data,
 )
+from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
+from ouroboros.orchestrator.hermes_runtime import HermesCliRuntime
+from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
 from ouroboros.orchestrator.rate_limit import RateLimitSnapshot, SharedRateLimitBucket
+from ouroboros.router import Resolved
 
 
 # Helper function to create mock SDK messages with correct class names
@@ -114,6 +120,32 @@ class TestAgentMessage:
         msg = AgentMessage(type="assistant", content="test")
         with pytest.raises(AttributeError):
             msg.content = "modified"  # type: ignore
+
+
+class TestSkillDispatchHandlerContract:
+    """Tests for the runtime callback contract shared with the router."""
+
+    def test_handler_alias_accepts_router_resolved_payload(self) -> None:
+        """Skill dispatch callbacks receive router Resolved, not runtime-local DTOs."""
+        handler_type = SkillDispatchHandler.__value__
+        handler_args, handler_return = get_args(handler_type)
+
+        assert get_origin(handler_type) is Callable
+        assert handler_args == [Resolved, RuntimeHandle | None]
+        assert get_origin(handler_return) is Awaitable
+
+        return_args = get_args(handler_return)
+        assert return_args == (tuple[AgentMessage, ...] | None,)
+
+    @pytest.mark.parametrize(
+        "runtime_class",
+        [CodexCliRuntime, HermesCliRuntime, OpenCodeRuntime],
+    )
+    def test_runtime_constructors_share_handler_alias(self, runtime_class: type[object]) -> None:
+        """Runtimes should not redefine local skill-dispatch callback types."""
+        init_hints = get_type_hints(runtime_class.__init__)
+
+        assert init_hints["skill_dispatcher"] == SkillDispatchHandler | None
 
 
 class TestTaskResult:

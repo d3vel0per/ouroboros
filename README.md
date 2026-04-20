@@ -36,18 +36,6 @@
   <a href="#from-wonder-to-ontology">Philosophy</a>
 </p>
 
----
-
-> **New: OpenClaw Integration** — Ouroboros now runs inside chat platforms via [OpenClaw](./docs/guides/openclaw-channel-workflow.md).
-> Install the skill, connect MCP, and your team can run `ooo` commands directly from Slack, Discord, or any OpenClaw-supported channel.
->
-> ```bash
-> clawhub install ouroboros
-> openclaw mcp set ouroboros '{"command":"uvx","args":["--from","ouroboros-ai[mcp]","ouroboros","mcp","serve"]}'
-> ```
-
----
-
 **Turn a vague idea into a verified, working codebase -- with any AI coding agent.**
 
 Ouroboros sits between you and your AI runtime (Claude Code, Codex CLI, Hermes, or others). It replaces ad-hoc prompting with a structured specification-first workflow: interview, crystallize, execute, evaluate, evolve.
@@ -105,15 +93,6 @@ ouroboros setup                         # configure runtime
 Legacy compatibility: `ouroboros-ai[dashboard]` is still accepted as a compatibility alias while extras migrate.
 
 See runtime guides: [Claude Code](./docs/runtime-guides/claude-code.md) · [Codex CLI](./docs/runtime-guides/codex.md) · [Hermes](./docs/runtime-guides/hermes.md) · [OpenCode](./docs/runtime-guides/opencode.md)
-
-Chat platform integration (OpenClaw / Slack / Discord / WhatsApp):
-```bash
-clawhub install ouroboros                    # install OpenClaw skill
-openclaw mcp set ouroboros '{"command":"uvx","args":["--from","ouroboros-ai[mcp]","ouroboros","mcp","serve"]}'
-```
-> If `openclaw mcp set` is not recognized, run `openclaw update` to get the latest version.
-
-Guide: [Channel workflow integration](./docs/guides/openclaw-channel-workflow.md)
 
 </details>
 

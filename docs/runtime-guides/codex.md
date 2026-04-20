@@ -143,6 +143,12 @@ After running `ouroboros setup --runtime codex`, the bundled `ooo` skills are in
 
 > **Note on `ooo publish`:** In Codex sessions, `ooo publish` is provided as a skill/runtime surface after setup installs the managed rules and skills. It currently relies on the external `gh` CLI plus GitHub authentication, rather than a dedicated `ouroboros publish` shell subcommand.
 
+Codex uses the shared stateless `ouroboros.router` resolver for exact `ooo`
+and `/ouroboros:` skill dispatch. Adding or changing a command only requires
+updating the relevant `SKILL.md` frontmatter; the runtime keeps logging,
+message assembly, and MCP invocation local. See
+[Shared `ooo` Skill Dispatch Router](../guides/ooo-skill-dispatch-router.md).
+
 ## Quick Start
 
 > For the full first-run onboarding flow (interview → seed → execute), see **[Getting Started](../getting-started.md)**.

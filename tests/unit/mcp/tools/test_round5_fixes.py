@@ -208,11 +208,11 @@ class TestGetOuroborosToolsPluginWiring:
         assert sev.agent_runtime_backend == "opencode"
         assert sev.opencode_mode == "plugin"
 
-    def test_total_tool_count_unchanged(self) -> None:
+    def test_total_tool_count_excludes_removed_channel_workflow(self) -> None:
         from ouroboros.mcp.tools.definitions import get_ouroboros_tools
 
         tools = get_ouroboros_tools()
-        assert len(tools) == 24
+        assert len(tools) == 23
 
 
 # ---------------------------------------------------------------------------

@@ -223,6 +223,12 @@ After running `ouroboros setup --runtime opencode`, the Ouroboros MCP server is 
 
 > **Note on `ooo seed` vs `ooo interview`:** These are two distinct skills with separate roles. `ooo interview` runs a Socratic Q&A session and returns a `session_id`. `ooo seed` accepts that `session_id` and generates a structured Seed YAML (with ambiguity scoring). From the terminal, both steps are performed in a single `ouroboros init start` invocation.
 
+OpenCode uses the shared stateless `ouroboros.router` resolver for exact `ooo`
+and `/ouroboros:` skill dispatch. Adding or changing a command only requires
+updating the relevant `SKILL.md` frontmatter; the runtime keeps logging,
+message assembly, and MCP invocation local. See
+[Shared `ooo` Skill Dispatch Router](../guides/ooo-skill-dispatch-router.md).
+
 ## Quick Start
 
 > For the full first-run onboarding flow (interview -> seed -> execute), see **[Getting Started](../getting-started.md)**.
@@ -308,8 +314,6 @@ In **plugin mode**, these tools delegate execution to the bridge plugin, which s
 - `ouroboros_job_status(None)` / `ouroboros_job_result(None)` are not useful handles
 
 The bridge manages its own lifecycle: child creation, progress rendering (Task panes), and completion signaling. Callers should check `status == "delegated_to_plugin"` and rely on the bridge's inline rendering rather than polling.
-
-The `channel_workflow_handler` (used by OpenClaw/Discord) is unaffected — its inner handlers are pinned to subprocess mode via `_isolate()`, producing real `job_id`s regardless of outer configuration.
 
 ### No interactive mode
 

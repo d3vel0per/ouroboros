@@ -11,8 +11,9 @@ from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPTimeoutError, MCPToolError
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
 from ouroboros.orchestrator.adapter import RuntimeHandle
-from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime, SkillInterceptRequest
+from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
 from ouroboros.orchestrator.command_dispatcher import create_codex_command_dispatcher
+from ouroboros.router.types import Resolved
 
 
 class TestCodexCommandDispatcher:
@@ -41,8 +42,8 @@ class TestCodexCommandDispatcher:
         mcp_args: dict[str, object],
         prompt: str,
         first_argument: str | None,
-    ) -> SkillInterceptRequest:
-        return SkillInterceptRequest(
+    ) -> Resolved:
+        return Resolved(
             skill_name=skill_name,
             command_prefix=f"ooo {skill_name}",
             prompt=prompt,

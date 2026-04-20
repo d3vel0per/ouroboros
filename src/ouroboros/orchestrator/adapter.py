@@ -37,6 +37,7 @@ from ouroboros.orchestrator.rate_limit import (
     SharedRateLimitBucket,
     estimate_runtime_request_tokens,
 )
+from ouroboros.router.types import Resolved
 
 if TYPE_CHECKING:
     from ouroboros.providers.base import CompletionConfig, CompletionResponse, Message
@@ -637,6 +638,12 @@ class AgentMessage:
     def is_error(self) -> bool:
         """Return True if this message indicates an error."""
         return self.data.get("subtype") == "error"
+
+
+type SkillDispatchHandler = Callable[
+    [Resolved, RuntimeHandle | None],
+    Awaitable[tuple[AgentMessage, ...] | None],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1579,6 +1586,7 @@ __all__ = [
     "ClaudeCodeRuntime",
     "DEFAULT_TOOLS",
     "RuntimeHandle",
+    "SkillDispatchHandler",
     "TaskResult",
     "runtime_handle_tool_catalog",
     "runtime_handle_capability_graph",

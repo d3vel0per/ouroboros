@@ -578,8 +578,7 @@ class TestCreateOuroborosServerCwdFallback:
     """Verify create_ouroboros_server() propagates _safe_cwd() fallback to components."""
 
     def test_cwd_root_propagates_fallback_to_all_components(self, tmp_path):
-        """When cwd=/, runtime adapter, LLM adapter, and channel workflow handler
-        all receive the fallback directory (Path.home()), not '/'.
+        """When cwd=/, runtime and LLM adapters receive the fallback directory.
 
         This is the factory-level complement to the unit-level TestSafeCwd tests.
         """
@@ -592,15 +591,6 @@ class TestCreateOuroborosServerCwdFallback:
         # Track calls to key dependency factories
         mock_create_runtime = MagicMock(return_value=MagicMock())
         mock_create_llm = MagicMock(return_value=MagicMock())
-        captured_channel_kwargs: dict = {}
-
-        class ChannelWorkflowCapture:
-            """Capture ChannelWorkflowHandler constructor kwargs."""
-
-            def __init__(self, **kwargs):
-                captured_channel_kwargs.update(kwargs)
-                self.definition = MagicMock()
-                self.definition.name = "ouroboros_channel_workflow"
 
         mock_event_store = MagicMock()
         mock_event_store.initialize = MagicMock()
@@ -626,9 +616,6 @@ class TestCreateOuroborosServerCwdFallback:
             "ouroboros.evolution.reflect.ReflectEngine": MagicMock(),
             "ouroboros.verification.extractor.AssertionExtractor": MagicMock(),
             "ouroboros.mcp.job_manager.JobManager": MagicMock(),
-            "ouroboros.openclaw.workflow.ChannelWorkflowManager": MagicMock(),
-            "ouroboros.openclaw.workflow.ChannelRepoRegistry": MagicMock(),
-            "ouroboros.mcp.tools.definitions.ChannelWorkflowHandler": ChannelWorkflowCapture,
             # Stub all tool handler classes
             "ouroboros.mcp.tools.definitions.ExecuteSeedHandler": _mock_handler(
                 "ouroboros_execute_seed"
@@ -723,83 +710,43 @@ class TestCreateOuroborosServerCwdFallback:
             f"got {llm_call.kwargs['cwd']}"
         )
 
-        # 3) ChannelWorkflowHandler received the fallback as default_repo
-        assert captured_channel_kwargs.get("default_repo") == str(expected_fallback), (
-            f"ChannelWorkflowHandler should receive default_repo={expected_fallback}, "
-            f"got {captured_channel_kwargs.get('default_repo')}"
-        )
-
 
 class TestCreateOuroborosServerOpenCodeMode:
-    """Verify create_ouroboros_server() threads opencode_mode to handlers.
+    """Verify create_ouroboros_server() threads opencode_mode to handlers."""
 
-    Reviewer suggestion #1: call without runtime_backend while config resolves
-    to OpenCode, then assert injected handlers receive 'opencode' mode and
-    ChannelWorkflow inner handlers are force-pinned to 'subprocess'.
-    """
-
-    def test_config_resolves_to_opencode_threads_mode_and_pins_channel_inner(self):
-        """Config → opencode runtime + plugin mode.
-
-        Asserts:
-        1. Outer handlers receive opencode_mode='plugin'.
-        2. ChannelWorkflowHandler receives opencode_mode='plugin'.
-        3. ChannelWorkflow inner handlers are pinned to 'subprocess' by
-           __post_init__ (contract preservation).
-        4. should_dispatch_via_plugin returns True for outer, False for inner.
-        """
+    def test_config_resolves_to_opencode_threads_mode_to_subagent_handlers(self):
+        """Config-resolved OpenCode plugin mode reaches subagent-aware handlers."""
         import contextlib
         from unittest.mock import MagicMock, patch
 
-        from ouroboros.mcp.tools.subagent import should_dispatch_via_plugin
-
-        captured_outer_modes: dict[str, str | None] = {}
-        captured_channel_instance = {}
+        captured_modes: dict[str, list[tuple[str | None, str | None]]] = {}
 
         def _capture_handler(name: str) -> type:
-            """Factory that records opencode_mode from constructor kwargs."""
+            """Factory that records runtime backend and opencode mode."""
 
             class _Handler:
                 def __init__(self, **kwargs):
                     mode = kwargs.get("opencode_mode")
                     backend = kwargs.get("agent_runtime_backend")
-                    captured_outer_modes[name] = mode
+                    captured_modes.setdefault(name, []).append((backend, mode))
                     self.opencode_mode = mode
                     self.agent_runtime_backend = backend
                     self.definition = MagicMock(name=name)
 
             return _Handler
 
-        # ChannelWorkflowHandler: use real class so __post_init__ runs and
-        # we can inspect inner handler pinning.
-        original_cwh = None
-
-        class ChannelWorkflowCapture:
-            """Wraps real ChannelWorkflowHandler to capture + inspect."""
-
-            def __init__(self, **kwargs):
-                nonlocal original_cwh
-                # Import real class — not affected by our patch since we
-                # import from the actual module, not the patched path.
-                from ouroboros.mcp.tools.channel_workflow_handler import (
-                    ChannelWorkflowHandler as RealCWH,
-                )
-
-                original_cwh = RealCWH(**kwargs)
-                captured_channel_instance["kwargs"] = kwargs
-                captured_channel_instance["instance"] = original_cwh
-                self.definition = original_cwh.definition
-
         mock_event_store = MagicMock()
         mock_event_store.initialize = MagicMock()
 
-        # Handlers whose opencode_mode we want to capture
         gated_handlers = {
             "ouroboros_execute_seed": "ouroboros.mcp.tools.definitions.ExecuteSeedHandler",
             "ouroboros_start_execute_seed": "ouroboros.mcp.tools.definitions.StartExecuteSeedHandler",
             "ouroboros_generate_seed": "ouroboros.mcp.tools.definitions.GenerateSeedHandler",
             "ouroboros_interview": "ouroboros.mcp.tools.definitions.InterviewHandler",
             "ouroboros_evaluate": "ouroboros.mcp.tools.definitions.EvaluateHandler",
+            "ouroboros_lateral_think": "ouroboros.mcp.tools.definitions.LateralThinkHandler",
+            "ouroboros_evolve_step": "ouroboros.mcp.tools.definitions.EvolveStepHandler",
+            "ouroboros_start_evolve_step": "ouroboros.mcp.tools.definitions.StartEvolveStepHandler",
             "ouroboros_pm_interview": "ouroboros.mcp.tools.pm_handler.PMInterviewHandler",
             "ouroboros_qa": "ouroboros.mcp.tools.qa.QAHandler",
         }
@@ -819,10 +766,8 @@ class TestCreateOuroborosServerOpenCodeMode:
                 return_value="opencode"
             ),
             "ouroboros.config.get_opencode_mode": MagicMock(return_value="plugin"),
-            # Stub adapters
             "ouroboros.orchestrator.create_agent_runtime": MagicMock(return_value=MagicMock()),
             "ouroboros.providers.create_llm_adapter": MagicMock(return_value=MagicMock()),
-            # Stub heavy services
             "ouroboros.bigbang.interview.InterviewEngine": MagicMock(),
             "ouroboros.bigbang.seed_generator.SeedGenerator": MagicMock(),
             "ouroboros.evaluation.EvaluationPipeline": MagicMock(),
@@ -831,11 +776,6 @@ class TestCreateOuroborosServerOpenCodeMode:
             "ouroboros.evolution.reflect.ReflectEngine": MagicMock(),
             "ouroboros.verification.extractor.AssertionExtractor": MagicMock(),
             "ouroboros.mcp.job_manager.JobManager": MagicMock(),
-            "ouroboros.openclaw.workflow.ChannelWorkflowManager": MagicMock(),
-            "ouroboros.openclaw.workflow.ChannelRepoRegistry": MagicMock(),
-            # ChannelWorkflow uses real class via capture wrapper
-            "ouroboros.mcp.tools.definitions.ChannelWorkflowHandler": ChannelWorkflowCapture,
-            # Non-gated handler stubs
             "ouroboros.mcp.tools.definitions.SessionStatusHandler": _simple_mock_handler(
                 "ouroboros_session_status"
             ),
@@ -856,15 +796,6 @@ class TestCreateOuroborosServerOpenCodeMode:
             ),
             "ouroboros.mcp.tools.definitions.MeasureDriftHandler": _simple_mock_handler(
                 "ouroboros_measure_drift"
-            ),
-            "ouroboros.mcp.tools.definitions.LateralThinkHandler": _simple_mock_handler(
-                "ouroboros_lateral_think"
-            ),
-            "ouroboros.mcp.tools.definitions.EvolveStepHandler": _simple_mock_handler(
-                "ouroboros_evolve_step"
-            ),
-            "ouroboros.mcp.tools.definitions.StartEvolveStepHandler": _simple_mock_handler(
-                "ouroboros_start_evolve_step"
             ),
             "ouroboros.mcp.tools.definitions.LineageStatusHandler": _simple_mock_handler(
                 "ouroboros_lineage_status"
@@ -892,7 +823,6 @@ class TestCreateOuroborosServerOpenCodeMode:
             "ouroboros.config.get_assertion_extraction_model": MagicMock(return_value="test-model"),
         }
 
-        # Gated handlers: use capture factories
         for handler_name, patch_path in gated_handlers.items():
             patch_targets[patch_path] = _capture_handler(handler_name)
 
@@ -902,50 +832,9 @@ class TestCreateOuroborosServerOpenCodeMode:
 
             from ouroboros.mcp.server.adapter import create_ouroboros_server
 
-            # No runtime_backend — config resolves to opencode via mock
             create_ouroboros_server(event_store=mock_event_store)
 
-        # 1) All gated outer handlers received opencode_mode="plugin"
         for name in gated_handlers:
-            assert captured_outer_modes.get(name) == "plugin", (
-                f"{name} should receive opencode_mode='plugin', "
-                f"got '{captured_outer_modes.get(name)}'"
-            )
-
-        # 2) ChannelWorkflowHandler's inner handlers were passed with "plugin"
-        #    by the composition root (captured in outer modes).
-        #    Note: ChannelWorkflowHandler does not receive opencode_mode directly;
-        #    it receives inner handlers that were constructed with opencode_mode.
-        assert "ouroboros_interview" in captured_outer_modes
-        # The composition root creates 2 InterviewHandlers: one top-level, one
-        # inner for ChannelWorkflow. Both get opencode_mode="plugin" at construction.
-        # We captured the second (inner) via the handler factory.
-
-        # 3) ChannelWorkflow inner handlers are force-pinned to "subprocess"
-        cwh = captured_channel_instance["instance"]
-        assert cwh._interview_handler.opencode_mode == "subprocess", (
-            f"ChannelWorkflow inner interview_handler should be pinned to 'subprocess', "
-            f"got '{cwh._interview_handler.opencode_mode}'"
-        )
-        assert cwh._generate_seed_handler.opencode_mode == "subprocess", (
-            f"ChannelWorkflow inner generate_seed_handler should be pinned to 'subprocess', "
-            f"got '{cwh._generate_seed_handler.opencode_mode}'"
-        )
-        assert cwh._start_execute_seed_handler.opencode_mode == "subprocess", (
-            f"ChannelWorkflow inner start_execute_seed_handler should be pinned to 'subprocess', "
-            f"got '{cwh._start_execute_seed_handler.opencode_mode}'"
-        )
-
-        # 4) Gate truth table: outer=True (emit _subagent), inner=False (real path)
-        for _name in gated_handlers:
-            assert should_dispatch_via_plugin("opencode", "plugin") is True
-
-        for inner in (
-            cwh._interview_handler,
-            cwh._generate_seed_handler,
-            cwh._start_execute_seed_handler,
-        ):
-            assert (
-                should_dispatch_via_plugin(inner.agent_runtime_backend, inner.opencode_mode)
-                is False
-            )
+            assert captured_modes.get(name), f"{name} was not constructed"
+            assert all(backend == "opencode" for backend, _mode in captured_modes[name])
+            assert all(mode == "plugin" for _backend, mode in captured_modes[name])

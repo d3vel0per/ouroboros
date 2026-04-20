@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -14,7 +14,9 @@ from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPToolError
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
 from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+import ouroboros.orchestrator.hermes_runtime as hermes_runtime_module
 from ouroboros.orchestrator.hermes_runtime import HermesCliRuntime, _parse_quiet_output
+from ouroboros.router import Resolved, ResolveRequest, SkillDispatchRouter
 
 
 class _FakeStream:
@@ -124,7 +126,40 @@ class TestHermesCliRuntime:
         runtime = HermesCliRuntime(cli_path="hermes", llm_backend="opencode")
         assert runtime._llm_backend == "opencode"
 
-    def test_resolve_skill_intercept_requires_exact_prefix_match(self, tmp_path: Path) -> None:
+    def test_runtime_does_not_expose_local_dispatch_parser_helpers(self) -> None:
+        """Dispatch parsing and metadata resolution live in the shared router."""
+        obsolete_helpers = {
+            "_extract_first_argument",
+            "_load_skill_frontmatter",
+            "_normalize_mcp_frontmatter",
+            "_resolve_dispatch_templates",
+            "_resolve_skill_dispatch",
+            "_resolve_skill_intercept",
+        }
+
+        assert obsolete_helpers.isdisjoint(dir(HermesCliRuntime))
+
+    def test_runtime_source_does_not_reference_removed_dispatch_parser_helpers(self) -> None:
+        """Removed local parser helpers should not remain referenced by the runtime."""
+        runtime_source = inspect.getsource(hermes_runtime_module)
+        obsolete_helper_references = {
+            "_extract_first_argument(",
+            "_load_skill_frontmatter(",
+            "_normalize_mcp_frontmatter(",
+            "_resolve_dispatch_templates(",
+            "_resolve_skill_dispatch(",
+            "_resolve_skill_intercept(",
+            "SkillInterceptRequest",
+            "dispatch_target",
+        }
+
+        assert all(reference not in runtime_source for reference in obsolete_helper_references)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_uses_dispatcher_for_valid_intercept(
+        self,
+        tmp_path: Path,
+    ) -> None:
         self._write_skill(
             tmp_path,
             "run",
@@ -135,18 +170,298 @@ class TestHermesCliRuntime:
                 '  seed_path: "$1"',
             ],
         )
-        runtime = HermesCliRuntime(cli_path="hermes", skills_dir=tmp_path)
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
 
-        intercept = runtime._resolve_skill_intercept('ooo run "seed spec.yaml"')
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+        ):
+            messages = [
+                message async for message in runtime.execute_task('ooo run "seed spec.yaml"')
+            ]
 
-        assert intercept is not None
+        dispatcher.assert_awaited_once()
+        mock_exec.assert_not_called()
+        mock_warning.assert_not_called()
+        intercept = dispatcher.await_args.args[0]
+        assert isinstance(intercept, Resolved)
         assert intercept.skill_name == "run"
         assert intercept.command_prefix == "ooo run"
         assert intercept.first_argument == "seed spec.yaml"
         assert intercept.mcp_args == {"seed_path": "seed spec.yaml"}
-        assert runtime._resolve_skill_intercept('please ooo run "seed spec.yaml"') is None
+        assert messages[-1].content == "Intercepted"
 
-    def test_resolve_skill_intercept_maps_interview_argument_to_initial_context(
+    @pytest.mark.asyncio
+    async def test_execute_task_uses_shared_router_for_normalized_ooo_dispatch(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+                '  cwd: "$CWD"',
+                '  label: "cwd=$CWD seed=$1"',
+                "  nested:",
+                "    values:",
+                '      - "$1"',
+                '      - "$CWD"',
+            ],
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        prompt = ' \tOOO   Run\t"seed spec.yaml" --max-iterations 2'
+        observed_requests: list[object] = []
+        original_resolve = SkillDispatchRouter.resolve
+
+        def resolve_spy(self, request, *, skills_dir=None, cwd=None):
+            observed_requests.append(request)
+            return original_resolve(self, request, skills_dir=skills_dir, cwd=cwd)
+
+        with (
+            patch.object(SkillDispatchRouter, "resolve", new=resolve_spy),
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task(prompt)]
+
+        assert len(observed_requests) == 1
+        resolve_request = observed_requests[0]
+        assert isinstance(resolve_request, ResolveRequest)
+        assert resolve_request.prompt == prompt
+        assert resolve_request.cwd == "/tmp/project"
+        assert resolve_request.skills_dir == tmp_path
+        dispatcher.assert_awaited_once()
+        mock_exec.assert_not_called()
+        intercept = dispatcher.await_args.args[0]
+        assert intercept.skill_name == "run"
+        assert intercept.command_prefix == "ooo run"
+        assert intercept.prompt == prompt
+        assert intercept.first_argument == "seed spec.yaml"
+        assert intercept.mcp_args == {
+            "seed_path": "seed spec.yaml",
+            "cwd": "/tmp/project",
+            "label": "cwd=/tmp/project seed=seed spec.yaml",
+            "nested": {"values": ["seed spec.yaml", "/tmp/project"]},
+        }
+        assert messages[-1].content == "Intercepted"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_passes_resolved_router_result_and_handle_to_dispatcher(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        resolved = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run seed.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={"seed_path": "resolved-by-router.yaml"},
+            first_argument="resolved-first-argument",
+        )
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        resume_handle = RuntimeHandle(
+            backend="hermes_cli",
+            native_session_id="20260412_090000_cafebabe",
+            metadata={"handoff": "runtime-handle"},
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+        ):
+            messages = [
+                message
+                async for message in runtime.execute_task(
+                    "ooo run seed.yaml",
+                    resume_handle=resume_handle,
+                )
+            ]
+
+        mock_resolve.assert_called_once()
+        request = mock_resolve.call_args.args[0]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo run seed.yaml"
+        assert request.cwd == "/tmp/project"
+        assert request.skills_dir == tmp_path
+        dispatcher.assert_awaited_once()
+        assert dispatcher.await_args.args[0] is resolved
+        assert dispatcher.await_args.args[1] is resume_handle
+        mock_exec.assert_not_called()
+        assert [message.content for message in messages] == ["Dispatching", "Intercepted"]
+
+    @pytest.mark.asyncio
+    async def test_execute_task_builtin_dispatcher_emits_router_payload_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Built-in dispatch preserves Hermes message fields from router metadata."""
+        resolved = Resolved(
+            skill_name="router-skill",
+            command_prefix="ooo router-skill",
+            prompt="ooo run prompt-derived.yaml",
+            skill_path=tmp_path / "router-skill" / "SKILL.md",
+            mcp_tool="router_only_tool",
+            mcp_args={
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            first_argument="resolved-first-argument",
+        )
+        fake_handler = AsyncMock()
+        fake_handler.handle = AsyncMock(
+            return_value=Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text="Router dispatch"),),
+                    meta={"execution_id": "exec-router"},
+                )
+            )
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.resolve_skill_dispatch",
+                return_value=resolved,
+            ) as mock_resolve,
+            patch.object(
+                runtime, "_get_mcp_tool_handler", return_value=fake_handler
+            ) as mock_lookup,
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec"
+            ) as mock_exec,
+        ):
+            messages = [
+                message async for message in runtime.execute_task("ooo run prompt-derived.yaml")
+            ]
+
+        mock_resolve.assert_called_once()
+        request = mock_resolve.call_args.args[0]
+        assert isinstance(request, ResolveRequest)
+        assert request.prompt == "ooo run prompt-derived.yaml"
+        assert request.cwd == "/tmp/project"
+        assert request.skills_dir == tmp_path
+        mock_lookup.assert_called_once_with("router_only_tool")
+        fake_handler.handle.assert_awaited_once_with(
+            {
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            }
+        )
+        mock_exec.assert_not_called()
+        mock_warning.assert_not_called()
+        assert len(messages) == 2
+        assert messages[0].type == "assistant"
+        assert messages[0].tool_name == "router_only_tool"
+        assert messages[0].content == "Calling tool: router_only_tool"
+        assert messages[0].data == {
+            "tool_input": {
+                "seed_path": "resolved-by-router.yaml",
+                "nested": {"source": "router"},
+            },
+            "command_prefix": "ooo router-skill",
+            "skill_name": "router-skill",
+        }
+        assert messages[1].type == "result"
+        assert messages[1].content == "Router dispatch"
+        assert messages[1].data == {
+            "subtype": "success",
+            "tool_name": "router_only_tool",
+            "mcp_meta": {"execution_id": "exec-router"},
+            "execution_id": "exec-router",
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_task_requires_exact_skill_prefix_through_shared_router(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        dispatcher = AsyncMock()
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
+
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                return_value=process,
+            ) as mock_exec,
+        ):
+            messages = [
+                message async for message in runtime.execute_task("please ooo run seed.yaml")
+            ]
+
+        dispatcher.assert_not_awaited()
+        mock_exec.assert_called_once()
+        mock_warning.assert_not_called()
+        assert messages[-1].content == "Hermes fallback completed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_maps_interview_argument_to_initial_context(
         self,
         tmp_path: Path,
     ) -> None:
@@ -161,18 +476,34 @@ class TestHermesCliRuntime:
                 '  cwd: "$CWD"',
             ],
         )
-        runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project", skills_dir=tmp_path)
+        dispatcher = AsyncMock(
+            return_value=(
+                AgentMessage(type="assistant", content="Dispatching"),
+                AgentMessage(type="result", content="Intercepted", data={"subtype": "success"}),
+            )
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
 
-        intercept = runtime._resolve_skill_intercept('ooo interview "Build a REST API"')
+        messages = [
+            message async for message in runtime.execute_task('ooo interview "Build a REST API"')
+        ]
 
-        assert intercept is not None
+        dispatcher.assert_awaited_once()
+        intercept = dispatcher.await_args.args[0]
         assert intercept.mcp_tool == "ouroboros_interview"
         assert intercept.mcp_args == {
             "initial_context": "Build a REST API",
             "cwd": "/tmp/project",
         }
+        assert messages[-1].content == "Intercepted"
 
-    def test_resolve_skill_intercept_bypasses_unterminated_frontmatter(
+    @pytest.mark.asyncio
+    async def test_execute_task_bypasses_unterminated_frontmatter(
         self,
         tmp_path: Path,
     ) -> None:
@@ -184,18 +515,27 @@ class TestHermesCliRuntime:
             encoding="utf-8",
         )
         runtime = HermesCliRuntime(cli_path="hermes", skills_dir=tmp_path)
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
 
-        with patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning:
-            intercept = runtime._resolve_skill_intercept("ooo run seed.yaml")
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                return_value=process,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
 
-        assert intercept is None
+        mock_exec.assert_called_once()
         mock_warning.assert_called_once()
         assert (
             mock_warning.call_args[0][0] == "hermes_cli_runtime.skill_intercept_frontmatter_invalid"
         )
         assert "Unterminated frontmatter" in mock_warning.call_args.kwargs["error"]
+        assert messages[-1].content == "Hermes fallback completed"
 
-    def test_resolve_skill_intercept_bypasses_non_mapping_frontmatter(
+    @pytest.mark.asyncio
+    async def test_execute_task_bypasses_non_mapping_frontmatter(
         self,
         tmp_path: Path,
     ) -> None:
@@ -207,20 +547,123 @@ class TestHermesCliRuntime:
             encoding="utf-8",
         )
         runtime = HermesCliRuntime(cli_path="hermes", skills_dir=tmp_path)
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
 
-        with patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning:
-            intercept = runtime._resolve_skill_intercept("ooo run seed.yaml")
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                return_value=process,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
 
-        assert intercept is None
+        mock_exec.assert_called_once()
         mock_warning.assert_called_once()
         assert (
             mock_warning.call_args[0][0] == "hermes_cli_runtime.skill_intercept_frontmatter_invalid"
         )
         assert "Frontmatter must be a mapping" in mock_warning.call_args.kwargs["error"]
+        assert messages[-1].content == "Hermes fallback completed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_bypasses_missing_frontmatter_key(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_path = self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+            ],
+        )
+        runtime = HermesCliRuntime(cli_path="hermes", skills_dir=tmp_path)
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
+        events: list[tuple[str, str]] = []
+
+        def record_warning(event_name: str, **_: object) -> None:
+            events.append(("warning", event_name))
+
+        async def record_forward(*args: object, **_: object) -> _FakeProcess:
+            events.append(("forward", str(args[0])))
+            return process
+
+        with (
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.log.warning",
+                side_effect=record_warning,
+            ) as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                side_effect=record_forward,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert events == [
+            ("warning", "hermes_cli_runtime.skill_intercept_frontmatter_missing"),
+            ("forward", "hermes"),
+        ]
+        assert (
+            mock_warning.call_args[0][0] == "hermes_cli_runtime.skill_intercept_frontmatter_missing"
+        )
+        assert mock_warning.call_args.kwargs == {
+            "skill": "run",
+            "path": str(skill_path),
+            "error": "missing required frontmatter key: mcp_args",
+        }
+        assert messages[-1].content == "Hermes fallback completed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_maps_granular_mcp_args_errors_to_legacy_log_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_path = self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                "  created_at: 2026-04-20",
+            ],
+        )
+        runtime = HermesCliRuntime(cli_path="hermes", skills_dir=tmp_path)
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
+
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                return_value=process,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
+
+        mock_exec.assert_called_once()
+        mock_warning.assert_called_once()
+        assert (
+            mock_warning.call_args[0][0] == "hermes_cli_runtime.skill_intercept_frontmatter_invalid"
+        )
+        assert mock_warning.call_args.kwargs == {
+            "skill": "run",
+            "path": str(skill_path),
+            "error": "mcp_args must be a mapping with string keys and YAML-safe values",
+        }
+        assert messages[-1].content == "Hermes fallback completed"
 
     def test_build_tool_arguments_reuses_interview_session_from_handle(self) -> None:
         runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
-        intercept = SimpleNamespace(
+        intercept = Resolved(
+            skill_name="interview",
+            command_prefix="ooo interview",
+            prompt="ooo interview Next answer",
+            skill_path=Path("/tmp/skills/interview/SKILL.md"),
             mcp_tool="ouroboros_interview",
             mcp_args={"initial_context": "Build a REST API"},
             first_argument="Next answer",
@@ -246,9 +689,11 @@ class TestHermesCliRuntime:
             )
         )
         runtime._builtin_mcp_handlers = {"ouroboros_interview": handler}
-        intercept = SimpleNamespace(
+        intercept = Resolved(
             skill_name="interview",
             command_prefix="ooo interview",
+            prompt="ooo interview",
+            skill_path=Path("/tmp/skills/interview/SKILL.md"),
             mcp_tool="ouroboros_interview",
             mcp_args={"initial_context": "Build a REST API"},
             first_argument=None,
@@ -277,9 +722,11 @@ class TestHermesCliRuntime:
             )
         )
         runtime._builtin_mcp_handlers = {"ouroboros_execute_seed": fake_handler}
-        intercept = SimpleNamespace(
+        intercept = Resolved(
             skill_name="run",
             command_prefix="ooo run",
+            prompt="ooo run seed.yaml",
+            skill_path=Path("/tmp/skills/run/SKILL.md"),
             mcp_tool="ouroboros_execute_seed",
             mcp_args={"seed_path": "seed.yaml"},
             first_argument="seed.yaml",
@@ -313,7 +760,7 @@ class TestHermesCliRuntime:
         self,
         tmp_path: Path,
     ) -> None:
-        self._write_skill(
+        skill_path = self._write_skill(
             tmp_path,
             "run",
             [
@@ -323,8 +770,14 @@ class TestHermesCliRuntime:
                 '  seed_path: "$1"',
             ],
         )
-        dispatcher = AsyncMock(
-            return_value=(
+        events: list[tuple[str, str]] = []
+
+        async def dispatch(
+            intercept: Resolved,
+            handle: RuntimeHandle | None,
+        ) -> tuple[AgentMessage, ...]:
+            events.append(("dispatch", intercept.command_prefix))
+            return (
                 AgentMessage(type="assistant", content="Dispatching"),
                 AgentMessage(
                     type="result",
@@ -336,7 +789,8 @@ class TestHermesCliRuntime:
                     },
                 ),
             )
-        )
+
+        dispatcher = AsyncMock(side_effect=dispatch)
         runtime = HermesCliRuntime(
             cli_path="hermes",
             cwd="/tmp/project",
@@ -345,11 +799,21 @@ class TestHermesCliRuntime:
         )
         process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
 
+        def record_warning(event_name: str, **_: object) -> None:
+            events.append(("warning", event_name))
+
+        async def record_forward(*args: object, **_: object) -> _FakeProcess:
+            events.append(("forward", str(args[0])))
+            return process
+
         with (
-            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.log.warning",
+                side_effect=record_warning,
+            ) as mock_warning,
             patch(
                 "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
-                return_value=process,
+                side_effect=record_forward,
             ) as mock_exec,
         ):
             messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
@@ -357,11 +821,55 @@ class TestHermesCliRuntime:
         dispatcher.assert_awaited_once()
         mock_exec.assert_called_once()
         mock_warning.assert_called_once()
+        assert events == [
+            ("dispatch", "ooo run"),
+            ("warning", "hermes_cli_runtime.skill_intercept_dispatch_failed"),
+            ("forward", "hermes"),
+        ]
         assert mock_warning.call_args[0][0] == "hermes_cli_runtime.skill_intercept_dispatch_failed"
-        assert mock_warning.call_args.kwargs["skill"] == "run"
-        assert mock_warning.call_args.kwargs["tool"] == "ouroboros_execute_seed"
-        assert mock_warning.call_args.kwargs["command_prefix"] == "ooo run"
-        assert mock_warning.call_args.kwargs["recoverable"] is True
+        assert mock_warning.call_args.kwargs == {
+            "skill": "run",
+            "tool": "ouroboros_execute_seed",
+            "command_prefix": "ooo run",
+            "path": str(skill_path),
+            "error_type": "MCPTimeoutError",
+            "error": "Tool call timed out",
+            "recoverable": True,
+        }
+        assert messages[-1].content == "Hermes fallback completed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_falls_through_when_router_returns_not_handled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        dispatcher = AsyncMock()
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+            skill_dispatcher=dispatcher,
+        )
+        process = _FakeProcess("Hermes fallback completed\nsession_id: 20260413_120000_deadbeef\n")
+        events: list[tuple[str, str]] = []
+
+        async def record_forward(*args: object, **_: object) -> _FakeProcess:
+            events.append(("forward", str(args[0])))
+            return process
+
+        with (
+            patch("ouroboros.orchestrator.hermes_runtime.log.warning") as mock_warning,
+            patch(
+                "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+                side_effect=record_forward,
+            ) as mock_exec,
+        ):
+            messages = [message async for message in runtime.execute_task("ooo missing seed.yaml")]
+
+        dispatcher.assert_not_awaited()
+        mock_exec.assert_called_once()
+        mock_warning.assert_not_called()
+        assert events == [("forward", "hermes")]
         assert messages[-1].content == "Hermes fallback completed"
 
     def test_parse_quiet_output_strips_reasoning_banner(self) -> None:

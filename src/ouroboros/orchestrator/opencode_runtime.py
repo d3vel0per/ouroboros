@@ -20,75 +20,46 @@ from __future__ import annotations
 import asyncio
 import codecs
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator
 import contextlib
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 from typing import Any
 
-import yaml
-
-from ouroboros.codex import resolve_packaged_codex_skill_path
 from ouroboros.config import get_opencode_cli_path
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.observability.logging import get_logger
-from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle, TaskResult
+from ouroboros.orchestrator.adapter import (
+    AgentMessage,
+    RuntimeHandle,
+    SkillDispatchHandler,
+    TaskResult,
+)
 from ouroboros.orchestrator.opencode_event_normalizer import (
     OpenCodeEventContext,
     OpenCodeEventNormalizer,
 )
+from ouroboros.router import (
+    InvalidInputReason,
+    InvalidSkill,
+    NotHandled,
+    Resolved,
+    ResolveRequest,
+    resolve_skill_dispatch,
+)
 
 log = get_logger(__name__)
 
-_SKILL_COMMAND_PATTERN = re.compile(
-    r"^\s*(?:(?P<ooo_prefix>ooo)\s+(?P<ooo_skill>[a-z0-9][a-z0-9_-]*)|"
-    r"(?P<slash_prefix>/ouroboros:)(?P<slash_skill>[a-z0-9][a-z0-9_-]*))"
-    r"(?:\s+(?P<remainder>.*))?$",
-    re.IGNORECASE,
-)
-_MCP_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SAFE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_LINE_BUFFER_BYTES = 50 * 1024 * 1024  # 50 MB
 
 _INTERVIEW_SESSION_METADATA_KEY = "ouroboros_interview_session_id"
-
-
-@dataclass(frozen=True, slots=True)
-class SkillInterceptRequest:
-    """Metadata for a deterministic MCP skill intercept.
-
-    Attributes:
-        skill_name: Normalised skill name (e.g. ``"interview"``).
-        command_prefix: Original prefix that triggered the intercept
-            (``"ooo interview"`` or ``"/ouroboros:interview"``).
-        prompt: Full prompt string that matched the skill pattern.
-        skill_path: Filesystem path to the resolved ``SKILL.md``.
-        mcp_tool: MCP tool name extracted from the YAML frontmatter.
-        mcp_args: Default argument dict from the YAML frontmatter.
-        first_argument: First positional argument following the
-            command prefix, or ``None``.
-    """
-
-    skill_name: str
-    command_prefix: str
-    prompt: str
-    skill_path: Path
-    mcp_tool: str
-    mcp_args: dict[str, Any]
-    first_argument: str | None
-
-
-type SkillDispatchHandler = Callable[
-    [SkillInterceptRequest, RuntimeHandle | None],
-    Awaitable[tuple[AgentMessage, ...] | None],
-]
 
 
 class OpenCodeRuntime:
@@ -702,106 +673,45 @@ class OpenCodeRuntime:
 
     # -- Skill interception ------------------------------------------------
 
-    def _extract_first_argument(self, remainder: str | None) -> str | None:
-        """Extract the first positional argument from a command tail.
+    def _invalid_skill_log_name(self, dispatch_result: InvalidSkill) -> str:
+        """Infer the legacy runtime skill field from the resolved skill path."""
+        skill_path = dispatch_result.skill_path
+        if skill_path.name == "SKILL.md" and skill_path.parent.name:
+            return skill_path.parent.name
+        return skill_path.stem or str(skill_path)
 
-        Uses :func:`shlex.split` for proper quoting, falling back
-        to a naive whitespace split on parse errors.
+    def _invalid_skill_log_error(self, dispatch_result: InvalidSkill) -> str:
+        """Map shared-router invalid metadata reasons to Opencode's legacy text."""
+        if dispatch_result.reason == "SKILL.md frontmatter must be a mapping":
+            return f"Frontmatter must be a mapping in {dispatch_result.skill_path}"
+        if self._is_legacy_mcp_args_validation_error(dispatch_result.reason):
+            return "mcp_args must be a mapping with string keys and YAML-safe values"
+        return dispatch_result.reason
 
-        Args:
-            remainder: The command string following the skill prefix,
-                or ``None``.
-
-        Returns:
-            First argument string, or ``None`` if *remainder* is
-            empty.
-        """
-        if not remainder or not remainder.strip():
-            return None
-        try:
-            args = shlex.split(remainder)
-        except ValueError:
-            args = remainder.strip().split(maxsplit=1)
-        return args[0] if args else None
-
-    def _load_skill_frontmatter(self, skill_md_path: Path) -> dict[str, Any]:
-        """Load YAML frontmatter from a packaged ``SKILL.md`` file.
-
-        Parses the leading ``---``-delimited YAML block and returns
-        it as a plain dict.
-
-        Args:
-            skill_md_path: Filesystem path to the ``SKILL.md`` file.
-
-        Returns:
-            Parsed frontmatter dict, or an empty dict if no
-            frontmatter is present.
-
-        Raises:
-            ValueError: If frontmatter delimiters are malformed or
-                the parsed value is not a mapping.
-        """
-        content = skill_md_path.read_text(encoding="utf-8")
-        lines = content.splitlines()
-        if not lines or lines[0].strip() != "---":
-            return {}
-
-        closing_index = next(
-            (index for index, line in enumerate(lines[1:], start=1) if line.strip() == "---"),
-            None,
+    def _is_legacy_mcp_args_validation_error(self, reason: str) -> bool:
+        """Collapse granular router mcp_args validation errors for legacy logs."""
+        if reason == "mcp_args must be a mapping with string keys and YAML-safe values":
+            return False
+        return (
+            reason.startswith("mcp_args.")
+            or reason.startswith("mcp_args[")
+            or reason.endswith("keys must be non-empty strings")
         )
-        if closing_index is None:
-            msg = f"Unterminated frontmatter in {skill_md_path}"
-            raise ValueError(msg)
 
-        raw_frontmatter = "\n".join(lines[1:closing_index]).strip()
-        if not raw_frontmatter:
-            return {}
+    def _log_invalid_skill_intercept(self, dispatch_result: InvalidSkill) -> None:
+        """Preserve runtime-owned warnings for matched skills with bad metadata."""
+        warning_event = f"{self._log_namespace}.skill_intercept_frontmatter_invalid"
+        if (
+            dispatch_result.category is InvalidInputReason.FRONTMATTER_INVALID
+            and dispatch_result.reason.startswith("missing required frontmatter key:")
+        ):
+            warning_event = f"{self._log_namespace}.skill_intercept_frontmatter_missing"
 
-        parsed = yaml.safe_load(raw_frontmatter)
-        if parsed is None:
-            return {}
-        if not isinstance(parsed, dict):
-            msg = f"Frontmatter must be a mapping in {skill_md_path}"
-            raise ValueError(msg)
-        return parsed
-
-    def _normalize_mcp_frontmatter(
-        self,
-        frontmatter: dict[str, Any],
-    ) -> tuple[tuple[str, dict[str, Any]] | None, str | None]:
-        """Validate and normalise MCP dispatch metadata from frontmatter.
-
-        Checks that ``mcp_tool`` and ``mcp_args`` keys are present
-        and well-typed.
-
-        Args:
-            frontmatter: Parsed YAML frontmatter dict.
-
-        Returns:
-            A 2-tuple ``(normalised, error)``.  On success
-            *normalised* is ``(mcp_tool, mcp_args)`` and *error* is
-            ``None``.  On failure *normalised* is ``None`` and
-            *error* contains a human-readable reason string.
-        """
-        raw_mcp_tool = frontmatter.get("mcp_tool")
-        if raw_mcp_tool is None:
-            return None, "missing required frontmatter key: mcp_tool"
-        if not isinstance(raw_mcp_tool, str) or not raw_mcp_tool.strip():
-            return None, "mcp_tool must be a non-empty string"
-
-        mcp_tool = raw_mcp_tool.strip()
-        if _MCP_TOOL_NAME_PATTERN.fullmatch(mcp_tool) is None:
-            return None, "mcp_tool must contain only letters, digits, and underscores"
-
-        if "mcp_args" not in frontmatter:
-            return None, "missing required frontmatter key: mcp_args"
-
-        raw_mcp_args = frontmatter.get("mcp_args")
-        if not isinstance(raw_mcp_args, Mapping):
-            return None, "mcp_args must be a mapping with string keys and YAML-safe values"
-
-        return (mcp_tool, dict(raw_mcp_args)), None
+        log.warning(
+            warning_event,
+            skill=self._invalid_skill_log_name(dispatch_result),
+            error=self._invalid_skill_log_error(dispatch_result),
+        )
 
     def _get_builtin_mcp_handlers(self) -> dict[str, Any]:
         """Load and cache local Ouroboros MCP handlers.
@@ -839,7 +749,7 @@ class OpenCodeRuntime:
 
     def _build_tool_arguments(
         self,
-        intercept: SkillInterceptRequest,
+        intercept: Resolved,
         current_handle: RuntimeHandle | None,
     ) -> dict[str, Any]:
         """Build the MCP argument payload for an intercepted skill.
@@ -872,7 +782,7 @@ class OpenCodeRuntime:
     def _build_resume_handle(
         self,
         current_handle: RuntimeHandle | None,
-        intercept: SkillInterceptRequest,
+        intercept: Resolved,
         tool_result: Any,
     ) -> RuntimeHandle | None:
         """Attach interview session metadata to the runtime handle.
@@ -915,7 +825,7 @@ class OpenCodeRuntime:
 
     async def _dispatch_skill_intercept_locally(
         self,
-        intercept: SkillInterceptRequest,
+        intercept: Resolved,
         current_handle: RuntimeHandle | None,
     ) -> tuple[AgentMessage, ...] | None:
         """Dispatch an exact-prefix intercept to a local MCP handler.
@@ -991,134 +901,19 @@ class OpenCodeRuntime:
             ),
         )
 
-    def _resolve_skill_intercept(self, prompt: str) -> SkillInterceptRequest | None:
-        """Resolve a deterministic MCP intercept from a skill command.
-
-        Matches the prompt against ``_SKILL_COMMAND_PATTERN``, locates
-        the corresponding ``SKILL.md``, and extracts MCP dispatch
-        metadata from its YAML frontmatter.
-
-        Args:
-            prompt: Raw prompt string to test for skill prefixes.
-
-        Returns:
-            :class:`SkillInterceptRequest` when the prompt matches a
-            known skill with valid MCP frontmatter, or ``None``.
-        """
-        match = _SKILL_COMMAND_PATTERN.match(prompt)
-        if match is None:
-            return None
-
-        skill_name = (match.group("ooo_skill") or match.group("slash_skill") or "").lower()
-        if not skill_name:
-            return None
-
-        command_prefix = (
-            f"ooo {skill_name}"
-            if match.group("ooo_skill") is not None
-            else f"/ouroboros:{skill_name}"
-        )
-        try:
-            with resolve_packaged_codex_skill_path(
-                skill_name,
-                skills_dir=self._skills_dir,
-            ) as skill_md_path:
-                frontmatter = self._load_skill_frontmatter(skill_md_path)
-                # Resolve to a concrete Path while the context manager is
-                # alive — importlib.resources may clean up a temp extraction
-                # once the ``with`` block exits.
-                resolved_skill_path = Path(str(skill_md_path))
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, yaml.YAMLError) as e:
-            log.warning(
-                f"{self._log_namespace}.skill_intercept_frontmatter_invalid",
-                skill=skill_name,
-                error=str(e),
-            )
-            return None
-
-        normalized, validation_error = self._normalize_mcp_frontmatter(frontmatter)
-        if normalized is None:
-            if validation_error and not validation_error.startswith(
-                "missing required frontmatter key:"
-            ):
-                log.warning(
-                    f"{self._log_namespace}.skill_intercept_frontmatter_invalid",
-                    skill=skill_name,
-                    error=validation_error,
-                )
-            return None
-
-        mcp_tool, mcp_args = normalized
-        first_argument = self._extract_first_argument(match.group("remainder"))
-        return SkillInterceptRequest(
-            skill_name=skill_name,
-            command_prefix=command_prefix,
-            prompt=prompt,
-            skill_path=resolved_skill_path,
-            mcp_tool=mcp_tool,
-            mcp_args=self._resolve_dispatch_templates(
-                mcp_args,
-                first_argument=first_argument,
-            ),
-            first_argument=first_argument,
-        )
-
-    def _resolve_dispatch_templates(
-        self,
-        value: Any,
-        *,
-        first_argument: str | None,
-    ) -> Any:
-        """Resolve ``$1`` / ``$CWD`` placeholders in MCP dispatch arguments.
-
-        Mirrors :meth:`CodexCliRuntime._resolve_dispatch_templates` so that
-        shipped skill frontmatter like ``mcp_args: {seed_path: "$1"}`` is
-        expanded before the MCP tool call.
-
-        Args:
-            value: Argument tree (str, dict, list, or primitive).
-            first_argument: The first positional word after the command prefix.
-
-        Returns:
-            Expanded copy of *value*.
-        """
-        if isinstance(value, str):
-            if value == "$1":
-                return first_argument if first_argument is not None else ""
-            if value == "$CWD":
-                return self._cwd
-            return value
-
-        if isinstance(value, Mapping):
-            return {
-                key: self._resolve_dispatch_templates(item, first_argument=first_argument)
-                for key, item in value.items()
-            }
-
-        if isinstance(value, list):
-            return [
-                self._resolve_dispatch_templates(item, first_argument=first_argument)
-                for item in value
-            ]
-
-        return value
-
     async def _maybe_dispatch_skill_intercept(
         self,
-        prompt: str,
+        intercept: Resolved,
         current_handle: RuntimeHandle | None,
     ) -> tuple[AgentMessage, ...] | None:
         """Attempt deterministic skill dispatch before invoking OpenCode.
 
-        Falls back to ``None`` (no interception) when the prompt does
-        not match a known skill, when dispatch raises, or when the
-        result contains a recoverable error that should be retried by
-        the main CLI path.
+        Falls back to ``None`` (no interception) when dispatch raises
+        or when the result contains a recoverable error that should be
+        retried by the main CLI path.
 
         Args:
-            prompt: Raw prompt string.
+            intercept: Resolved shared-router skill dispatch metadata.
             current_handle: Active runtime handle, or ``None``.
 
         Returns:
@@ -1127,10 +922,6 @@ class OpenCodeRuntime:
             values if dispatched, or ``None`` to fall through to the
             CLI path.
         """
-        intercept = self._resolve_skill_intercept(prompt)
-        if intercept is None:
-            return None
-
         dispatcher = self._skill_dispatcher or self._dispatch_skill_intercept_locally
         try:
             dispatched_messages = await dispatcher(intercept, current_handle)
@@ -1249,8 +1040,22 @@ class OpenCodeRuntime:
         """
         current_handle = resume_handle or self._build_runtime_handle(resume_session_id)
 
-        # Try skill interception first
-        intercepted = await self._maybe_dispatch_skill_intercept(prompt, current_handle)
+        # Resolve deterministic skill dispatch once before invoking OpenCode.
+        dispatch_result = resolve_skill_dispatch(
+            ResolveRequest(
+                prompt=prompt,
+                cwd=self._cwd,
+                skills_dir=self._skills_dir,
+            )
+        )
+        intercepted: tuple[AgentMessage, ...] | None = None
+        if isinstance(dispatch_result, InvalidSkill):
+            self._log_invalid_skill_intercept(dispatch_result)
+        elif not isinstance(dispatch_result, NotHandled):
+            intercepted = await self._maybe_dispatch_skill_intercept(
+                dispatch_result,
+                current_handle,
+            )
         if intercepted is not None:
             for message in intercepted:
                 if message.resume_handle is not None:
@@ -1565,4 +1370,4 @@ class OpenCodeRuntime:
         )
 
 
-__all__ = ["OpenCodeRuntime", "SkillInterceptRequest"]
+__all__ = ["OpenCodeRuntime"]

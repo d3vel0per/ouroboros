@@ -984,7 +984,7 @@ class ChecklistVerifyHandler:
       delegation) and has a stable public contract.  Adding a retry
       loop inside it would entangle with Ralph mode and the Job system.
     - This tool lets the *caller* (a human, a ``/ralph`` loop, or a
-      channel workflow) decide when and how to retry.  No decisions
+      runtime workflow) decide when and how to retry.  No decisions
       are hidden inside background tasks.
     - It is opt-in: existing callers are unaffected.
     """

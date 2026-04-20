@@ -9,12 +9,12 @@ import pytest
 
 from ouroboros.core.types import Result
 from ouroboros.mcp.tools.authoring_handlers import _is_interview_completion_signal
+from ouroboros.mcp.tools.brownfield_handler import BrownfieldHandler
 from ouroboros.mcp.tools.definitions import (
     OUROBOROS_TOOLS,
     ACTreeHUDHandler,
     CancelExecutionHandler,
     CancelJobHandler,
-    ChannelWorkflowHandler,
     EvaluateHandler,
     EvolveRewindHandler,
     EvolveStepHandler,
@@ -38,6 +38,7 @@ from ouroboros.mcp.tools.definitions import (
     interview_handler,
     start_execute_seed_handler,
 )
+from ouroboros.mcp.tools.pm_handler import PMInterviewHandler
 from ouroboros.mcp.tools.qa import QAHandler
 from ouroboros.mcp.types import ToolInputType
 from ouroboros.orchestrator.adapter import (
@@ -338,11 +339,38 @@ class TestQueryEventsHandler:
 class TestOuroborosTools:
     """Test OUROBOROS_TOOLS constant."""
 
+    EXPECTED_OUROBOROS_TOOL_NAMES = {
+        "ouroboros_ac_tree_hud",
+        "ouroboros_brownfield",
+        "ouroboros_cancel_execution",
+        "ouroboros_cancel_job",
+        "ouroboros_checklist_verify",
+        "ouroboros_evaluate",
+        "ouroboros_evolve_rewind",
+        "ouroboros_evolve_step",
+        "ouroboros_execute_seed",
+        "ouroboros_generate_seed",
+        "ouroboros_interview",
+        "ouroboros_job_result",
+        "ouroboros_job_status",
+        "ouroboros_job_wait",
+        "ouroboros_lateral_think",
+        "ouroboros_lineage_status",
+        "ouroboros_measure_drift",
+        "ouroboros_pm_interview",
+        "ouroboros_qa",
+        "ouroboros_query_events",
+        "ouroboros_session_status",
+        "ouroboros_start_evolve_step",
+        "ouroboros_start_execute_seed",
+    }
+
     def test_ouroboros_tools_contains_all_handlers(self) -> None:
         """OUROBOROS_TOOLS contains all standard handlers."""
         from ouroboros.mcp.tools.evaluation_handlers import ChecklistVerifyHandler
 
-        assert len(OUROBOROS_TOOLS) == 24
+        names = {h.definition.name for h in OUROBOROS_TOOLS}
+        assert names == self.EXPECTED_OUROBOROS_TOOL_NAMES
 
         handler_types = {type(h) for h in OUROBOROS_TOOLS}
         assert ACTreeHUDHandler in handler_types
@@ -365,7 +393,9 @@ class TestOuroborosTools:
         assert LineageStatusHandler in handler_types
         assert EvolveRewindHandler in handler_types
         assert CancelExecutionHandler in handler_types
-        assert ChannelWorkflowHandler in handler_types
+        assert BrownfieldHandler in handler_types
+        assert PMInterviewHandler in handler_types
+        assert QAHandler in handler_types
 
     def test_all_tools_have_unique_names(self) -> None:
         """All tools have unique names."""
@@ -381,7 +411,7 @@ class TestOuroborosTools:
     def test_get_ouroboros_tools_can_inject_runtime_backend(self) -> None:
         """Tool factory can build execute_seed with a specific runtime backend."""
         tools = get_ouroboros_tools(runtime_backend="codex")
-        assert len(tools) == 24
+        assert {h.definition.name for h in tools} == self.EXPECTED_OUROBOROS_TOOL_NAMES
         execute_handler = next(h for h in tools if isinstance(h, ExecuteSeedHandler))
         assert execute_handler.agent_runtime_backend == "codex"
 

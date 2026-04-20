@@ -5,7 +5,6 @@ registration, resource handling, and the full server lifecycle.
 """
 
 import asyncio
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -477,6 +476,32 @@ class TestMCPServerAdapterIntegration:
 class TestCreateOuroborosServer:
     """Test the create_ouroboros_server factory function."""
 
+    EXPECTED_OUROBOROS_SERVER_TOOLS = {
+        "ouroboros_ac_dashboard",
+        "ouroboros_ac_tree_hud",
+        "ouroboros_brownfield",
+        "ouroboros_cancel_execution",
+        "ouroboros_cancel_job",
+        "ouroboros_evaluate",
+        "ouroboros_evolve_rewind",
+        "ouroboros_evolve_step",
+        "ouroboros_execute_seed",
+        "ouroboros_generate_seed",
+        "ouroboros_interview",
+        "ouroboros_job_result",
+        "ouroboros_job_status",
+        "ouroboros_job_wait",
+        "ouroboros_lateral_think",
+        "ouroboros_lineage_status",
+        "ouroboros_measure_drift",
+        "ouroboros_pm_interview",
+        "ouroboros_qa",
+        "ouroboros_query_events",
+        "ouroboros_session_status",
+        "ouroboros_start_evolve_step",
+        "ouroboros_start_execute_seed",
+    }
+
     def test_creates_server_with_defaults(self) -> None:
         """Factory creates server with default configuration."""
         server = create_ouroboros_server()
@@ -484,8 +509,7 @@ class TestCreateOuroborosServer:
         assert server.info.name == "ouroboros-mcp"
         assert server.info.version == "1.0.0"
         tool_names = {tool.name for tool in server.info.tools}
-        assert "ouroboros_ac_tree_hud" in tool_names
-        assert "ouroboros_channel_workflow" in tool_names
+        assert tool_names == self.EXPECTED_OUROBOROS_SERVER_TOOLS
 
     def test_creates_server_with_custom_config(self) -> None:
         """Factory creates server with custom configuration."""
@@ -560,38 +584,6 @@ class TestCreateOuroborosServer:
         assert mock_create_llm_adapter.call_args.kwargs["backend"] == "opencode"
         mock_create_runtime.assert_called_once()
         assert mock_create_runtime.call_args.kwargs["backend"] == "opencode"
-
-    @pytest.mark.asyncio
-    async def test_channel_workflow_set_repo_and_status(self, tmp_path: Path) -> None:
-        """Channel workflow tool supports repo config and status without LLM execution."""
-        server = create_ouroboros_server(state_dir=tmp_path / "data")
-
-        set_result = await server.call_tool(
-            "ouroboros_channel_workflow",
-            {
-                "action": "set_repo",
-                "guild_id": "g1",
-                "channel_id": "c1",
-                "repo": str(tmp_path / "repo"),
-            },
-        )
-
-        assert set_result.is_ok
-        assert "Default repo" in set_result.value.text_content
-
-        status_result = await server.call_tool(
-            "ouroboros_channel_workflow",
-            {
-                "action": "status",
-                "guild_id": "g1",
-                "channel_id": "c1",
-            },
-        )
-
-        assert status_result.is_ok
-        assert "Channel Workflow Summary" in status_result.value.text_content
-        assert str(tmp_path / "repo") in status_result.value.text_content
-        assert (Path.home() / ".ouroboros" / "ouroboros.db").exists()
 
 
 class TestMCPServerAdapterConcurrency:
