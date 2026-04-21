@@ -1,11 +1,51 @@
 """Tests for MCP client manager."""
 
+from ouroboros.core.types import Result
 from ouroboros.mcp.client.manager import (
     ConnectionState,
     MCPClientManager,
+    ServerConnection,
 )
-from ouroboros.mcp.errors import MCPClientError
-from ouroboros.mcp.types import MCPServerConfig, TransportType
+from ouroboros.mcp.errors import MCPClientError, MCPConnectionError
+from ouroboros.mcp.types import (
+    ContentType,
+    MCPCapabilities,
+    MCPContentItem,
+    MCPResourceContent,
+    MCPServerConfig,
+    MCPServerInfo,
+    MCPToolDefinition,
+    MCPToolResult,
+    TransportType,
+)
+
+
+class _ToolAdapter:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    async def call_tool(self, _tool_name, _arguments=None):
+        self.calls += 1
+        return self.result
+
+
+class _ResourceAdapter:
+    def __init__(self, result):
+        self.result = result
+        self.calls = 0
+
+    async def read_resource(self, _uri):
+        self.calls += 1
+        return self.result
+
+
+class _HealthAdapter:
+    def __init__(self, result):
+        self.result = result
+
+    async def list_tools(self):
+        return self.result
 
 
 class TestConnectionState:
@@ -134,6 +174,54 @@ class TestMCPClientManagerTools:
         tools = await manager.list_all_tools()
         assert len(tools) == 0
 
+    async def test_call_tool_reconnects_once_after_transport_failure(self) -> None:
+        """call_tool reconnects and retries once when the transport is closed."""
+        manager = MCPClientManager()
+        config = MCPServerConfig(
+            name="test-server",
+            transport=TransportType.STDIO,
+            command="test-cmd",
+        )
+        stale_adapter = _ToolAdapter(
+            Result.err(MCPConnectionError("transport closed", server_name="test-server"))
+        )
+        fresh_result = MCPToolResult(
+            content=(MCPContentItem(type=ContentType.TEXT, text="ok"),),
+            is_error=False,
+        )
+        fresh_adapter = _ToolAdapter(Result.ok(fresh_result))
+        tool = MCPToolDefinition(name="tool", description="")
+        manager._connections["test-server"] = ServerConnection(
+            config=config,
+            adapter=stale_adapter,
+            state=ConnectionState.CONNECTED,
+            tools=(tool,),
+        )
+
+        async def _connect(server_name: str):
+            manager._connections[server_name] = ServerConnection(
+                config=config,
+                adapter=fresh_adapter,
+                state=ConnectionState.CONNECTED,
+                tools=(tool,),
+            )
+            return Result.ok(
+                MCPServerInfo(
+                    name=server_name,
+                    version="1.0.0",
+                    capabilities=MCPCapabilities(tools=True),
+                )
+            )
+
+        manager.connect = _connect  # type: ignore[method-assign]
+
+        result = await manager.call_tool("test-server", "tool", {})
+
+        assert result.is_ok
+        assert result.value.text_content == "ok"
+        assert stale_adapter.calls == 1
+        assert fresh_adapter.calls == 1
+
 
 class TestMCPClientManagerResources:
     """Test MCPClientManager resource operations."""
@@ -152,3 +240,89 @@ class TestMCPClientManagerResources:
         manager = MCPClientManager()
         resources = await manager.list_all_resources()
         assert len(resources) == 0
+
+    async def test_read_resource_reconnects_once_after_transport_failure(self) -> None:
+        """read_resource reconnects and retries once when the transport is closed."""
+        manager = MCPClientManager()
+        config = MCPServerConfig(
+            name="test-server",
+            transport=TransportType.STDIO,
+            command="test-cmd",
+        )
+        stale_adapter = _ResourceAdapter(
+            Result.err(MCPConnectionError("transport closed", server_name="test-server"))
+        )
+        fresh_adapter = _ResourceAdapter(
+            Result.ok(MCPResourceContent(uri="file://doc", text="ok"))
+        )
+        manager._connections["test-server"] = ServerConnection(
+            config=config,
+            adapter=stale_adapter,
+            state=ConnectionState.CONNECTED,
+        )
+
+        async def _connect(server_name: str):
+            manager._connections[server_name] = ServerConnection(
+                config=config,
+                adapter=fresh_adapter,
+                state=ConnectionState.CONNECTED,
+            )
+            return Result.ok(
+                MCPServerInfo(
+                    name=server_name,
+                    version="1.0.0",
+                    capabilities=MCPCapabilities(resources=True),
+                )
+            )
+
+        manager.connect = _connect  # type: ignore[method-assign]
+
+        result = await manager.read_resource("test-server", "file://doc")
+
+        assert result.is_ok
+        assert result.value.text == "ok"
+        assert stale_adapter.calls == 1
+        assert fresh_adapter.calls == 1
+
+
+class TestMCPClientManagerHealthChecks:
+    """Test MCPClientManager health-check recovery."""
+
+    async def test_health_check_reconnects_immediately_after_failure(self) -> None:
+        """A failed heartbeat check attempts reconnect in the same pass."""
+        manager = MCPClientManager()
+        config = MCPServerConfig(
+            name="test-server",
+            transport=TransportType.STDIO,
+            command="test-cmd",
+        )
+        manager._connections["test-server"] = ServerConnection(
+            config=config,
+            adapter=_HealthAdapter(
+                Result.err(MCPConnectionError("transport closed", server_name="test-server"))
+            ),
+            state=ConnectionState.CONNECTED,
+        )
+        reconnects: list[str] = []
+
+        async def _connect(server_name: str):
+            reconnects.append(server_name)
+            manager._connections[server_name] = ServerConnection(
+                config=config,
+                adapter=_HealthAdapter(Result.ok(())),
+                state=ConnectionState.CONNECTED,
+            )
+            return Result.ok(
+                MCPServerInfo(
+                    name=server_name,
+                    version="1.0.0",
+                    capabilities=MCPCapabilities(tools=True),
+                )
+            )
+
+        manager.connect = _connect  # type: ignore[method-assign]
+
+        await manager._perform_health_checks()
+
+        assert reconnects == ["test-server"]
+        assert manager.get_connection_state("test-server") == ConnectionState.CONNECTED
