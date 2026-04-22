@@ -333,10 +333,12 @@ class EvaluateHandler:
                     name="working_dir",
                     type=ToolInputType.STRING,
                     description=(
-                        "Project working directory for language auto-detection of Stage 1 "
-                        "mechanical verification commands. Auto-detects language from marker "
-                        "files (build.zig, Cargo.toml, go.mod, package.json, etc.). "
-                        "Supports .ouroboros/mechanical.toml for custom overrides."
+                        "Project root used to resolve Stage 1 mechanical verification "
+                        "commands. Commands are read from .ouroboros/mechanical.toml; "
+                        "when the file is missing, the evaluator makes one AI detect "
+                        "call that inspects manifests (package.json, pyproject.toml, "
+                        "Cargo.toml, Makefile, ...) and authors the toml. Stage 1 "
+                        "skips every check when no toml is produced — it never guesses."
                     ),
                     required=False,
                 ),
@@ -363,6 +365,8 @@ class EvaluateHandler:
             PipelineConfig,
             SemanticConfig,
             build_mechanical_config,
+            ensure_mechanical_toml,
+            has_mechanical_toml,
         )
 
         session_id = arguments.get("session_id")
@@ -533,6 +537,24 @@ class EvaluateHandler:
                 )
                 artifact_bundle = None
 
+            # Stage 1 trusts .ouroboros/mechanical.toml only. When the file is
+            # absent we run the AI detector once to author it — silent
+            # best-effort, so a failed detect simply leaves Stage 1 empty and
+            # the pipeline falls through to Stage 2 instead of phantom-failing
+            # on hardcoded preset guesses.
+            if not has_mechanical_toml(working_dir):
+                try:
+                    await ensure_mechanical_toml(
+                        working_dir,
+                        llm_adapter,
+                        backend=self.llm_backend,
+                    )
+                except Exception as exc:  # noqa: BLE001 — detector must never break eval
+                    log.warning(
+                        "mcp.tool.evaluate.detect_failed",
+                        working_dir=str(working_dir),
+                        error=str(exc),
+                    )
             mechanical_config = build_mechanical_config(working_dir)
             config = PipelineConfig(
                 mechanical=mechanical_config,
