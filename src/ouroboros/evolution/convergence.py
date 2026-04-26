@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ouroboros.core.lineage import EvaluationSummary, OntologyDelta, OntologyLineage
+from ouroboros.core.lineage import (
+    EvaluationSummary,
+    GenerationPhase,
+    GenerationRecord,
+    OntologyDelta,
+    OntologyLineage,
+)
 from ouroboros.evolution.regression import RegressionDetector
 from ouroboros.evolution.wonder import WonderOutput
 
@@ -51,12 +57,14 @@ class ConvergenceCriteria:
     ac_gate_mode: str = "all"  # "all" | "ratio" | "off"
     ac_min_pass_ratio: float = 1.0  # for "ratio" mode
     regression_gate_enabled: bool = True
+    validation_gate_enabled: bool = True
 
     def evaluate(
         self,
         lineage: OntologyLineage,
         latest_wonder: WonderOutput | None = None,
         latest_evaluation: EvaluationSummary | None = None,
+        validation_output: str | None = None,
     ) -> ConvergenceSignal:
         """Check if the loop should terminate.
 
@@ -67,11 +75,12 @@ class ConvergenceCriteria:
         Returns:
             ConvergenceSignal with convergence status and reason.
         """
-        num_gens = len(lineage.generations)
+        completed = self._completed_generations(lineage)
+        num_completed = len(completed)
         current_gen = lineage.current_generation
 
-        # Signal 4: Hard cap
-        if num_gens >= self.max_generations:
+        # Signal 4: Hard cap (only count completed generations)
+        if num_completed >= self.max_generations:
             return ConvergenceSignal(
                 converged=True,
                 reason=f"Max generations reached ({self.max_generations})",
@@ -79,11 +88,11 @@ class ConvergenceCriteria:
                 generation=current_gen,
             )
 
-        # Need at least min_generations before checking other signals
-        if num_gens < self.min_generations:
+        # Need at least min_generations completed before checking other signals
+        if num_completed < self.min_generations:
             return ConvergenceSignal(
                 converged=False,
-                reason=f"Below minimum generations ({num_gens}/{self.min_generations})",
+                reason=f"Below minimum generations ({num_completed}/{self.min_generations})",
                 ontology_similarity=0.0,
                 generation=current_gen,
             )
@@ -128,7 +137,9 @@ class ConvergenceCriteria:
 
             # Signal 5: Regression gate — block convergence if ACs regressed
             if self.regression_gate_enabled:
-                regression_report = RegressionDetector().detect(lineage)
+                # Pass only completed generations to regression detector
+                completed_lineage = lineage.model_copy(update={"generations": completed})
+                regression_report = RegressionDetector().detect(completed_lineage)
                 if regression_report.has_regressions:
                     regressed = regression_report.regressed_ac_indices
                     display = ", ".join(str(i + 1) for i in regressed)
@@ -142,22 +153,32 @@ class ConvergenceCriteria:
                         failed_acs=regressed,
                     )
 
-            # False convergence gate: block if ontology never actually evolved.
-            # When Wonder→Reflect repeatedly fails, the same seed is re-executed
-            # and similarity stays at 1.0 — this is convergence through failure,
-            # not through genuine stabilization.
+            # Evolution gate: withhold convergence if ontology never actually evolved.
+            # When ontology never changes, either Reflect is conservatively
+            # preserving a well-performing ontology, or Wonder/Reflect encountered
+            # errors. Either way, withhold convergence until genuine evolution occurs.
             evolved_count = self._count_evolved_generations(lineage)
             if evolved_count == 0:
                 return ConvergenceSignal(
                     converged=False,
                     reason=(
-                        f"False convergence blocked: similarity {latest_sim:.3f} "
-                        f"but ontology never evolved across {num_gens} generations "
-                        f"(Wonder→Reflect may have failed)"
+                        f"Convergence withheld: similarity {latest_sim:.3f} "
+                        f"but ontology unchanged across {num_completed} generations "
+                        f"(evolution required before convergence is accepted)"
                     ),
                     ontology_similarity=latest_sim,
                     generation=current_gen,
                 )
+
+            # Validation gate: block convergence if validation was skipped or failed
+            if self.validation_gate_enabled and validation_output:
+                if "skipped" in validation_output.lower() or "error" in validation_output.lower():
+                    return ConvergenceSignal(
+                        converged=False,
+                        reason=(f"Validation gate blocked: {validation_output}"),
+                        ontology_similarity=latest_sim,
+                        generation=current_gen,
+                    )
 
             return ConvergenceSignal(
                 converged=True,
@@ -170,7 +191,7 @@ class ConvergenceCriteria:
             )
 
         # Signal 2: Stagnation (unchanged for N consecutive gens)
-        if num_gens >= self.stagnation_window:
+        if num_completed >= self.stagnation_window:
             stagnant = self._check_stagnation(lineage)
             if stagnant:
                 return ConvergenceSignal(
@@ -184,7 +205,7 @@ class ConvergenceCriteria:
                 )
 
         # Signal 2.5: Oscillation detection (A→B→A→B cycling)
-        if self.enable_oscillation_detection and num_gens >= 3:
+        if self.enable_oscillation_detection and num_completed >= 3:
             oscillating = self._check_oscillation(lineage)
             if oscillating:
                 return ConvergenceSignal(
@@ -195,7 +216,7 @@ class ConvergenceCriteria:
                 )
 
         # Signal 3: Repetitive wonder questions
-        if latest_wonder and num_gens >= 3:
+        if latest_wonder and num_completed >= 3:
             repetitive = self._check_repetitive_feedback(lineage, latest_wonder)
             if repetitive:
                 return ConvergenceSignal(
@@ -213,25 +234,31 @@ class ConvergenceCriteria:
             generation=current_gen,
         )
 
+    def _completed_generations(self, lineage: OntologyLineage) -> tuple[GenerationRecord, ...]:
+        """Return only completed generations for convergence calculations."""
+        return tuple(g for g in lineage.generations if g.phase == GenerationPhase.COMPLETED)
+
     def _latest_similarity(self, lineage: OntologyLineage) -> float:
-        """Compute similarity between the last two generations."""
-        if len(lineage.generations) < 2:
+        """Compute similarity between the last two completed generations."""
+        gens = self._completed_generations(lineage)
+        if len(gens) < 2:
             return 0.0
 
-        prev = lineage.generations[-2].ontology_snapshot
-        curr = lineage.generations[-1].ontology_snapshot
+        prev = gens[-2].ontology_snapshot
+        curr = gens[-1].ontology_snapshot
         delta = OntologyDelta.compute(prev, curr)
         return delta.similarity
 
     def _count_evolved_generations(self, lineage: OntologyLineage) -> int:
-        """Count how many consecutive generation pairs show actual ontology evolution.
+        """Count how many generation pairs show actual ontology evolution.
 
         Returns the number of transitions where similarity < convergence_threshold,
         indicating Wonder→Reflect successfully mutated the ontology.
-        A return of 0 means the ontology never changed — likely due to repeated
-        Wonder/Reflect failures causing the same seed to be re-executed.
+        A return of 0 means the ontology never changed -- either because Reflect
+        conservatively preserved a well-performing ontology, or because
+        Wonder/Reflect encountered errors preventing mutation.
         """
-        gens = lineage.generations
+        gens = self._completed_generations(lineage)
         if len(gens) < 2:
             return 0
 
@@ -278,7 +305,7 @@ class ConvergenceCriteria:
 
     def _check_stagnation(self, lineage: OntologyLineage) -> bool:
         """Check if ontology has been unchanged for stagnation_window gens."""
-        gens = lineage.generations
+        gens = self._completed_generations(lineage)
         if len(gens) < self.stagnation_window:
             return False
 
@@ -295,7 +322,7 @@ class ConvergenceCriteria:
 
     def _check_oscillation(self, lineage: OntologyLineage) -> bool:
         """Detect oscillation: N~N-2 AND N-1~N-3 (full period-2 verification)."""
-        gens = lineage.generations
+        gens = self._completed_generations(lineage)
 
         # Period-2 full check: A→B→A→B — verify BOTH half-periods
         if len(gens) >= 4:
@@ -329,9 +356,10 @@ class ConvergenceCriteria:
 
         latest_set = set(latest_wonder.questions)
 
-        # Check against last 2 generations' wonder questions
+        # Check against last 2 completed generations' wonder questions
         repeat_count = 0
-        for gen in lineage.generations[-3:]:
+        completed = self._completed_generations(lineage)
+        for gen in completed[-3:]:
             if gen.wonder_questions:
                 prev_set = set(gen.wonder_questions)
                 overlap = len(latest_set & prev_set)

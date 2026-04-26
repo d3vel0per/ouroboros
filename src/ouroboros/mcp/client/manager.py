@@ -230,7 +230,6 @@ class MCPClientManager:
             )
 
         # Connect outside the lock
-        await conn.adapter.__aenter__()
         result = await conn.adapter.connect(conn.config)
 
         async with self._lock:
@@ -320,7 +319,6 @@ class MCPClientManager:
                 )
 
         result = await conn.adapter.disconnect()
-        await conn.adapter.__aexit__(None, None, None)
 
         async with self._lock:
             self._connections[server_name] = ServerConnection(
@@ -433,26 +431,26 @@ class MCPClientManager:
         Returns:
             Result containing tool result or error.
         """
-        conn = self._connections.get(server_name)
-        if not conn:
-            return Result.err(
-                MCPClientError(
-                    f"Server not found: {server_name}",
-                    is_retriable=False,
-                    details={"resource_type": "server", "resource_id": server_name},
-                )
-            )
-
-        if conn.state != ConnectionState.CONNECTED:
-            return Result.err(
-                MCPConnectionError(
-                    f"Server not connected: {server_name}",
-                    server_name=server_name,
-                )
-            )
-
+        conn_result = await self._connected_or_reconnected(server_name)
+        if conn_result.is_err:
+            return Result.err(conn_result.error)
+        conn = conn_result.value
         effective_timeout = timeout or self._default_timeout
 
+        result = await self._call_tool_once(conn, tool_name, arguments, effective_timeout)
+        if result.is_ok or not self._should_reconnect_after_error(result.error):
+            return result
+
+        await self._mark_unhealthy_and_reconnect(server_name, conn, result.error)
+        return result
+
+    async def _call_tool_once(
+        self,
+        conn: ServerConnection,
+        tool_name: str,
+        arguments: dict[str, Any] | None,
+        effective_timeout: float,
+    ) -> Result[MCPToolResult, MCPClientError]:
         try:
             return await asyncio.wait_for(
                 conn.adapter.call_tool(tool_name, arguments),
@@ -464,7 +462,7 @@ class MCPClientManager:
             return Result.err(
                 MCPTimeoutError(
                     f"Tool call timed out: {tool_name}",
-                    server_name=server_name,
+                    server_name=conn.config.name,
                     timeout_seconds=effective_timeout,
                     operation="call_tool",
                 )
@@ -516,26 +514,27 @@ class MCPClientManager:
         Returns:
             Result containing resource content or error.
         """
-        conn = self._connections.get(server_name)
-        if not conn:
-            return Result.err(
-                MCPClientError(
-                    f"Server not found: {server_name}",
-                    is_retriable=False,
-                    details={"resource_type": "server", "resource_id": server_name},
-                )
-            )
-
-        if conn.state != ConnectionState.CONNECTED:
-            return Result.err(
-                MCPConnectionError(
-                    f"Server not connected: {server_name}",
-                    server_name=server_name,
-                )
-            )
-
+        conn_result = await self._connected_or_reconnected(server_name)
+        if conn_result.is_err:
+            return Result.err(conn_result.error)
+        conn = conn_result.value
         effective_timeout = timeout or self._default_timeout
 
+        result = await self._read_resource_once(conn, uri, effective_timeout)
+        if result.is_ok or not self._should_reconnect_after_error(result.error):
+            return result
+
+        reconnect_result = await self._mark_unhealthy_and_reconnect(server_name, conn, result.error)
+        if reconnect_result.is_err:
+            return Result.err(reconnect_result.error)
+        return await self._read_resource_once(reconnect_result.value, uri, effective_timeout)
+
+    async def _read_resource_once(
+        self,
+        conn: ServerConnection,
+        uri: str,
+        effective_timeout: float,
+    ) -> Result[MCPResourceContent, MCPClientError]:
         try:
             return await asyncio.wait_for(
                 conn.adapter.read_resource(uri),
@@ -547,11 +546,93 @@ class MCPClientManager:
             return Result.err(
                 MCPTimeoutError(
                     f"Resource read timed out: {uri}",
-                    server_name=server_name,
+                    server_name=conn.config.name,
                     timeout_seconds=effective_timeout,
                     operation="read_resource",
                 )
             )
+
+    async def _connected_or_reconnected(
+        self,
+        server_name: str,
+    ) -> Result[ServerConnection, MCPClientError]:
+        """Return a connected server, reconnecting unhealthy servers first."""
+        conn = self._connections.get(server_name)
+        if not conn:
+            return Result.err(
+                MCPClientError(
+                    f"Server not found: {server_name}",
+                    is_retriable=False,
+                    details={"resource_type": "server", "resource_id": server_name},
+                )
+            )
+
+        if conn.state == ConnectionState.CONNECTED:
+            return Result.ok(conn)
+        if conn.state == ConnectionState.UNHEALTHY:
+            reconnect_result = await self.connect(server_name)
+            if reconnect_result.is_err:
+                return Result.err(reconnect_result.error)
+            refreshed = self._connections.get(server_name)
+            if refreshed and refreshed.state == ConnectionState.CONNECTED:
+                return Result.ok(refreshed)
+
+        return Result.err(
+            MCPConnectionError(
+                f"Server not connected: {server_name}",
+                server_name=server_name,
+            )
+        )
+
+    def _should_reconnect_after_error(self, error: MCPClientError) -> bool:
+        """Return True when an MCP failure looks like a lost transport."""
+        if isinstance(error, MCPConnectionError):
+            return True
+        error_text = str(error).lower()
+        return any(
+            token in error_text
+            for token in (
+                "broken pipe",
+                "connection reset",
+                "connection closed",
+                "end of file",
+                "eof",
+                "not connected",
+                "transport closed",
+            )
+        )
+
+    async def _mark_unhealthy_and_reconnect(
+        self,
+        server_name: str,
+        conn: ServerConnection,
+        error: MCPClientError,
+    ) -> Result[ServerConnection, MCPClientError]:
+        """Mark a connection unhealthy, reconnect, and return the refreshed connection."""
+        async with self._lock:
+            current = self._connections.get(server_name, conn)
+            self._connections[server_name] = ServerConnection(
+                config=current.config,
+                adapter=current.adapter,
+                state=ConnectionState.UNHEALTHY,
+                last_error=str(error),
+                tools=current.tools,
+                resources=current.resources,
+            )
+
+        reconnect_result = await self.connect(server_name)
+        if reconnect_result.is_err:
+            return Result.err(reconnect_result.error)
+
+        refreshed = self._connections.get(server_name)
+        if refreshed is None or refreshed.state != ConnectionState.CONNECTED:
+            return Result.err(
+                MCPConnectionError(
+                    f"Server reconnect did not restore connection: {server_name}",
+                    server_name=server_name,
+                )
+            )
+        return Result.ok(refreshed)
 
     def start_health_checks(self) -> None:
         """Start periodic health checks for all connections."""
@@ -593,6 +674,9 @@ class MCPClientManager:
                         server=server_name,
                         error=str(result.error),
                     )
+                    reconnect_result = await self.connect(server_name)
+                    if reconnect_result.is_ok:
+                        log.info("mcp.manager.reconnected", server=server_name)
             elif conn.state == ConnectionState.UNHEALTHY:
                 # Try to reconnect
                 reconnect_result = await self.connect(server_name)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,15 @@ from ouroboros.core.seed import (
     Seed,
     SeedMetadata,
 )
-from ouroboros.orchestrator.adapter import AgentMessage
+from ouroboros.core.types import Result
+from ouroboros.core.worktree import TaskWorkspace
+from ouroboros.events.base import BaseEvent
+from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
+
+# TODO: uncomment when OpenCode runtime is shipped
+# from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
+from ouroboros.orchestrator.parallel_executor import ACExecutionResult, ParallelExecutionResult
 from ouroboros.orchestrator.runner import (
     OrchestratorError,
     OrchestratorResult,
@@ -25,6 +34,19 @@ from ouroboros.orchestrator.runner import (
     build_task_prompt,
 )
 from ouroboros.orchestrator.session import SessionStatus, SessionTracker
+
+
+def _task_workspace() -> TaskWorkspace:
+    return TaskWorkspace(
+        durable_id="orch_test",
+        repo_root="/tmp/repo",
+        repo_name="repo",
+        original_cwd="/tmp/repo",
+        effective_cwd="/tmp/worktree/repo/orch_test",
+        worktree_path="/tmp/worktree/repo/orch_test",
+        branch="ooo/orch_test",
+        lock_path="/tmp/worktree/.locks/repo/orch_test.json",
+    )
 
 
 @pytest.fixture
@@ -85,6 +107,13 @@ class TestBuildSystemPrompt:
         prompt = build_system_prompt(sample_seed)
         assert "completeness" in prompt
         assert "All requirements are met" in prompt
+
+    def test_includes_self_recovery_protocol(self, sample_seed: Seed) -> None:
+        """Run prompts should tell agents how to change strategy when stuck."""
+        prompt = build_system_prompt(sample_seed)
+        assert "Self-Recovery Protocol" in prompt
+        assert "spinning" in prompt
+        assert "no acceptance-criterion progress" in prompt
 
     def test_handles_empty_constraints(self) -> None:
         """Test handling seed with no constraints."""
@@ -165,6 +194,9 @@ class TestOrchestratorRunner:
     def mock_adapter(self) -> MagicMock:
         """Create a mock Claude agent adapter."""
         adapter = MagicMock()
+        adapter.runtime_backend = "opencode"
+        adapter.working_directory = "/tmp/project"
+        adapter.permission_mode = "acceptEdits"
         return adapter
 
     @pytest.fixture
@@ -230,6 +262,568 @@ class TestOrchestratorRunner:
         assert result.value.messages_processed == 9
 
     @pytest.mark.asyncio
+    async def test_execute_seed_retries_once_with_lateral_recovery_directive(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Sequential run failures should get one same-session lateral recovery retry."""
+        runtime_handle = RuntimeHandle(
+            backend="opencode",
+            native_session_id="oc-session-recovery",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+        )
+        prompts: list[str] = []
+        resume_handles: list[RuntimeHandle | None] = []
+
+        async def mock_execute(prompt: str, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            prompts.append(prompt)
+            resume_handles.append(kwargs.get("resume_handle"))
+            if len(prompts) == 1:
+                yield AgentMessage(
+                    type="assistant",
+                    content="Trying the original path",
+                    resume_handle=runtime_handle,
+                )
+                yield AgentMessage(
+                    type="result",
+                    content="Tests still fail",
+                    data={"subtype": "error"},
+                    resume_handle=runtime_handle,
+                )
+                return
+
+            yield AgentMessage(
+                type="result",
+                content="[TASK_COMPLETE] Recovered",
+                data={"subtype": "success"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert result.value.success is True
+        assert len(prompts) == 2
+        assert "Lateral Recovery Directive" in prompts[1]
+        assert "Selected persona: hacker" in prompts[1]
+        assert resume_handles[1] == runtime_handle
+
+        recovery_event = next(
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if getattr(call.args[0], "type", None) == "resilience.recovery.applied"
+        )
+        assert recovery_event.data["pattern"] == "spinning"
+        assert recovery_event.data["persona"] == "hacker"
+
+    @pytest.mark.asyncio
+    async def test_prepare_session_forwards_seed_goal(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """prepare_session reserves a session with the seed goal persisted."""
+        tracker = SessionTracker.create(
+            "exec_prepared",
+            sample_seed.metadata.seed_id,
+            session_id="orch_prepared",
+        )
+        create_session = AsyncMock(return_value=Result.ok(tracker))
+
+        with patch.object(runner._session_repo, "create_session", create_session):
+            result = await runner.prepare_session(
+                sample_seed,
+                execution_id="exec_prepared",
+                session_id="orch_prepared",
+            )
+
+        assert result.is_ok
+        assert result.value is tracker
+        create_session.assert_awaited_once_with(
+            execution_id="exec_prepared",
+            seed_id=sample_seed.metadata.seed_id,
+            session_id="orch_prepared",
+            seed_goal=sample_seed.goal,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_delegates_to_precreated_session(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """execute_seed should reserve IDs first, then run the precreated session."""
+        tracker = SessionTracker.create(
+            "exec_delegated",
+            sample_seed.metadata.seed_id,
+            session_id="orch_delegated",
+        )
+        orchestrator_result = OrchestratorResult(
+            success=True,
+            session_id=tracker.session_id,
+            execution_id=tracker.execution_id,
+        )
+        prepare_session = AsyncMock(return_value=Result.ok(tracker))
+        execute_precreated = AsyncMock(return_value=Result.ok(orchestrator_result))
+
+        with (
+            patch.object(runner, "prepare_session", prepare_session),
+            patch.object(runner, "execute_precreated_session", execute_precreated),
+        ):
+            result = await runner.execute_seed(sample_seed, execution_id="exec_delegated")
+
+        assert result.is_ok
+        assert result.value == orchestrator_result
+        prepare_session.assert_awaited_once_with(sample_seed, execution_id="exec_delegated")
+        execute_precreated.assert_awaited_once_with(
+            seed=sample_seed,
+            tracker=tracker,
+            parallel=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_seeds_startup_tool_catalog_on_runtime_handle(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Initial runtime startup should expose the merged tool catalog before tool calls."""
+        from ouroboros.core.types import Result
+
+        captured_kwargs: dict[str, Any] = {}
+        mock_adapter._runtime_handle_backend = "opencode"
+        mock_adapter._cwd = "/tmp/project"
+        mock_adapter._permission_mode = "acceptEdits"
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            captured_kwargs.update(kwargs)
+            resume_handle = kwargs["resume_handle"]
+            assert isinstance(resume_handle, RuntimeHandle)
+            yield AgentMessage(
+                type="result",
+                content="[TASK_COMPLETE]",
+                data={"subtype": "success"},
+                resume_handle=resume_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        resume_handle = captured_kwargs["resume_handle"]
+        assert isinstance(resume_handle, RuntimeHandle)
+        assert resume_handle.backend == "opencode"
+        assert resume_handle.cwd == "/tmp/project"
+        assert resume_handle.metadata["tool_catalog"][0]["name"] == "Read"
+        assert resume_handle.metadata["tool_catalog"][0]["id"] == "builtin:Read"
+        assert resume_handle.metadata["capability_graph"][0]["name"] == "Read"
+        assert resume_handle.metadata["control_plane"][0]["name"] == "Read"
+        assert "Edit" in {tool["name"] for tool in resume_handle.metadata["tool_catalog"]}
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_terminates_live_runtime_handle_after_completion(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Sequential runs should best-effort terminate live runtime handles on exit."""
+        from ouroboros.core.types import Result
+
+        terminate_calls = 0
+
+        async def _terminate(_handle: RuntimeHandle) -> bool:
+            nonlocal terminate_calls
+            terminate_calls += 1
+            return True
+
+        live_handle = RuntimeHandle(
+            backend="opencode",
+            native_session_id="oc-session-live",
+        ).bind_controls(terminate_callback=_terminate)
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            del args, kwargs
+            yield AgentMessage(
+                type="result",
+                content="[TASK_COMPLETE]",
+                data={"subtype": "success"},
+                resume_handle=live_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert terminate_calls == 1
+
+    def test_build_progress_update_serializes_opencode_tool_result_metadata(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """OpenCode tool/result metadata should survive into persisted progress state."""
+        from ouroboros.orchestrator.mcp_tools import (
+            normalize_runtime_tool_definition,
+            normalize_runtime_tool_result,
+        )
+
+        runtime_handle = RuntimeHandle(
+            backend="opencode",
+            native_session_id="oc-session-1",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+            metadata={
+                "server_session_id": "server-42",
+                "runtime_event_type": "tool.completed",
+            },
+        )
+        message = AgentMessage(
+            type="assistant",
+            content="Updated src/app.py",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "src/app.py"},
+                "tool_definition": normalize_runtime_tool_definition(
+                    "Edit",
+                    {"file_path": "src/app.py"},
+                ),
+                "tool_result": normalize_runtime_tool_result("Updated src/app.py"),
+            },
+            resume_handle=runtime_handle,
+        )
+
+        progress = runner._build_progress_update(message, 3)
+
+        assert progress["last_message_type"] == "tool_result"
+        assert progress["messages_processed"] == 3
+        assert progress["runtime_backend"] == "opencode"
+        assert progress["runtime_event_type"] == "tool.completed"
+        assert progress["tool_name"] == "Edit"
+        assert progress["tool_input"] == {"file_path": "src/app.py"}
+        assert progress["tool_definition"]["name"] == "Edit"
+        assert progress["tool_result"]["text_content"] == "Updated src/app.py"
+        assert progress["runtime"] == {
+            "backend": "opencode",
+            "kind": "agent_runtime",
+            "native_session_id": "oc-session-1",
+            "cwd": "/tmp/project",
+            "approval_mode": "acceptEdits",
+            "metadata": {
+                "server_session_id": "server-42",
+            },
+        }
+
+    def test_build_progress_update_projects_empty_tool_result_content(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Projected tool-result text should drive persisted progress previews."""
+        from ouroboros.orchestrator.mcp_tools import normalize_runtime_tool_result
+
+        message = AgentMessage(
+            type="assistant",
+            content="",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_result": normalize_runtime_tool_result("[AC_COMPLETE: 1] Done!"),
+            },
+        )
+
+        progress = runner._build_progress_update(message, 4)
+        progress_event = runner._build_progress_event("sess_123", message, step=4)
+
+        assert progress["last_message_type"] == "tool_result"
+        assert progress["content_preview"] == "[AC_COMPLETE: 1] Done!"
+        assert progress_event.data["content_preview"] == "[AC_COMPLETE: 1] Done!"
+        assert progress_event.data["progress"]["last_content_preview"] == "[AC_COMPLETE: 1] Done!"
+
+    def test_build_progress_update_extracts_ac_tracking_from_tool_result_payload(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Persisted progress should keep AC markers from normalized tool-result payloads."""
+        from ouroboros.orchestrator.mcp_tools import normalize_runtime_tool_result
+
+        message = AgentMessage(
+            type="assistant",
+            content="Tool completed successfully.",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_result": normalize_runtime_tool_result("[AC_COMPLETE: 1] Done!"),
+            },
+        )
+
+        progress = runner._build_progress_update(message, 4)
+        progress_event = runner._build_progress_event("sess_123", message, step=4)
+
+        assert progress["content_preview"] == "Tool completed successfully."
+        assert progress["ac_tracking"] == {"started": [], "completed": [1]}
+        assert progress_event.data["content_preview"] == "Tool completed successfully."
+        assert progress_event.data["ac_tracking"] == {"started": [], "completed": [1]}
+        assert progress_event.data["progress"]["ac_tracking"] == {
+            "started": [],
+            "completed": [1],
+        }
+
+    def test_build_progress_event_serializes_ac_tracking_metadata(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """AC marker metadata should survive into persisted progress events."""
+        message = AgentMessage(
+            type="assistant",
+            content="[AC_START: 2] Implementing the second acceptance criterion.",
+            data={"ac_tracking": {"started": [2], "completed": []}},
+            resume_handle=RuntimeHandle(backend="opencode", native_session_id="oc-session-1"),
+        )
+
+        progress = runner._build_progress_update(message, 4)
+        progress_event = runner._build_progress_event("sess_123", message)
+
+        assert progress["ac_tracking"] == {"started": [2], "completed": []}
+        assert progress_event.data["ac_tracking"] == {"started": [2], "completed": []}
+        assert progress_event.data["progress"]["ac_tracking"] == {
+            "started": [2],
+            "completed": [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_emits_enriched_opencode_tool_and_progress_events(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """OpenCode-backed runs should reuse the standard tool/progress event stream."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.mcp_tools import (
+            normalize_runtime_tool_definition,
+            normalize_runtime_tool_result,
+        )
+
+        runtime_handle = RuntimeHandle(
+            backend="opencode",
+            native_session_id="oc-session-1",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+            metadata={
+                "server_session_id": "server-42",
+                "runtime_event_type": "session.started",
+            },
+        )
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="system",
+                content="OpenCode session initialized",
+                resume_handle=runtime_handle,
+            )
+            yield AgentMessage(
+                type="assistant",
+                content="Calling tool: Edit: src/app.py",
+                tool_name="Edit",
+                data={
+                    "tool_input": {"file_path": "src/app.py"},
+                    "tool_definition": normalize_runtime_tool_definition(
+                        "Edit",
+                        {"file_path": "src/app.py"},
+                    ),
+                },
+                resume_handle=runtime_handle,
+            )
+            yield AgentMessage(
+                type="assistant",
+                content="Updated src/app.py",
+                data={
+                    "subtype": "tool_result",
+                    "tool_name": "Edit",
+                    "tool_definition": normalize_runtime_tool_definition("Edit"),
+                    "tool_result": normalize_runtime_tool_result("Updated src/app.py"),
+                },
+                resume_handle=runtime_handle,
+            )
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+
+        appended_events = [call.args[0] for call in mock_event_store.append.await_args_list]
+        tool_event = next(
+            event for event in appended_events if event.type == "orchestrator.tool.called"
+        )
+        progress_events = [
+            event
+            for event in appended_events
+            if event.type == "orchestrator.progress.updated" and event.data.get("message_type")
+        ]
+
+        assert tool_event.data["tool_name"] == "Edit"
+        assert tool_event.data["tool_input_preview"] == "file_path: src/app.py"
+        assert tool_event.data["tool_input"] == {"file_path": "src/app.py"}
+        assert tool_event.data["tool_definition"]["name"] == "Edit"
+        assert tool_event.data["runtime_backend"] == "opencode"
+
+        system_event = next(
+            event for event in progress_events if event.data["message_type"] == "system"
+        )
+        tool_result_event = next(
+            event for event in progress_events if event.data["message_type"] == "tool_result"
+        )
+
+        assert system_event.data["runtime_backend"] == "opencode"
+        assert system_event.data["session_id"] == "oc-session-1"
+        assert system_event.data["server_session_id"] == "server-42"
+        assert system_event.data["resume_session_id"] == "oc-session-1"
+        assert system_event.data["runtime"]["native_session_id"] == "oc-session-1"
+        assert tool_result_event.data["tool_name"] == "Edit"
+        assert tool_result_event.data["resume_session_id"] == "oc-session-1"
+        assert tool_result_event.data["tool_result"]["text_content"] == "Updated src/app.py"
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_emits_workflow_progress_with_projected_last_update(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Workflow progress updates should carry the normalized latest runtime artifact."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.mcp_tools import normalize_runtime_tool_result
+
+        runtime_handle = RuntimeHandle(
+            backend="opencode",
+            native_session_id="oc-session-1",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+            metadata={"server_session_id": "server-42"},
+        )
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="assistant",
+                content="Tool completed successfully.",
+                data={
+                    "subtype": "tool_result",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/app.py"},
+                    "tool_result": normalize_runtime_tool_result("[AC_COMPLETE: 1] Done!"),
+                    "runtime_event_type": "tool.completed",
+                },
+                resume_handle=runtime_handle,
+            )
+            yield AgentMessage(
+                type="result",
+                content="[TASK_COMPLETE]",
+                data={"subtype": "success", "runtime_event_type": "result.completed"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+
+        workflow_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if getattr(call.args[0], "type", None) == "workflow.progress.updated"
+        ]
+        tool_result_workflow_event = next(
+            event
+            for event in workflow_events
+            if event.data.get("last_update", {}).get("message_type") == "tool_result"
+        )
+
+        assert tool_result_workflow_event.data["completed_count"] == 1
+        assert tool_result_workflow_event.data["current_ac_index"] == 2
+        last_update = tool_result_workflow_event.data["last_update"]
+        assert last_update["message_type"] == "tool_result"
+        assert last_update["content_preview"] == "Tool completed successfully."
+        assert last_update["tool_name"] == "Edit"
+        assert last_update["tool_input"] == {"file_path": "src/app.py"}
+        assert last_update["tool_result"]["text_content"] == "[AC_COMPLETE: 1] Done!"
+        assert last_update["tool_result"]["is_error"] is False
+        assert last_update["tool_result"]["meta"] == {}
+        assert last_update["tool_result"]["content"][0]["type"] == "text"
+        assert last_update["tool_result"]["content"][0]["text"] == "[AC_COMPLETE: 1] Done!"
+        assert last_update["runtime_signal"] == "tool_completed"
+        assert last_update["runtime_status"] == "running"
+        assert last_update["ac_tracking"] == {"started": [], "completed": [1]}
+
+    @pytest.mark.asyncio
     async def test_execute_seed_failure(
         self,
         runner: OrchestratorRunner,
@@ -264,6 +858,37 @@ class TestOrchestratorRunner:
         assert "failed" in result.value.final_message.lower()
 
     @pytest.mark.asyncio
+    async def test_execute_seed_exception_marks_session_failed(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Unexpected execution exceptions should mark the session as failed."""
+        from ouroboros.core.types import Result
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            if False:
+                yield AgentMessage(type="assistant", content="never")
+            raise RuntimeError("coordinator crash")
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        mark_failed = AsyncMock(return_value=Result.ok(None))
+
+        with patch.object(runner._session_repo, "create_session", mock_create_session):
+            with patch.object(runner._session_repo, "mark_failed", mark_failed):
+                result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_err
+        assert "coordinator crash" in str(result.error)
+        mark_failed.assert_awaited_once()
+        assert mark_failed.await_args.args[1] == "coordinator crash"
+
+    @pytest.mark.asyncio
     async def test_execute_seed_session_creation_fails(
         self,
         runner: OrchestratorRunner,
@@ -282,6 +907,104 @@ class TestOrchestratorRunner:
 
         assert result.is_err
         assert "session" in str(result.error).lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_session_creation_failure_releases_workspace_lock(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Session creation errors should not leak an acquired workspace lock."""
+        from ouroboros.core.errors import PersistenceError
+        from ouroboros.core.types import Result
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            task_workspace=_task_workspace(),
+        )
+
+        with (
+            patch.object(
+                runner._session_repo,
+                "create_session",
+                return_value=Result.err(PersistenceError("DB error")),
+            ),
+            patch("ouroboros.orchestrator.runner.release_lock") as release_lock_mock,
+        ):
+            result = await runner.execute_seed(sample_seed)
+
+        assert result.is_err
+        release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_start_event_failure_cleans_up_workspace_lock(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Start-event failures should release the workspace lock and unregister the session."""
+        from ouroboros.core.types import Result
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            task_workspace=_task_workspace(),
+        )
+        tracker = SessionTracker.create("exec_setup", sample_seed.metadata.seed_id)
+
+        with (
+            patch.object(runner._session_repo, "create_session", return_value=Result.ok(tracker)),
+            patch.object(
+                runner._event_store,
+                "append",
+                AsyncMock(side_effect=RuntimeError("event append failed")),
+            ),
+            patch.object(runner, "_unregister_session") as unregister_mock,
+            patch("ouroboros.orchestrator.runner.release_lock") as release_lock_mock,
+        ):
+            result = await runner.execute_seed(sample_seed, execution_id="exec_setup")
+
+        assert result.is_err
+        unregister_mock.assert_called_once_with("exec_setup", tracker.session_id)
+        release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_tool_setup_failure_cleans_up_workspace_lock(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Merged-tool setup failures should release the workspace lock and unregister."""
+        from ouroboros.core.types import Result
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            task_workspace=_task_workspace(),
+        )
+        tracker = SessionTracker.create("exec_tools", sample_seed.metadata.seed_id)
+
+        with (
+            patch.object(runner._session_repo, "create_session", return_value=Result.ok(tracker)),
+            patch.object(runner, "_get_merged_tools", AsyncMock(side_effect=RuntimeError("boom"))),
+            patch.object(runner, "_unregister_session") as unregister_mock,
+            patch("ouroboros.orchestrator.runner.release_lock") as release_lock_mock,
+        ):
+            result = await runner.execute_seed(sample_seed, execution_id="exec_tools")
+
+        assert result.is_err
+        unregister_mock.assert_called_once_with("exec_tools", tracker.session_id)
+        release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
 
     @pytest.mark.asyncio
     async def test_resume_session_already_completed(
@@ -304,7 +1027,78 @@ class TestOrchestratorRunner:
             result = await runner.resume_session("sess_123", sample_seed)
 
         assert result.is_err
-        assert "already completed" in str(result.error).lower()
+        assert "terminal state" in str(result.error).lower()
+
+    @pytest.mark.asyncio
+    async def test_resume_session_already_completed_releases_workspace_lock(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Terminal resume attempts should not leak the acquired workspace lock."""
+        from ouroboros.core.types import Result
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            task_workspace=_task_workspace(),
+        )
+        completed_tracker = SessionTracker.create("exec", "seed").with_status(
+            SessionStatus.COMPLETED
+        )
+
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                return_value=Result.ok(completed_tracker),
+            ),
+            patch("ouroboros.orchestrator.runner.release_lock") as release_lock_mock,
+        ):
+            result = await runner.resume_session("sess_123", sample_seed)
+
+        assert result.is_err
+        release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
+
+    @pytest.mark.asyncio
+    async def test_resume_session_tool_setup_failure_cleans_up_workspace_lock(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Resume setup failures should release the workspace lock and unregister."""
+        from ouroboros.core.types import Result
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            task_workspace=_task_workspace(),
+        )
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                return_value=Result.ok(running_tracker),
+            ),
+            patch.object(runner, "_get_merged_tools", AsyncMock(side_effect=RuntimeError("boom"))),
+            patch.object(runner, "_unregister_session") as unregister_mock,
+            patch("ouroboros.orchestrator.runner.release_lock") as release_lock_mock,
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_err
+        unregister_mock.assert_called_once_with("exec_resume", "sess_resume")
+        release_lock_mock.assert_called_once_with("/tmp/worktree/.locks/repo/orch_test.json")
 
     @pytest.mark.asyncio
     async def test_resume_session_not_found(
@@ -324,6 +1118,1040 @@ class TestOrchestratorRunner:
             result = await runner.resume_session("nonexistent", sample_seed)
 
         assert result.is_err
+
+    @pytest.mark.asyncio
+    async def test_resume_session_recoverable_failure_marks_session_paused(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Recoverable resume bootstrap failures should not poison the session."""
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+        runtime_handle = RuntimeHandle(backend="codex_cli", native_session_id="thread-123")
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            del args, kwargs
+            yield AgentMessage(
+                type="result",
+                content="Codex rejected the resume command",
+                data={
+                    "subtype": "error",
+                    "recoverable": True,
+                    "recovery": {"kind": "resume_retry"},
+                },
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                AsyncMock(return_value=Result.ok(running_tracker)),
+            ),
+            patch.object(
+                runner._session_repo,
+                "mark_paused",
+                AsyncMock(return_value=Result.ok(None)),
+            ) as mark_paused,
+            patch.object(
+                runner._session_repo,
+                "mark_failed",
+                AsyncMock(return_value=Result.ok(None)),
+            ) as mark_failed,
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert result.value.final_message == "Codex rejected the resume command"
+        mark_paused.assert_awaited_once()
+        mark_failed.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_resume_session_allows_paused_sessions(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Paused sessions should remain resumable."""
+        paused_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.PAUSED
+        )
+        runtime_handle = RuntimeHandle(backend="codex_cli", native_session_id="thread-123")
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            del args, kwargs
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        with (
+            patch.object(
+                runner._session_repo,
+                "reconstruct_session",
+                AsyncMock(return_value=Result.ok(paused_tracker)),
+            ),
+            patch.object(
+                runner._session_repo,
+                "mark_completed",
+                AsyncMock(return_value=Result.ok(None)),
+            ) as mark_completed,
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is True
+        mark_completed.assert_awaited_once()
+
+    def test_deserialize_runtime_handle_supports_legacy_progress(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Test legacy Claude session progress still reconstructs a runtime handle."""
+        handle = runner._deserialize_runtime_handle({"agent_session_id": "sess_legacy"})
+
+        assert handle == RuntimeHandle(backend="claude", native_session_id="sess_legacy")
+
+    def test_deserialize_runtime_handle_falls_back_from_invalid_runtime_payload(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Malformed runtime payloads should not block the legacy session-id fallback."""
+        handle = runner._deserialize_runtime_handle(
+            {
+                "runtime": {
+                    "native_session_id": "sess_ignored",
+                    "metadata": {"server_session_id": "server-42"},
+                },
+                "agent_session_id": "sess_legacy",
+                "runtime_backend": "claude",
+            }
+        )
+
+        assert handle == RuntimeHandle(backend="claude", native_session_id="sess_legacy")
+
+    def test_deserialize_runtime_handle_returns_none_when_invalid_payload_has_no_fallback(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Malformed runtime payloads without legacy fallback data should be ignored."""
+        handle = runner._deserialize_runtime_handle(
+            {
+                "runtime": {
+                    "native_session_id": "sess_ignored",
+                    "metadata": {"server_session_id": "server-42"},
+                }
+            }
+        )
+
+        assert handle is None
+
+    def test_build_progress_update_round_trips_persisted_opencode_resume_handle(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Persisted OpenCode progress should preserve the reconnect handle exactly."""
+        runtime_handle = RuntimeHandle(
+            backend="opencode",
+            kind="implementation_session",
+            cwd="/tmp/project",
+            approval_mode="acceptEdits",
+            updated_at="2026-03-13T00:00:00+00:00",
+            metadata={
+                "server_session_id": "server-42",
+                "session_scope_id": "ac_1",
+                "session_state_path": "execution.acceptance_criteria.ac_1.implementation_session",
+                "session_role": "implementation",
+                "retry_attempt": 0,
+            },
+        )
+        message = AgentMessage(
+            type="system",
+            content="OpenCode session bound",
+            resume_handle=runtime_handle,
+        )
+
+        progress = runner._build_progress_update(message, 2)
+        restored = runner._deserialize_runtime_handle(progress)
+
+        assert progress["runtime"] == runtime_handle.to_session_state_dict()
+        assert progress["runtime_backend"] == "opencode"
+        assert progress["server_session_id"] == "server-42"
+        assert progress["resume_session_id"] == "server-42"
+        assert restored is not None
+        assert restored.backend == runtime_handle.backend
+        assert restored.kind == runtime_handle.kind
+        assert restored.cwd == runtime_handle.cwd
+        assert restored.approval_mode == runtime_handle.approval_mode
+        assert restored.metadata == runtime_handle.metadata
+
+    @pytest.mark.asyncio
+    async def test_resume_session_uses_runtime_handle(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Test resume_session passes normalized runtime handles to the adapter."""
+        from ouroboros.core.types import Result
+
+        runtime_handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="sess_runtime",
+        )
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+        running_tracker = running_tracker.with_progress({"runtime": runtime_handle.to_dict()})
+
+        captured_kwargs: dict[str, Any] = {}
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            captured_kwargs.update(kwargs)
+            yield AgentMessage(
+                type="result",
+                content="Resumed successfully",
+                data={"subtype": "success", "session_id": "sess_runtime"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        async def mock_reconstruct(*args: Any, **kwargs: Any):
+            return Result.ok(running_tracker)
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "reconstruct_session", mock_reconstruct),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        resume_handle = captured_kwargs["resume_handle"]
+        assert isinstance(resume_handle, RuntimeHandle)
+        assert resume_handle.backend == runtime_handle.backend
+        assert resume_handle.native_session_id == runtime_handle.native_session_id
+        assert resume_handle.metadata["tool_catalog"][0]["name"] == "Read"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skip(reason="OpenCode runtime not yet shipped")
+    async def test_resume_session_reconnects_opencode_runtime_from_persisted_handle(
+        self,
+        tmp_path,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Interrupted OpenCode runs should resume from the stored runtime handle."""
+
+        class _FakeStream:
+            def __init__(self, text: str = "") -> None:
+                self._buffer = text.encode("utf-8")
+                self._drained = False
+
+            async def read(self, _chunk_size: int = 16384) -> bytes:
+                if self._drained:
+                    return b""
+                self._drained = True
+                return self._buffer
+
+        class _FakeProcess:
+            def __init__(self, stdout_text: str, *, returncode: int = 0) -> None:
+                self.stdout = _FakeStream(stdout_text)
+                self.stderr = _FakeStream("")
+                self.stdin = None
+                self._returncode = returncode
+
+            async def wait(self) -> int:
+                return self._returncode
+
+        runtime = OpenCodeRuntime(  # type: ignore[name-defined]  # noqa: F821
+            cli_path="/tmp/opencode",
+            permission_mode="acceptEdits",
+            cwd=tmp_path,
+        )
+        runner = OrchestratorRunner(runtime, mock_event_store, mock_console)
+
+        persisted_handle = RuntimeHandle(
+            backend="opencode",
+            kind="implementation_session",
+            cwd=str(tmp_path),
+            approval_mode="acceptEdits",
+            updated_at="2026-03-13T00:00:00+00:00",
+            metadata={
+                "server_session_id": "server-42",
+                "session_scope_id": "ac_0",
+                "session_state_path": ("execution.acceptance_criteria.ac_0.implementation_session"),
+                "session_role": "implementation",
+                "retry_attempt": 0,
+            },
+        )
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+        running_tracker = running_tracker.with_progress(
+            {
+                "runtime": persisted_handle.to_dict(),
+                "runtime_backend": "opencode",
+                "messages_processed": 4,
+            }
+        )
+
+        async def mock_reconstruct(*args: Any, **kwargs: Any):
+            return Result.ok(running_tracker)
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        recorded_commands: list[tuple[str, ...]] = []
+
+        async def fake_create_subprocess_exec(*command: str, **kwargs: Any) -> _FakeProcess:
+            recorded_commands.append(tuple(command))
+            output_index = command.index("--output-last-message") + 1
+            output_path = kwargs.get("cwd")
+            assert output_path == str(tmp_path)
+            from pathlib import Path
+
+            Path(command[output_index]).write_text("Resume pass complete.", encoding="utf-8")
+            stdout_text = (
+                '{"type":"session.resumed","server_session_id":"server-42",'
+                '"session":{"id":"oc-session-123"}}\n'
+                '{"type":"assistant.message.delta","delta":{"text":"Reconnected to the'
+                ' interrupted OpenCode session."}}\n'
+            )
+            return _FakeProcess(stdout_text)
+
+        with (
+            patch.object(runner._session_repo, "reconstruct_session", mock_reconstruct),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+            patch(
+                "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is True
+        assert recorded_commands
+        assert recorded_commands[0][:2] == ("/tmp/opencode", "run")
+        assert "--resume" in recorded_commands[0]
+        assert recorded_commands[0][recorded_commands[0].index("--resume") + 1] == "server-42"
+        progress_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if getattr(call.args[0], "type", None) == "orchestrator.progress.updated"
+        ]
+        assert any(
+            event.data.get("progress", {}).get("runtime", {}).get("native_session_id")
+            == "oc-session-123"
+            for event in progress_events
+        )
+
+    @pytest.mark.asyncio
+    async def test_resume_session_replays_persisted_progress_into_workflow_state(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Resume should rebuild workflow state from persisted progress before streaming."""
+        runtime_handle = RuntimeHandle(backend="opencode", native_session_id="oc-session-123")
+        running_tracker = SessionTracker.create("exec_resume", "seed_resume").with_status(
+            SessionStatus.RUNNING
+        )
+        running_tracker = running_tracker.with_progress(
+            {
+                "runtime": runtime_handle.to_dict(),
+                "messages_processed": 4,
+            }
+        )
+
+        async def mock_reconstruct(*args: Any, **kwargs: Any):
+            return Result.ok(running_tracker)
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(
+                type="result",
+                content="[TASK_COMPLETE]",
+                data={"subtype": "success"},
+                resume_handle=runtime_handle,
+            )
+
+        mock_adapter.execute_task = mock_execute
+        mock_event_store.replay.return_value = [
+            BaseEvent(
+                type="orchestrator.progress.updated",
+                aggregate_type="session",
+                aggregate_id="sess_resume",
+                data={
+                    "message_type": "assistant",
+                    "content_preview": "[AC_COMPLETE: 1] Finished the first criterion.",
+                    "ac_tracking": {"started": [], "completed": [1]},
+                    "progress": {
+                        "last_message_type": "assistant",
+                        "last_content_preview": "[AC_COMPLETE: 1] Finished the first criterion.",
+                    },
+                },
+            )
+        ]
+
+        with (
+            patch.object(runner._session_repo, "reconstruct_session", mock_reconstruct),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        workflow_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if getattr(call.args[0], "type", None) == "workflow.progress.updated"
+        ]
+        assert workflow_events
+        assert workflow_events[0].data["completed_count"] == 1
+        assert workflow_events[0].data["current_ac_index"] == 2
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel_passes_staged_execution_plan(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """Parallel execution should pass a staged plan into the executor."""
+        from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+        dependency_graph = DependencyGraph(
+            nodes=(
+                ACNode(index=0, content=sample_seed.acceptance_criteria[0]),
+                ACNode(index=1, content=sample_seed.acceptance_criteria[1]),
+                ACNode(index=2, content=sample_seed.acceptance_criteria[2], depends_on=(0, 1)),
+            ),
+            execution_levels=((0, 1), (2,)),
+        )
+        parallel_result = ParallelExecutionResult(
+            results=(
+                ACExecutionResult(
+                    ac_index=0,
+                    ac_content=sample_seed.acceptance_criteria[0],
+                    success=True,
+                    final_message="done",
+                ),
+                ACExecutionResult(
+                    ac_index=1,
+                    ac_content=sample_seed.acceptance_criteria[1],
+                    success=True,
+                    final_message="done",
+                ),
+                ACExecutionResult(
+                    ac_index=2,
+                    ac_content=sample_seed.acceptance_criteria[2],
+                    success=True,
+                    final_message="done",
+                ),
+            ),
+            success_count=3,
+            failure_count=0,
+            total_messages=3,
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer.analyze",
+                AsyncMock(return_value=Result.ok(dependency_graph)),
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(
+                runner._session_repo,
+                "mark_completed",
+                AsyncMock(return_value=Result.ok(None)),
+            ),
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor.execute_parallel",
+                AsyncMock(return_value=parallel_result),
+            ) as mock_execute_parallel,
+        ):
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read"],
+                tool_catalog=assemble_session_tool_catalog(["Read"]),
+                system_prompt="system",
+                start_time=tracker.start_time,
+            )
+
+        assert result.is_ok
+        kwargs = mock_execute_parallel.await_args.kwargs
+        execution_plan = kwargs["execution_plan"]
+        assert execution_plan.execution_levels == dependency_graph.execution_levels
+        assert execution_plan.total_stages == 2
+        assert kwargs["session_id"] == tracker.session_id
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel_builds_dependency_analyzer_with_llm_adapter(
+        self,
+        runner: OrchestratorRunner,
+        sample_seed: Seed,
+    ) -> None:
+        """Parallel execution should restore LLM-assisted dependency analysis."""
+        from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+        dependency_graph = DependencyGraph(
+            nodes=tuple(
+                ACNode(index=i, content=ac) for i, ac in enumerate(sample_seed.acceptance_criteria)
+            ),
+            execution_levels=((0, 1, 2),),
+        )
+        parallel_result = ParallelExecutionResult(
+            results=tuple(
+                ACExecutionResult(
+                    ac_index=i,
+                    ac_content=ac,
+                    success=True,
+                    final_message="done",
+                )
+                for i, ac in enumerate(sample_seed.acceptance_criteria)
+            ),
+            success_count=len(sample_seed.acceptance_criteria),
+            failure_count=0,
+            total_messages=len(sample_seed.acceptance_criteria),
+        )
+        llm_adapter = object()
+        analyzer_instance = MagicMock()
+        analyzer_instance.analyze = AsyncMock(return_value=Result.ok(dependency_graph))
+        dependency_analyzer_cls = MagicMock(return_value=analyzer_instance)
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                return_value=llm_adapter,
+            ) as mock_create_llm_adapter,
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer",
+                dependency_analyzer_cls,
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(
+                runner._session_repo,
+                "mark_completed",
+                AsyncMock(return_value=Result.ok(None)),
+            ),
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor.execute_parallel",
+                AsyncMock(return_value=parallel_result),
+            ),
+        ):
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read"],
+                tool_catalog=assemble_session_tool_catalog(["Read"]),
+                system_prompt="system",
+                start_time=tracker.start_time,
+            )
+
+        assert result.is_ok
+        mock_create_llm_adapter.assert_called_once_with(
+            backend="opencode",
+            permission_mode="acceptEdits",
+            cli_path=None,
+            cwd="/tmp/project",
+            max_turns=1,
+        )
+        dependency_analyzer_cls.assert_called_once_with(llm_adapter=llm_adapter)
+
+    def test_build_dependency_analyzer_reuses_resolved_codex_cli_path(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Nested dependency analysis should inherit the runtime's resolved Codex CLI path."""
+        mock_adapter.runtime_backend = "codex"
+        mock_adapter.cli_path = "/tmp/real-codex"
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        llm_adapter = object()
+        dependency_analyzer_cls = MagicMock()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                return_value=llm_adapter,
+            ) as mock_create_llm_adapter,
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer",
+                dependency_analyzer_cls,
+            ),
+        ):
+            analyzer = runner._build_dependency_analyzer()
+
+        assert analyzer is dependency_analyzer_cls.return_value
+        mock_create_llm_adapter.assert_called_once_with(
+            backend="codex",
+            permission_mode="acceptEdits",
+            cli_path="/tmp/real-codex",
+            cwd="/tmp/project",
+            max_turns=1,
+        )
+
+    def test_build_dependency_analyzer_uses_public_llm_backend_property(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """_build_dependency_analyzer must use the public llm_backend property, not _llm_backend."""
+        mock_adapter.runtime_backend = "opencode"
+        mock_adapter.llm_backend = "codex"  # override via public property
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        llm_adapter = object()
+        dependency_analyzer_cls = MagicMock()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                return_value=llm_adapter,
+            ) as mock_create_llm_adapter,
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer",
+                dependency_analyzer_cls,
+            ),
+        ):
+            analyzer = runner._build_dependency_analyzer()
+
+        assert analyzer is dependency_analyzer_cls.return_value
+        # llm_backend="codex" takes precedence over runtime_backend="opencode"
+        mock_create_llm_adapter.assert_called_once_with(
+            backend="codex",
+            permission_mode="acceptEdits",
+            cli_path=None,
+            cwd="/tmp/project",
+            max_turns=1,
+        )
+
+    def test_build_dependency_analyzer_falls_back_to_runtime_backend_when_llm_backend_none(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """When llm_backend is None, runtime_backend is used as the LLM backend."""
+        mock_adapter.runtime_backend = "opencode"
+        mock_adapter.llm_backend = None
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        llm_adapter = object()
+        dependency_analyzer_cls = MagicMock()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                return_value=llm_adapter,
+            ) as mock_create_llm_adapter,
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer",
+                dependency_analyzer_cls,
+            ),
+        ):
+            analyzer = runner._build_dependency_analyzer()
+
+        assert analyzer is dependency_analyzer_cls.return_value
+        mock_create_llm_adapter.assert_called_once_with(
+            backend="opencode",
+            permission_mode="acceptEdits",
+            cli_path=None,
+            cwd="/tmp/project",
+            max_turns=1,
+        )
+
+    def test_build_dependency_analyzer_catches_expected_exceptions(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """RuntimeError from create_llm_adapter is caught and returns a no-LLM analyzer."""
+        from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
+
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        with patch(
+            "ouroboros.orchestrator.runner.create_llm_adapter",
+            side_effect=RuntimeError("CLI not found"),
+        ):
+            analyzer = runner._build_dependency_analyzer()
+
+        assert isinstance(analyzer, DependencyAnalyzer)
+
+    def test_build_dependency_analyzer_does_not_catch_type_error(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """TypeError from create_llm_adapter propagates uncaught (programming error)."""
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                side_effect=TypeError("unexpected keyword argument"),
+            ),
+            pytest.raises(TypeError),
+        ):
+            runner._build_dependency_analyzer()
+
+    def test_build_dependency_analyzer_does_not_catch_attribute_error(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """AttributeError from create_llm_adapter propagates uncaught (programming error)."""
+        runner = OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runner.create_llm_adapter",
+                side_effect=AttributeError("object has no attribute"),
+            ),
+            pytest.raises(AttributeError),
+        ):
+            runner._build_dependency_analyzer()
+
+    def test_legacy_adapter_without_llm_backend_degrades_gracefully(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """Legacy adapters predating v0.28.6 (no llm_backend attr) fall back to structured-only.
+
+        Protects downstream Protocol implementers (custom runtimes, test mocks)
+        from the v0.28.6 AgentRuntime Protocol addition. Instead of raising
+        AttributeError at the call site, _build_dependency_analyzer returns a
+        structured-only DependencyAnalyzer, preserving pre-v0.28.6 behavior.
+        """
+        from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
+
+        class LegacyAdapter:
+            """Pre-v0.28.6 adapter stub without llm_backend attribute."""
+
+            runtime_backend = "opencode"
+            working_directory = "/tmp/project"
+            permission_mode = "acceptEdits"
+
+        legacy_adapter = LegacyAdapter()
+        assert not hasattr(legacy_adapter, "llm_backend")
+
+        runner = OrchestratorRunner(legacy_adapter, mock_event_store, mock_console)  # type: ignore[arg-type]
+
+        with patch("ouroboros.orchestrator.runner.create_llm_adapter") as mock_create_llm_adapter:
+            analyzer = runner._build_dependency_analyzer()
+
+        # Must not attempt to wire an LLM adapter when the legacy runtime
+        # lacks llm_backend - that path is the breaking-change path.
+        mock_create_llm_adapter.assert_not_called()
+        assert isinstance(analyzer, DependencyAnalyzer)
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_uses_inherited_runtime_handle(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Delegated child runs should fork from the inherited parent runtime handle."""
+        inherited_handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="sess_parent",
+            metadata={"fork_session": True},
+        )
+        mock_adapter = MagicMock()
+        captured_kwargs: dict[str, Any] = {}
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            captured_kwargs.update(kwargs)
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        # Inherit a known builtin (WebFetch) and a bridge tool
+        # (mcp__chrome-devtools__click).  The bridge tool should be
+        # deferred to MCPToolProvider discovery — not injected as a
+        # phantom builtin catalog entry.
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            inherited_runtime_handle=inherited_handle,
+            inherited_tools=["WebFetch", "mcp__chrome-devtools__click"],
+        )
+
+        from ouroboros.core.types import Result
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        resume_handle = captured_kwargs["resume_handle"]
+        assert resume_handle is not None
+        assert resume_handle.backend == inherited_handle.backend
+        assert resume_handle.native_session_id == inherited_handle.native_session_id
+        assert resume_handle.metadata.get("fork_session") is True
+        # Known builtin should be inherited
+        assert "WebFetch" in captured_kwargs["tools"]
+        # Bridge tool should NOT appear — it would be a phantom entry
+        assert "mcp__chrome-devtools__click" not in captured_kwargs["tools"]
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel_passes_inherited_runtime_handle_to_executor(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Parallel delegated runs should propagate inherited runtime/tool context."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
+        from ouroboros.orchestrator.parallel_executor import (
+            ACExecutionResult,
+            ParallelExecutionResult,
+        )
+
+        inherited_handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="sess_parent",
+            metadata={"fork_session": True},
+        )
+        mock_adapter = MagicMock()
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            inherited_runtime_handle=inherited_handle,
+        )
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+        captured_init: dict[str, Any] = {}
+        captured_execute: dict[str, Any] = {}
+
+        class FakeParallelExecutor:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                captured_init.update(kwargs)
+
+            async def execute_parallel(self, **kwargs: Any) -> ParallelExecutionResult:
+                captured_execute.update(kwargs)
+                return ParallelExecutionResult(
+                    results=tuple(
+                        ACExecutionResult(
+                            ac_index=index,
+                            ac_content=ac,
+                            success=True,
+                            final_message="[TASK_COMPLETE]",
+                        )
+                        for index, ac in enumerate(sample_seed.acceptance_criteria)
+                    ),
+                    success_count=len(sample_seed.acceptance_criteria),
+                    failure_count=0,
+                    total_messages=3,
+                    total_duration_seconds=0.1,
+                )
+
+        dependency_graph = DependencyGraph(
+            nodes=tuple(
+                ACNode(index=index, content=ac)
+                for index, ac in enumerate(sample_seed.acceptance_criteria)
+            ),
+            execution_levels=(tuple(range(len(sample_seed.acceptance_criteria))),),
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer.analyze",
+                AsyncMock(return_value=Result.ok(dependency_graph)),
+            ),
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor",
+                FakeParallelExecutor,
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(
+                runner._session_repo, "mark_completed", AsyncMock(return_value=Result.ok(None))
+            ),
+        ):
+            from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+            tool_catalog = assemble_session_tool_catalog(
+                ["Read", "mcp__chrome-devtools__click"],
+            )
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read", "mcp__chrome-devtools__click"],
+                tool_catalog=tool_catalog,
+                system_prompt="system",
+                start_time=datetime.now(UTC),
+            )
+
+        assert result.is_ok
+        assert captured_init["inherited_runtime_handle"] == inherited_handle
+        assert captured_execute["tools"] == ["Read", "mcp__chrome-devtools__click"]
+
+    @pytest.mark.asyncio
+    async def test_execute_parallel_emits_verification_report_for_decomposed_acs(
+        self,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Parallel execution should preserve decomposed Sub-AC evidence for QA."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.dependency_analyzer import ACNode, DependencyGraph
+        from ouroboros.orchestrator.parallel_executor import (
+            ACExecutionResult,
+            ParallelExecutionResult,
+        )
+
+        runner = OrchestratorRunner(MagicMock(), mock_event_store, mock_console)
+        tracker = SessionTracker.create("exec_parallel", sample_seed.metadata.seed_id)
+
+        sub_result = ACExecutionResult(
+            ac_index=100,
+            ac_content="Create task storage",
+            success=True,
+            messages=(
+                AgentMessage(
+                    type="tool",
+                    content="Running tests",
+                    tool_name="Bash",
+                    data={
+                        "tool_input": {"command": "uv   run pytest\n tests/unit/test_runner.py -q"}
+                    },
+                ),
+                AgentMessage(
+                    type="tool",
+                    content="Writing file",
+                    tool_name="Write",
+                    data={"tool_input": {"file_path": "/tmp/project/task_store.py"}},
+                ),
+            ),
+            final_message="Implemented task storage and verified behavior.",
+        )
+
+        class FakeParallelExecutor:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def execute_parallel(self, **kwargs: Any) -> ParallelExecutionResult:
+                return ParallelExecutionResult(
+                    results=(
+                        ACExecutionResult(
+                            ac_index=0,
+                            ac_content=sample_seed.acceptance_criteria[0],
+                            success=True,
+                            is_decomposed=True,
+                            sub_results=(sub_result,),
+                            final_message="Decomposed placeholder should not leak",
+                        ),
+                        ACExecutionResult(
+                            ac_index=1,
+                            ac_content=sample_seed.acceptance_criteria[1],
+                            success=True,
+                            final_message="Listed tasks correctly.",
+                        ),
+                        ACExecutionResult(
+                            ac_index=2,
+                            ac_content=sample_seed.acceptance_criteria[2],
+                            success=True,
+                            final_message="Deleted tasks correctly.",
+                        ),
+                    ),
+                    success_count=3,
+                    failure_count=0,
+                    total_messages=4,
+                    total_duration_seconds=0.2,
+                )
+
+        dependency_graph = DependencyGraph(
+            nodes=tuple(
+                ACNode(index=index, content=ac)
+                for index, ac in enumerate(sample_seed.acceptance_criteria)
+            ),
+            execution_levels=(tuple(range(len(sample_seed.acceptance_criteria))),),
+        )
+
+        with (
+            patch(
+                "ouroboros.orchestrator.dependency_analyzer.DependencyAnalyzer.analyze",
+                AsyncMock(return_value=Result.ok(dependency_graph)),
+            ),
+            patch(
+                "ouroboros.orchestrator.parallel_executor.ParallelACExecutor",
+                FakeParallelExecutor,
+            ),
+            patch.object(runner, "_check_cancellation", AsyncMock(return_value=False)),
+            patch.object(
+                runner._session_repo, "mark_completed", AsyncMock(return_value=Result.ok(None))
+            ),
+        ):
+            from ouroboros.orchestrator.mcp_tools import assemble_session_tool_catalog
+
+            result = await runner._execute_parallel(
+                seed=sample_seed,
+                exec_id="exec_parallel",
+                tracker=tracker,
+                merged_tools=["Read", "Write", "Bash"],
+                tool_catalog=assemble_session_tool_catalog(["Read", "Write", "Bash"]),
+                system_prompt="system",
+                start_time=datetime.now(UTC),
+            )
+
+        assert result.is_ok
+        assert "Commands Run:" not in result.value.final_message
+        assert "AC Status:" in result.value.final_message
+        verification_report = result.value.summary["verification_report"]
+        assert "### AC 1: [PASS] Tasks can be created" in verification_report
+        assert "#### Sub-AC 1.1: [PASS] Create task storage" in verification_report
+        assert "Bash: uv run pytest tests/unit/test_runner.py -q" in verification_report
+        assert "Write: /tmp/project/task_store.py" in verification_report
+        assert "Decomposed placeholder should not leak" not in verification_report
 
 
 class TestOrchestratorError:
@@ -354,6 +2182,9 @@ class TestOrchestratorRunnerWithMCP:
     def mock_adapter(self) -> MagicMock:
         """Create a mock Claude agent adapter."""
         adapter = MagicMock()
+        adapter.runtime_backend = "opencode"
+        adapter.working_directory = "/tmp/project"
+        adapter.permission_mode = "acceptEdits"
         return adapter
 
     @pytest.fixture
@@ -452,10 +2283,11 @@ class TestOrchestratorRunnerWithMCP:
             mock_console,
         )
 
-        merged_tools, provider = await runner._get_merged_tools("session_123")
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
 
         assert merged_tools == DEFAULT_TOOLS
         assert provider is None
+        assert [tool.name for tool in tool_catalog.tools] == DEFAULT_TOOLS
 
     @pytest.mark.asyncio
     async def test_get_merged_tools_with_mcp(
@@ -475,12 +2307,240 @@ class TestOrchestratorRunnerWithMCP:
             mcp_manager=mock_mcp_manager,
         )
 
-        merged_tools, provider = await runner._get_merged_tools("session_123")
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
 
         # Should include DEFAULT_TOOLS + MCP tools
         assert all(t in merged_tools for t in DEFAULT_TOOLS)
         assert "external_tool" in merged_tools
         assert provider is not None
+        assert tool_catalog.attached_tools[0].name == "external_tool"
+
+    @pytest.mark.asyncio
+    async def test_get_merged_tools_uses_deterministic_session_catalog_order(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        mock_mcp_manager: MagicMock,
+    ) -> None:
+        """Merged tool order should come from the normalized session catalog."""
+        from ouroboros.mcp.types import MCPToolDefinition
+
+        class _Strategy:
+            def get_tools(self) -> list[str]:
+                return ["Write", "Read"]
+
+        mock_mcp_manager.list_all_tools = AsyncMock(
+            return_value=[
+                MCPToolDefinition(
+                    name="search",
+                    description="Search from server-b",
+                    server_name="server-b",
+                ),
+                MCPToolDefinition(
+                    name="Read",
+                    description="Conflicting read tool",
+                    server_name="server-shadow",
+                ),
+                MCPToolDefinition(
+                    name="alpha",
+                    description="Alpha tool",
+                    server_name="server-a",
+                ),
+                MCPToolDefinition(
+                    name="search",
+                    description="Search from server-a",
+                    server_name="server-a",
+                ),
+            ]
+        )
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            mcp_manager=mock_mcp_manager,
+        )
+
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools(
+            "session_123",
+            strategy=_Strategy(),
+        )
+
+        assert merged_tools == ["Write", "Read", "alpha", "search"]
+        assert provider is not None
+        assert [tool.name for tool in provider.session_catalog.tools] == merged_tools
+        assert [tool.name for tool in tool_catalog.tools] == merged_tools
+
+    @pytest.mark.asyncio
+    async def test_get_merged_tools_includes_inherited_tools(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """Inherited builtin tools are merged; non-builtin tools are preserved as capabilities."""
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            inherited_tools=["Read", "WebFetch", "mcp__chrome-devtools__click"],
+        )
+
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
+
+        # Known builtins are inherited and deduplicated
+        assert "WebFetch" in merged_tools
+        assert merged_tools.count("Read") == 1
+        # Bridge/MCP tools are NOT in merged_tools — they would create
+        # phantom entries.  Instead they are preserved as inherited
+        # capabilities on the catalog for authorization / observability.
+        assert "mcp__chrome-devtools__click" not in merged_tools
+        assert tool_catalog is not None
+        assert "mcp__chrome-devtools__click" in tool_catalog.inherited_capabilities
+        assert provider is None
+
+    @pytest.mark.asyncio
+    async def test_get_merged_tools_emits_policy_events_for_inherited_capabilities(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """Policy decisions are persisted, including non-executable inherited grants."""
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            inherited_tools=["Read", "mcp__chrome-devtools__click"],
+        )
+
+        merged_tools, provider, _tool_catalog = await runner._get_merged_tools("session_123")
+
+        assert provider is None
+        assert "mcp__chrome-devtools__click" not in merged_tools
+        policy_events = [
+            call.args[0]
+            for call in mock_event_store.append.await_args_list
+            if getattr(call.args[0], "type", None) == "orchestrator.policy.capabilities.evaluated"
+        ]
+        assert len(policy_events) == 1
+        events_by_name = {
+            item["capability"]["name"]: item for item in policy_events[0].data["evaluations"]
+        }
+
+        read_event = events_by_name["Read"]
+        assert read_event["decision"]["visible"] is True
+        assert read_event["decision"]["executable"] is True
+
+        inherited_event = events_by_name["mcp__chrome-devtools__click"]
+        assert inherited_event["capability"]["source_kind"] == "inherited_capability"
+        assert inherited_event["decision"]["visible"] is True
+        assert inherited_event["decision"]["executable"] is False
+        assert inherited_event["decision"]["reasons"] == [
+            "inherited_capability requires live provider discovery before execution"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_policy_audit_emit_failure_does_not_break_orchestration(
+        self,
+        mock_adapter: MagicMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """A failing event store must not take down tool-catalog assembly.
+
+        The policy audit event is auxiliary observability, not a
+        prerequisite for orchestration.  If the event store fails
+        (disk full, DB locked, etc.), the orchestrator must keep
+        producing merged tools and degrade to a logged warning
+        instead of raising into the session flow.
+        """
+        failing_event_store = AsyncMock()
+        failing_event_store.append.side_effect = RuntimeError("event store unavailable")
+
+        runner = OrchestratorRunner(
+            mock_adapter,
+            failing_event_store,
+            mock_console,
+            inherited_tools=["Read"],
+        )
+
+        # Must not raise despite every append() failing.
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
+
+        assert provider is None
+        assert "Read" in merged_tools
+        assert tool_catalog is not None
+        # The failed audit attempt was still made (best-effort, not skipped).
+        assert failing_event_store.append.await_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_get_merged_tools_preserves_inherited_capabilities_after_discovery(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+        mock_mcp_manager: MagicMock,
+    ) -> None:
+        """Inherited MCP capabilities survive MCP discovery replacing session_catalog."""
+        runner = OrchestratorRunner(
+            mock_adapter,
+            mock_event_store,
+            mock_console,
+            mcp_manager=mock_mcp_manager,
+            inherited_tools=["Read", "mcp__chrome-devtools__click"],
+        )
+
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
+
+        # MCP discovery succeeded — provider found 'external_tool'
+        assert provider is not None
+        assert "external_tool" in merged_tools
+        # The inherited MCP capability must survive discovery replacing
+        # the catalog — this was Regression 2 from Q00's review.
+        assert tool_catalog is not None
+        assert "mcp__chrome-devtools__click" in tool_catalog.inherited_capabilities
+
+    @pytest.mark.asyncio
+    async def test_runtime_handle_tool_catalog_round_trip_with_inherited_capabilities(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> None:
+        """Serialized dict tool catalog round-trips through runtime_handle_tool_catalog."""
+        from dataclasses import replace as dc_replace
+
+        from ouroboros.orchestrator.adapter import RuntimeHandle, runtime_handle_tool_catalog
+        from ouroboros.orchestrator.mcp_tools import (
+            assemble_session_tool_catalog,
+            normalize_serialized_tool_catalog,
+            serialize_tool_catalog,
+        )
+
+        catalog = assemble_session_tool_catalog(["Read", "Edit"])
+        catalog = dc_replace(
+            catalog,
+            inherited_capabilities=frozenset({"mcp__chrome-devtools__click"}),
+        )
+        serialized = serialize_tool_catalog(catalog)
+        # serialize_tool_catalog returns dict when inherited_capabilities present
+        assert isinstance(serialized, dict)
+
+        handle = RuntimeHandle(
+            backend="claude",
+            native_session_id="s1",
+            metadata={"tool_catalog": serialized},
+        )
+        # runtime_handle_tool_catalog must accept the dict format
+        raw = runtime_handle_tool_catalog(handle)
+        assert raw is not None
+        assert isinstance(raw, dict)
+
+        # Full round-trip through normalize_serialized_tool_catalog
+        restored = normalize_serialized_tool_catalog(raw)
+        assert restored is not None
+        assert "mcp__chrome-devtools__click" in restored.inherited_capabilities
 
     @pytest.mark.asyncio
     async def test_get_merged_tools_mcp_failure(
@@ -502,7 +2562,7 @@ class TestOrchestratorRunnerWithMCP:
             mcp_manager=mock_mcp_manager,
         )
 
-        merged_tools, provider = await runner._get_merged_tools("session_123")
+        merged_tools, provider, tool_catalog = await runner._get_merged_tools("session_123")
 
         # Should still return DEFAULT_TOOLS on failure
         assert merged_tools == DEFAULT_TOOLS
@@ -511,6 +2571,7 @@ class TestOrchestratorRunnerWithMCP:
         assert provider is not None
         # No MCP tools should have been added
         assert len(merged_tools) == len(DEFAULT_TOOLS)
+        assert tool_catalog.attached_tools == ()
 
     @pytest.mark.asyncio
     async def test_execute_seed_with_mcp_tools(
@@ -554,3 +2615,444 @@ class TestOrchestratorRunnerWithMCP:
         assert result.is_ok
         # MCP tools loaded event should have been emitted
         assert mock_event_store.append.called
+
+
+class TestCancellationPolling:
+    """Tests for cancellation detection in execution loops."""
+
+    @pytest.fixture
+    def mock_adapter(self) -> MagicMock:
+        """Create a mock Claude agent adapter."""
+        adapter = MagicMock()
+        adapter.runtime_backend = "opencode"
+        adapter.working_directory = "/tmp/project"
+        adapter.permission_mode = "acceptEdits"
+        return adapter
+
+    @pytest.fixture
+    def mock_event_store(self) -> AsyncMock:
+        """Create a mock event store."""
+        store = AsyncMock()
+        store.append = AsyncMock()
+        store.replay = AsyncMock(return_value=[])
+        store.query_events = AsyncMock(return_value=[])
+        return store
+
+    @pytest.fixture
+    def mock_console(self) -> MagicMock:
+        """Create a mock Rich console."""
+        return MagicMock()
+
+    @pytest.fixture
+    def runner(
+        self,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        mock_console: MagicMock,
+    ) -> OrchestratorRunner:
+        """Create a runner with mocked dependencies."""
+        return OrchestratorRunner(mock_adapter, mock_event_store, mock_console)
+
+    @pytest.mark.asyncio
+    async def test_check_cancellation_returns_false_when_no_event(
+        self,
+        runner: OrchestratorRunner,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test _check_cancellation returns False when no cancellation event exists."""
+        mock_event_store.query_events = AsyncMock(return_value=[])
+        result = await runner._check_cancellation("session_123")
+        assert result is False
+        mock_event_store.query_events.assert_called_once_with(
+            aggregate_id="session_123",
+            event_type="orchestrator.session.cancelled",
+            limit=1,
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_cancellation_returns_true_when_event_exists(
+        self,
+        runner: OrchestratorRunner,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test _check_cancellation returns True when cancellation event exists."""
+        from ouroboros.orchestrator.events import create_session_cancelled_event
+
+        cancel_event = create_session_cancelled_event("session_123", "User requested")
+        mock_event_store.query_events = AsyncMock(return_value=[cancel_event])
+        result = await runner._check_cancellation("session_123")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_check_cancellation_graceful_on_error(
+        self,
+        runner: OrchestratorRunner,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test _check_cancellation returns False on event store error (graceful degradation)."""
+        mock_event_store.query_events = AsyncMock(side_effect=Exception("DB unavailable"))
+        result = await runner._check_cancellation("session_123")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_handle_cancellation_returns_result(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Test _handle_cancellation returns a proper OrchestratorResult."""
+        from datetime import UTC, datetime
+
+        start_time = datetime.now(UTC)
+
+        with patch.object(runner._session_repo, "mark_cancelled", AsyncMock(return_value=None)):
+            result = await runner._handle_cancellation(
+                session_id="sess_123",
+                execution_id="exec_456",
+                messages_processed=10,
+                start_time=start_time,
+            )
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert result.value.session_id == "sess_123"
+        assert result.value.execution_id == "exec_456"
+        assert result.value.messages_processed == 10
+        assert "cancelled" in result.value.final_message.lower()
+        assert result.value.summary.get("cancelled") is True
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_stops_on_cancellation(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Test that execute_seed detects cancellation and stops execution."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.events import create_session_cancelled_event
+        from ouroboros.orchestrator.runner import CANCELLATION_CHECK_INTERVAL
+
+        messages_yielded = 0
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            nonlocal messages_yielded
+            # Yield enough messages to trigger a cancellation check
+            for i in range(CANCELLATION_CHECK_INTERVAL + 5):
+                messages_yielded += 1
+                yield AgentMessage(type="assistant", content=f"Message {i}")
+            # This final message should never be reached
+            yield AgentMessage(
+                type="result",
+                content="Should not reach here",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        # Return no cancellation at startup, then return a cancellation event
+        # at the first periodic message-loop checkpoint.
+        cancel_event = create_session_cancelled_event("session_123", "User requested")
+        mock_event_store.query_events = AsyncMock(side_effect=[[], [cancel_event]])
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_cancelled(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_cancelled", mock_mark_cancelled),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert "cancelled" in result.value.final_message.lower()
+        # Should have stopped at the cancellation check interval
+        assert result.value.messages_processed == CANCELLATION_CHECK_INTERVAL
+
+    @pytest.mark.asyncio
+    async def test_execute_seed_no_cancellation_proceeds_normally(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Test that execute_seed runs normally when no cancellation is issued."""
+        from ouroboros.core.types import Result
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            yield AgentMessage(type="assistant", content="Working...")
+            yield AgentMessage(type="tool", content="Reading", tool_name="Read")
+            yield AgentMessage(
+                type="result",
+                content="Task completed successfully",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+        # No cancellation events
+        mock_event_store.query_events = AsyncMock(return_value=[])
+
+        async def mock_create_session(*args: Any, **kwargs: Any):
+            return Result.ok(SessionTracker.create("exec", sample_seed.metadata.seed_id))
+
+        async def mock_mark_completed(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "create_session", mock_create_session),
+            patch.object(runner._session_repo, "mark_completed", mock_mark_completed),
+        ):
+            result = await runner.execute_seed(sample_seed, parallel=False)
+
+        assert result.is_ok
+        assert result.value.success is True
+
+    @pytest.mark.asyncio
+    async def test_resume_session_stops_on_cancellation(
+        self,
+        runner: OrchestratorRunner,
+        mock_adapter: MagicMock,
+        mock_event_store: AsyncMock,
+        sample_seed: Seed,
+    ) -> None:
+        """Test that resume_session detects cancellation and stops."""
+        from ouroboros.core.types import Result
+        from ouroboros.orchestrator.events import create_session_cancelled_event
+        from ouroboros.orchestrator.runner import CANCELLATION_CHECK_INTERVAL
+
+        async def mock_execute(*args: Any, **kwargs: Any) -> AsyncIterator[AgentMessage]:
+            for i in range(CANCELLATION_CHECK_INTERVAL + 5):
+                yield AgentMessage(type="assistant", content=f"Message {i}")
+            yield AgentMessage(
+                type="result",
+                content="Should not reach",
+                data={"subtype": "success"},
+            )
+
+        mock_adapter.execute_task = mock_execute
+
+        cancel_event = create_session_cancelled_event("sess_resume", "User requested")
+        mock_event_store.query_events = AsyncMock(return_value=[cancel_event])
+
+        running_tracker = SessionTracker.create("exec_resume", "seed_1").with_status(
+            SessionStatus.RUNNING
+        )
+
+        async def mock_reconstruct(*args: Any, **kwargs: Any):
+            return Result.ok(running_tracker)
+
+        async def mock_mark_cancelled(*args: Any, **kwargs: Any):
+            return Result.ok(None)
+
+        with (
+            patch.object(runner._session_repo, "reconstruct_session", mock_reconstruct),
+            patch.object(runner._session_repo, "mark_cancelled", mock_mark_cancelled),
+        ):
+            result = await runner.resume_session("sess_resume", sample_seed)
+
+        assert result.is_ok
+        assert result.value.success is False
+        assert "cancelled" in result.value.final_message.lower()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_check_interval_constant(self) -> None:
+        """Test that CANCELLATION_CHECK_INTERVAL is defined and reasonable."""
+        from ouroboros.orchestrator.runner import CANCELLATION_CHECK_INTERVAL
+
+        assert isinstance(CANCELLATION_CHECK_INTERVAL, int)
+        assert CANCELLATION_CHECK_INTERVAL > 0
+        assert CANCELLATION_CHECK_INTERVAL <= 20  # Reasonable upper bound
+
+    @pytest.mark.asyncio
+    async def test_check_cancellation_detects_in_memory_registry(
+        self,
+        runner: OrchestratorRunner,
+        mock_event_store: AsyncMock,
+    ) -> None:
+        """Test _check_cancellation returns True when session is in the in-memory registry."""
+        from ouroboros.orchestrator.runner import (
+            _cancellation_registry,
+            clear_cancellation,
+            request_cancellation,
+        )
+
+        # Ensure clean state
+        _cancellation_registry.discard("sess_inmem")
+
+        await request_cancellation("sess_inmem")
+        try:
+            # Should return True without even querying the event store
+            result = await runner._check_cancellation("sess_inmem")
+            assert result is True
+            # Event store query should NOT have been called (fast path)
+            mock_event_store.query_events.assert_not_called()
+        finally:
+            await clear_cancellation("sess_inmem")
+
+    @pytest.mark.asyncio
+    async def test_handle_cancellation_clears_in_memory_registry(
+        self,
+        runner: OrchestratorRunner,
+    ) -> None:
+        """Test _handle_cancellation clears the in-memory registry entry."""
+        from datetime import UTC, datetime
+
+        from ouroboros.orchestrator.runner import (
+            is_cancellation_requested,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_clear")
+
+        with patch.object(runner._session_repo, "mark_cancelled", AsyncMock(return_value=None)):
+            await runner._handle_cancellation(
+                session_id="sess_clear",
+                execution_id="exec_clear",
+                messages_processed=5,
+                start_time=datetime.now(UTC),
+            )
+
+        assert await is_cancellation_requested("sess_clear") is False
+
+
+class TestCancellationRegistry:
+    """Tests for the module-level in-memory cancellation registry functions."""
+
+    def setup_method(self) -> None:
+        """Clear the registry before each test."""
+        from ouroboros.orchestrator.runner import _cancellation_registry
+
+        _cancellation_registry.clear()
+
+    def teardown_method(self) -> None:
+        """Clear the registry after each test."""
+        from ouroboros.orchestrator.runner import _cancellation_registry
+
+        _cancellation_registry.clear()
+
+    @pytest.mark.asyncio
+    async def test_request_cancellation_adds_session(self) -> None:
+        """Test that request_cancellation adds the session ID to the registry."""
+        from ouroboros.orchestrator.runner import (
+            is_cancellation_requested,
+            request_cancellation,
+        )
+
+        assert await is_cancellation_requested("sess_1") is False
+        await request_cancellation("sess_1")
+        assert await is_cancellation_requested("sess_1") is True
+
+    @pytest.mark.asyncio
+    async def test_clear_cancellation_removes_session(self) -> None:
+        """Test that clear_cancellation removes the session ID."""
+        from ouroboros.orchestrator.runner import (
+            clear_cancellation,
+            is_cancellation_requested,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_2")
+        assert await is_cancellation_requested("sess_2") is True
+        await clear_cancellation("sess_2")
+        assert await is_cancellation_requested("sess_2") is False
+
+    @pytest.mark.asyncio
+    async def test_clear_cancellation_is_idempotent(self) -> None:
+        """Test that clearing a non-existent session does not raise."""
+        from ouroboros.orchestrator.runner import clear_cancellation
+
+        # Should not raise
+        await clear_cancellation("nonexistent_session")
+
+    @pytest.mark.asyncio
+    async def test_get_pending_cancellations_returns_frozenset(self) -> None:
+        """Test that get_pending_cancellations returns a frozenset snapshot."""
+        from ouroboros.orchestrator.runner import (
+            get_pending_cancellations,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_a")
+        await request_cancellation("sess_b")
+
+        pending = await get_pending_cancellations()
+        assert isinstance(pending, frozenset)
+        assert pending == frozenset({"sess_a", "sess_b"})
+
+    @pytest.mark.asyncio
+    async def test_get_pending_cancellations_is_snapshot(self) -> None:
+        """Test that the returned frozenset is a snapshot, not a live view."""
+        from ouroboros.orchestrator.runner import (
+            clear_cancellation,
+            get_pending_cancellations,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_snap")
+        snapshot = await get_pending_cancellations()
+        await clear_cancellation("sess_snap")
+
+        # Snapshot should still contain the session
+        assert "sess_snap" in snapshot
+        # But the registry should not
+        new_snapshot = await get_pending_cancellations()
+        assert "sess_snap" not in new_snapshot
+
+    @pytest.mark.asyncio
+    async def test_multiple_sessions_tracked_independently(self) -> None:
+        """Test that multiple sessions can be tracked independently."""
+        from ouroboros.orchestrator.runner import (
+            clear_cancellation,
+            is_cancellation_requested,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_x")
+        await request_cancellation("sess_y")
+
+        assert await is_cancellation_requested("sess_x") is True
+        assert await is_cancellation_requested("sess_y") is True
+
+        await clear_cancellation("sess_x")
+        assert await is_cancellation_requested("sess_x") is False
+        assert await is_cancellation_requested("sess_y") is True
+
+    @pytest.mark.asyncio
+    async def test_request_cancellation_is_idempotent(self) -> None:
+        """Test that requesting cancellation twice is safe."""
+        from ouroboros.orchestrator.runner import (
+            get_pending_cancellations,
+            request_cancellation,
+        )
+
+        await request_cancellation("sess_dup")
+        await request_cancellation("sess_dup")
+
+        assert len(await get_pending_cancellations()) == 1
+
+
+class TestExecutionCancelledError:
+    """Tests for ExecutionCancelledError."""
+
+    def test_create_with_defaults(self) -> None:
+        """Test creating error with default reason."""
+        from ouroboros.orchestrator.runner import ExecutionCancelledError
+
+        error = ExecutionCancelledError(session_id="sess_123")
+        assert error.session_id == "sess_123"
+        assert error.reason == "Cancelled by user"
+        assert "sess_123" in str(error)
+
+    def test_create_with_custom_reason(self) -> None:
+        """Test creating error with custom reason."""
+        from ouroboros.orchestrator.runner import ExecutionCancelledError
+
+        error = ExecutionCancelledError(session_id="sess_456", reason="Auto-cleanup: stale")
+        assert error.session_id == "sess_456"
+        assert error.reason == "Auto-cleanup: stale"
+        assert "Auto-cleanup: stale" in str(error)

@@ -12,14 +12,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 from typing import Any
 import uuid
 
 import structlog
 
+from ouroboros.config import get_qa_model
 from ouroboros.core.types import Result
 from ouroboros.evaluation.json_utils import extract_json_payload
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
+from ouroboros.mcp.tools.subagent import (
+    build_qa_subagent,
+    build_subagent_result,
+    emit_subagent_dispatched_event,
+    should_dispatch_via_plugin,
+)
 from ouroboros.mcp.types import (
     ContentType,
     MCPContentItem,
@@ -28,7 +36,9 @@ from ouroboros.mcp.types import (
     MCPToolResult,
     ToolInputType,
 )
-from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
+from ouroboros.persistence.event_store import EventStore
+from ouroboros.providers import create_llm_adapter
+from ouroboros.providers.base import LLMAdapter
 
 log = structlog.get_logger(__name__)
 
@@ -63,7 +73,8 @@ QA_VERDICT_SCHEMA: dict[str, object] = {
         },
         "reasoning": {"type": "string", "description": "Explanation of assessment"},
     },
-    "required": ["score", "verdict"],
+    "required": ["score", "verdict", "dimensions", "differences", "suggestions", "reasoning"],
+    "additionalProperties": False,
 }
 
 VALID_ARTIFACT_TYPES = ("code", "api_response", "document", "screenshot", "test_output", "custom")
@@ -167,6 +178,99 @@ def _unwrap_verdict_data(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+_LINE_DECORATION_RE = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
+_BOLD_RE = re.compile(r"\*{1,2}([^*]+)\*{1,2}")
+_KV_RE = re.compile(r"(?im)^(\w[\w ]*?)[ \t]*[:=\-][ \t]*(.+)$")
+_SCORE_FALLBACK_RE = re.compile(r"(?im)\bscore\b[ \t]*(?:is|-)[ \t]*([0-9]*\.?[0-9]+)")
+
+
+def _strip_line_decorations(text: str) -> str:
+    """Strip markdown/bullet formatting so downstream parsing stays simple."""
+    lines = []
+    for line in text.splitlines():
+        line = _LINE_DECORATION_RE.sub("", line)
+        line = _BOLD_RE.sub(r"\1", line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _extract_kv_fields(text: str) -> dict[str, str]:
+    """Extract ``Key: Value`` or ``Key = Value`` pairs from cleaned text."""
+    fields: dict[str, str] = {}
+    for m in _KV_RE.finditer(text):
+        fields.setdefault(m.group(1).strip().lower(), m.group(2).strip())
+    return fields
+
+
+def _parse_non_json_qa_response(response_text: str) -> dict[str, Any] | None:
+    """Parse QA verdicts from plain-text fallbacks.
+
+    Some providers occasionally ignore structured-output constraints and return
+    readable prose such as ``Score: 0.84`` / ``Verdict: pass`` instead of JSON.
+    When that happens we still want the tool to degrade gracefully rather than
+    failing the whole QA step.
+    """
+    cleaned = _strip_line_decorations(response_text)
+    fields = _extract_kv_fields(cleaned)
+
+    raw_score = fields.get("score")
+    if raw_score:
+        score_num = re.match(r"([0-9]*\.?[0-9]+)", raw_score)
+    else:
+        # Fallback: "score is 0.85" / "score - 0.85" (word-bounded, not in KV)
+        score_num = _SCORE_FALLBACK_RE.search(cleaned)
+
+    if not score_num:
+        return None
+    try:
+        score = float(score_num.group(1))
+    except ValueError:
+        return None
+
+    differences: list[str] = []
+    suggestions: list[str] = []
+    dimensions: dict[str, float] = {}
+
+    # Track which section we're in based on headers
+    current_section = "differences"
+    _SECTION_RE = re.compile(r"(?i)^\s*#*\s*(suggestions?|differences?|dimensions?)\s*:?\s*$")
+    _BULLET_RE = re.compile(r"(?m)^\s*(?:[-*]|\d+[.)])\s+(.+)$")
+    _DIM_RE = re.compile(r"^(\w[\w ]*?)[:=\-]\s*([0-9]*\.?[0-9]+)\s*$")
+
+    for line in response_text.splitlines():
+        section_match = _SECTION_RE.match(line)
+        if section_match:
+            header = section_match.group(1).lower().rstrip("s")
+            if header == "suggestion":
+                current_section = "suggestions"
+            elif header == "dimension":
+                current_section = "dimensions"
+            else:
+                current_section = "differences"
+            continue
+
+        bullet_match = _BULLET_RE.match(line)
+        if bullet_match:
+            item = bullet_match.group(1).strip()
+            # Check if this bullet is a dimension (e.g. "accuracy: 0.9")
+            dim_match = _DIM_RE.match(item)
+            if dim_match and current_section == "dimensions":
+                dimensions[dim_match.group(1).strip().lower()] = float(dim_match.group(2))
+            elif current_section == "suggestions":
+                suggestions.append(item)
+            else:
+                differences.append(item)
+
+    return {
+        "score": score,
+        "verdict": fields.get("verdict", ""),
+        "dimensions": dimensions,
+        "differences": differences,
+        "suggestions": suggestions,
+        "reasoning": fields.get("reasoning", ""),
+    }
+
+
 def _parse_qa_response(
     response_text: str,
     pass_threshold: float = DEFAULT_PASS_THRESHOLD,
@@ -177,13 +281,15 @@ def _parse_qa_response(
         Result containing QAVerdict or error string.
     """
     json_str = extract_json_payload(response_text)
-    if not json_str:
-        return Result.err("Could not find JSON in QA response")
-
-    try:
-        data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        return Result.err(f"Invalid JSON in QA response: {e}")
+    if json_str:
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            return Result.err(f"Invalid JSON in QA response: {e}")
+    else:
+        data = _parse_non_json_qa_response(response_text)
+        if data is None:
+            return Result.err("Could not find JSON in QA response")
 
     # Unwrap nested verdict objects (e.g. {"qa_verdict": {...}})
     data = _unwrap_verdict_data(data)
@@ -295,7 +401,11 @@ class QAHandler:
     Supports iterative loop until pass or max_iterations reached.
     """
 
-    llm_adapter: ClaudeCodeAdapter | None = field(default=None, repr=False)
+    llm_adapter: LLMAdapter | None = field(default=None, repr=False)
+    llm_backend: str | None = field(default=None, repr=False)
+    event_store: EventStore | None = field(default=None, repr=False)
+    agent_runtime_backend: str | None = field(default=None, repr=False)
+    opencode_mode: str | None = field(default=None, repr=False)
 
     @property
     def definition(self) -> MCPToolDefinition:
@@ -415,6 +525,35 @@ class QAHandler:
             pass_threshold=pass_threshold,
         )
 
+        # --- Subagent dispatch: gate on runtime + opencode_mode ---
+        payload = build_qa_subagent(
+            artifact=artifact,
+            quality_bar=quality_bar,
+            artifact_type=artifact_type,
+            reference=reference,
+            pass_threshold=pass_threshold,
+            qa_session_id=qa_session_id,
+            iteration_history=iteration_history,
+            seed_content=seed_content,
+        )
+        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            await emit_subagent_dispatched_event(
+                self.event_store,
+                session_id=qa_session_id,
+                payload=payload,
+            )
+            return build_subagent_result(
+                payload,
+                response_shape={
+                    "qa_session_id": qa_session_id,
+                    "artifact_type": artifact_type,
+                    "status": "delegated_to_subagent",
+                    "dispatch_mode": "plugin",
+                },
+            )
+
+        # Fall-through: real in-process QA LLM call (subprocess / non-opencode runtimes).
+
         try:
             from ouroboros.providers.base import CompletionConfig, Message, MessageRole
 
@@ -434,9 +573,12 @@ class QAHandler:
                 Message(role=MessageRole.USER, content=user_prompt),
             ]
 
-            llm_adapter = self.llm_adapter or ClaudeCodeAdapter(max_turns=1)
+            llm_adapter = self.llm_adapter or create_llm_adapter(
+                backend=self.llm_backend,
+                max_turns=1,
+            )
             config = CompletionConfig(
-                model="claude-sonnet-4-20250514",
+                model=get_qa_model(self.llm_backend),
                 temperature=0.2,
                 max_tokens=2048,
                 response_format={"type": "json_schema", "json_schema": QA_VERDICT_SCHEMA},
@@ -499,11 +641,21 @@ class QAHandler:
                 )
             )
 
-        except Exception as e:
-            log.error("mcp.tool.qa.error", error=str(e))
+        except (ValueError, RuntimeError) as e:
+            # Configuration/bootstrap errors (unsupported backend, missing
+            # provider install) — actionable by the user, safe to surface.
+            log.warning("mcp.tool.qa.config_error", error=str(e))
             return Result.err(
                 MCPToolError(
-                    f"QA evaluation failed: {e}",
+                    f"QA setup failed: {e}",
+                    tool_name="ouroboros_qa",
+                )
+            )
+        except Exception:
+            log.exception("mcp.tool.qa.error")
+            return Result.err(
+                MCPToolError(
+                    "QA evaluation failed due to an internal error. Check server logs for details.",
                     tool_name="ouroboros_qa",
                 )
             )

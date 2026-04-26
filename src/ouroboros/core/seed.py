@@ -14,6 +14,8 @@ This module defines:
 - Supporting types for seed components
 """
 
+from __future__ import annotations
+
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -145,7 +147,7 @@ class SeedMetadata(BaseModel, frozen=True):
     seed_id: str = Field(default_factory=lambda: f"seed_{uuid4().hex[:12]}")
     version: str = Field(default="1.0.0")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    ambiguity_score: float = Field(..., ge=0.0, le=1.0)
+    ambiguity_score: float = Field(default=0.15, ge=0.0, le=1.0)
     interview_id: str | None = Field(default=None)
     parent_seed_id: str | None = Field(default=None)
 

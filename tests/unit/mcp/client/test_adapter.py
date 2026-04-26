@@ -1,9 +1,11 @@
 """Tests for MCP client adapter."""
 
-from unittest.mock import MagicMock
+import inspect
+from unittest.mock import AsyncMock, MagicMock
 
 from ouroboros.mcp.client.adapter import MCPClientAdapter
 from ouroboros.mcp.errors import MCPConnectionError
+from ouroboros.mcp.types import MCPServerConfig, TransportType
 
 
 class TestMCPClientAdapter:
@@ -47,6 +49,31 @@ class TestMCPClientAdapter:
         result = await adapter.read_resource("ouroboros://test")
         assert result.is_err
         assert "Not connected" in str(result.error)
+
+    async def test_disconnect_closes_transport_context(self) -> None:
+        """disconnect closes both session and stdio transport context."""
+        adapter = MCPClientAdapter()
+        adapter._config = MCPServerConfig(
+            name="test-server",
+            transport=TransportType.STDIO,
+            command="test-cmd",
+        )
+        session = AsyncMock()
+        transport_cm = AsyncMock()
+        adapter._session = session
+        adapter._transport_cm = transport_cm
+        adapter._read_stream = object()
+        adapter._write_stream = object()
+
+        result = await adapter.disconnect()
+
+        assert result.is_ok
+        session.__aexit__.assert_awaited_once()
+        transport_cm.__aexit__.assert_awaited_once()
+        assert adapter._session is None
+        assert adapter._transport_cm is None
+        assert adapter._read_stream is None
+        assert adapter._write_stream is None
 
 
 class TestMCPClientAdapterParsing:
@@ -108,3 +135,19 @@ class TestMCPClientAdapterRetry:
         assert adapter._max_retries == 5
         assert adapter._retry_wait_initial == 2.0
         assert adapter._retry_wait_max == 20.0
+
+
+class TestNoPrivateAPIImport:
+    """Verify private MCP SDK imports are not used."""
+
+    def test_no_private_httpx_utils_import(self) -> None:
+        """adapter.py must not import from mcp.shared._httpx_utils (private API)."""
+        import ouroboros.mcp.client.adapter as adapter_module
+
+        source = inspect.getsource(adapter_module)
+        assert "_httpx_utils" not in source, (
+            "adapter.py still references the private mcp.shared._httpx_utils module"
+        )
+        assert "create_mcp_http_client" not in source, (
+            "adapter.py still references the private create_mcp_http_client helper"
+        )

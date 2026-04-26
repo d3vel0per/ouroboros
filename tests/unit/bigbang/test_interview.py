@@ -2,15 +2,18 @@
 
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS,
     InterviewEngine,
     InterviewRound,
     InterviewState,
     InterviewStatus,
+    prompt_safe_initial_context,
 )
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.types import Result
@@ -123,6 +126,27 @@ class TestInterviewState:
             interview_id="test_001",
             initial_context="Build a CLI tool",
             status=InterviewStatus.IN_PROGRESS,
+            ambiguity_score=0.18,
+            ambiguity_breakdown={
+                "goal_clarity": {
+                    "name": "goal_clarity",
+                    "clarity_score": 0.9,
+                    "weight": 0.4,
+                    "justification": "Clear goal",
+                },
+                "constraint_clarity": {
+                    "name": "constraint_clarity",
+                    "clarity_score": 0.8,
+                    "weight": 0.3,
+                    "justification": "Mostly clear constraints",
+                },
+                "success_criteria_clarity": {
+                    "name": "success_criteria_clarity",
+                    "clarity_score": 0.75,
+                    "weight": 0.3,
+                    "justification": "Success criteria are measurable",
+                },
+            },
         )
         state.rounds.append(
             InterviewRound(
@@ -144,6 +168,21 @@ class TestInterviewState:
         assert len(restored.rounds) == 1
         assert restored.rounds[0].question == "What problem does it solve?"
         assert restored.rounds[0].user_response == "Task management"
+        assert restored.ambiguity_score == 0.18
+        assert restored.ambiguity_breakdown == state.ambiguity_breakdown
+
+    def test_clear_stored_ambiguity(self) -> None:
+        """Stored ambiguity snapshots can be invalidated after interview changes."""
+        state = InterviewState(
+            interview_id="test_001",
+            ambiguity_score=0.12,
+            ambiguity_breakdown={"goal_clarity": {"name": "goal_clarity"}},
+        )
+
+        state.clear_stored_ambiguity()
+
+        assert state.ambiguity_score is None
+        assert state.ambiguity_breakdown is None
 
 
 class TestInterviewRound:
@@ -300,6 +339,183 @@ class TestInterviewEngineAskNextQuestion:
         assert "Build a task manager" in system_message.content
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("context_length", [2500, 3500])
+    async def test_long_initial_context_stays_below_cli_failure_cap(
+        self, context_length: int
+    ) -> None:
+        """Long initial_context is split so the system prompt stays below 3500 chars."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        async def _complete(messages, _config):
+            total_prompt_chars = sum(len(message.content) for message in messages)
+            if total_prompt_chars > engine._MAX_TOTAL_PROMPT_CHARS:
+                return Result.err(
+                    ProviderError(
+                        "Command failed with exit code 1. Check stderr output for details"
+                    )
+                )
+            return Result.ok(create_mock_completion_response())
+
+        mock_adapter.complete = AsyncMock(side_effect=_complete)
+        state = InterviewState(
+            interview_id=f"test_long_context_{context_length}",
+            initial_context="X" * context_length,
+        )
+
+        result = await engine.ask_next_question(state)
+
+        assert result.is_ok
+        messages = mock_adapter.complete.call_args[0][0]
+        assert len(messages[0].content) <= engine._MAX_SYSTEM_PROMPT_CHARS
+        assert sum(len(message.content) for message in messages) <= engine._MAX_TOTAL_PROMPT_CHARS
+        assert "Initial context continues in the first user message" in messages[0].content
+        assert messages[1].role == MessageRole.USER
+        assert "Additional initial context omitted" in messages[1].content
+
+    @pytest.mark.asyncio
+    async def test_long_initial_context_overflow_remains_after_first_round(self) -> None:
+        """Overflow initial_context remains present in later stateless requests."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(return_value=Result.ok(create_mock_completion_response()))
+
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_long_context_round_2",
+            initial_context="X" * 3500,
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question="What is the main goal?",
+                user_response="Ship the feature",
+            )
+        )
+
+        result = await engine.ask_next_question(state)
+
+        assert result.is_ok
+        messages = mock_adapter.complete.call_args[0][0]
+        assert len(messages[0].content) <= engine._MAX_SYSTEM_PROMPT_CHARS
+        assert sum(len(message.content) for message in messages) <= engine._MAX_TOTAL_PROMPT_CHARS
+        assert messages[1].role == MessageRole.USER
+        assert "Additional initial context omitted" in messages[1].content
+
+    @pytest.mark.asyncio
+    async def test_very_long_initial_context_is_rejected_before_prompting(self) -> None:
+        """Persisted long initial_context asks for a summary instead of failing."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(return_value=Result.ok(create_mock_completion_response()))
+
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+        initial_context = ("A" * 49_990) + "TAIL_MARKER"
+        state = InterviewState(
+            interview_id="test_very_long_context",
+            initial_context=initial_context,
+        )
+
+        result = await engine.ask_next_question(state)
+
+        assert result.is_ok
+        assert result.value == INITIAL_CONTEXT_SUMMARY_QUESTION
+        mock_adapter.complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_accepts_very_long_initial_context_for_summary_recovery(self) -> None:
+        """start_interview remains backward-compatible with security limits."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        result = await engine.start_interview(("A" * 4_000) + "TAIL_MARKER")
+
+        assert result.is_ok
+        assert result.value.initial_context.endswith("TAIL_MARKER")
+
+    def test_prompt_safe_initial_context_uses_summary_round(self) -> None:
+        """Shared prompt-safe context helper uses the recorded user summary."""
+        state = InterviewState(
+            interview_id="test_summary_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response="Short project summary",
+            )
+        )
+
+        assert prompt_safe_initial_context(state) == "Short project summary"
+
+    def test_prompt_safe_initial_context_caps_long_summary_round(self) -> None:
+        """Shared prompt-safe context helper caps oversized recorded summaries."""
+        state = InterviewState(
+            interview_id="test_long_summary_context",
+            initial_context=("A" * 4_000) + "ORIGINAL_TAIL",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response=("B" * 4_000) + "SUMMARY_TAIL",
+            )
+        )
+
+        prompt_context = prompt_safe_initial_context(state)
+
+        assert len(prompt_context) <= MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS
+        assert "Context truncated for prompt safety" in prompt_context
+        assert "ORIGINAL_TAIL" not in prompt_context
+        assert "SUMMARY_TAIL" not in prompt_context
+
+    @pytest.mark.asyncio
+    async def test_completed_long_context_requests_summary_recovery(self) -> None:
+        """Completed long-context interviews can still ask for the required summary."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_completed_legacy_context",
+            initial_context=("A" * 4_000) + "ORIGINAL_TAIL",
+            status=InterviewStatus.COMPLETED,
+        )
+
+        result = await engine.ask_next_question(state)
+
+        assert result.is_ok
+        assert result.value == INITIAL_CONTEXT_SUMMARY_QUESTION
+        mock_adapter.complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_long_history_stays_under_total_prompt_cap(self) -> None:
+        """Later rounds trim retained history so the full request stays safe."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(return_value=Result.ok(create_mock_completion_response()))
+
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_long_history",
+            initial_context=("X" * 3489) + "TAIL_MARKER",
+        )
+        for i in range(8):
+            state.rounds.append(
+                InterviewRound(
+                    round_number=i + 1,
+                    question=f"What detail matters next? {i}",
+                    user_response="Y" * 800,
+                )
+            )
+
+        result = await engine.ask_next_question(state)
+
+        assert result.is_ok
+        messages = mock_adapter.complete.call_args[0][0]
+        prompt_content = "\n".join(message.content for message in messages)
+        assert sum(len(message.content) for message in messages) <= engine._MAX_TOTAL_PROMPT_CHARS
+        assert "Additional initial context omitted" in prompt_content
+        assert "TAIL_MARKER" in prompt_content
+
+    @pytest.mark.asyncio
     async def test_ask_question_with_history(self) -> None:
         """ask_next_question includes conversation history."""
         mock_adapter = MagicMock()
@@ -432,6 +648,29 @@ class TestInterviewEngineRecordResponse:
 
         assert result.is_err
         assert isinstance(result.error, ValidationError)
+
+    @pytest.mark.asyncio
+    async def test_record_response_reopens_completed_long_context_for_summary(self) -> None:
+        """Completed long-context interviews can record the missing summary."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        state = InterviewState(
+            interview_id="test_completed_summary_repair",
+            initial_context=("A" * 4_000) + "ORIGINAL_TAIL",
+            status=InterviewStatus.COMPLETED,
+        )
+
+        result = await engine.record_response(
+            state,
+            user_response="Concise product summary",
+            question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+        )
+
+        assert result.is_ok
+        assert state.status == InterviewStatus.IN_PROGRESS
+        assert state.rounds[-1].question == INITIAL_CONTEXT_SUMMARY_QUESTION
+        assert prompt_safe_initial_context(state) == "Concise product summary"
 
     @pytest.mark.asyncio
     async def test_record_response_does_not_auto_complete(self) -> None:
@@ -739,6 +978,121 @@ class TestInterviewEngineSystemPrompt:
 
         assert "Build a task manager" in prompt
 
+    def test_system_prompt_includes_live_ambiguity_snapshot(self) -> None:
+        """_build_system_prompt includes the latest ambiguity snapshot when available."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        state = InterviewState(
+            interview_id="test_001",
+            initial_context="Build a task manager",
+            ambiguity_score=0.24,
+            ambiguity_breakdown={
+                "goal_clarity": {
+                    "name": "Goal Clarity",
+                    "clarity_score": 0.82,
+                    "weight": 0.4,
+                    "justification": "Goal is mostly clear.",
+                },
+                "constraint_clarity": {
+                    "name": "Constraint Clarity",
+                    "clarity_score": 0.61,
+                    "weight": 0.3,
+                    "justification": "Constraints need work.",
+                },
+                "success_criteria_clarity": {
+                    "name": "Success Criteria Clarity",
+                    "clarity_score": 0.73,
+                    "weight": 0.3,
+                    "justification": "Criteria are somewhat measurable.",
+                },
+            },
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert "## Current Ambiguity Snapshot" in prompt
+        assert "Overall ambiguity: 0.24" in prompt
+        assert "Milestone:" in prompt
+        assert "Weakest area: Constraint Clarity" in prompt
+        assert "Constraints need work." in prompt
+
+    def test_system_prompt_includes_perspective_panel(self) -> None:
+        """_build_system_prompt includes the internal perspective panel."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        state = InterviewState(
+            interview_id="test_001",
+            initial_context="Review a PR and decide what to implement",
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert "## Perspective Panel" in prompt
+        assert "### breadth-keeper" in prompt
+        assert "### researcher" in prompt
+        assert "### simplifier" in prompt
+
+    def test_system_prompt_uses_seed_closer_when_closure_mode_is_active(self) -> None:
+        """Closure mode should activate the seed-closer perspective."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        state = InterviewState(
+            interview_id="test_001",
+            initial_context="Refine requirements",
+            ambiguity_score=0.24,
+            ambiguity_breakdown={
+                "goal_clarity": {
+                    "name": "Goal Clarity",
+                    "clarity_score": 0.82,
+                    "weight": 0.4,
+                    "justification": "Goal is mostly clear.",
+                },
+                "constraint_clarity": {
+                    "name": "Constraint Clarity",
+                    "clarity_score": 0.70,
+                    "weight": 0.3,
+                    "justification": "Constraints are getting clearer.",
+                },
+                "success_criteria_clarity": {
+                    "name": "Success Criteria Clarity",
+                    "clarity_score": 0.76,
+                    "weight": 0.3,
+                    "justification": "Criteria are becoming measurable.",
+                },
+            },
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert "### seed-closer" in prompt
+        assert "Closure mode active: yes" in prompt
+
+    def test_system_prompt_omits_seed_closer_when_closure_mode_is_inactive(self) -> None:
+        """High ambiguity should keep the closure perspective disabled."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        state = InterviewState(
+            interview_id="test_001",
+            initial_context="Refine requirements",
+            rounds=[
+                InterviewRound(round_number=1, question="Q1", user_response="A1"),
+                InterviewRound(round_number=2, question="Q2", user_response="A2"),
+                InterviewRound(round_number=3, question="Q3", user_response="A3"),
+                InterviewRound(round_number=4, question="Q4", user_response="A4"),
+                InterviewRound(round_number=5, question="Q5", user_response="A5"),
+            ],
+            ambiguity_score=0.41,
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert "### seed-closer" not in prompt
+        assert "Closure mode active: no" in prompt
+
 
 class TestInterviewEngineConversationHistory:
     """Test InterviewEngine conversation history building."""
@@ -798,11 +1152,7 @@ class TestInterviewEngineBrownfieldDetection:
         mock_adapter = MagicMock()
         engine = InterviewEngine(llm_adapter=mock_adapter)
 
-        with patch(
-            "ouroboros.bigbang.interview.InterviewEngine._trigger_codebase_exploration",
-            new_callable=AsyncMock,
-        ):
-            result = await engine.start_interview("Add a REST endpoint", cwd=str(tmp_path))
+        result = await engine.start_interview("Add a REST endpoint", cwd=str(tmp_path))
 
         assert result.is_ok
         state = result.value
@@ -821,41 +1171,25 @@ class TestInterviewEngineBrownfieldDetection:
         assert result.value.is_brownfield is False
 
     @pytest.mark.asyncio
-    async def test_start_interview_brownfield_runs_exploration(self, tmp_path: Path) -> None:
-        """start_interview calls _trigger_codebase_exploration for brownfield."""
+    async def test_start_interview_brownfield_no_exploration(self, tmp_path: Path) -> None:
+        """start_interview detects brownfield but does NOT trigger exploration.
+
+        In the new architecture, main session handles code reading.
+        MCP only sets is_brownfield flag.
+        """
         (tmp_path / "package.json").write_text('{"name":"demo"}')
 
         mock_adapter = MagicMock()
         engine = InterviewEngine(llm_adapter=mock_adapter)
 
-        with patch.object(
-            engine,
-            "_trigger_codebase_exploration",
-            new_callable=AsyncMock,
-        ) as mock_explore:
-            await engine.start_interview("Add a feature", cwd=str(tmp_path))
+        result = await engine.start_interview("Add a feature", cwd=str(tmp_path))
 
-        mock_explore.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_start_interview_exploration_failure_non_blocking(self, tmp_path: Path) -> None:
-        """start_interview succeeds even when exploration raises."""
-        (tmp_path / "go.mod").write_text("module example.com/demo\n")
-
-        mock_adapter = MagicMock()
-        engine = InterviewEngine(llm_adapter=mock_adapter)
-
-        with patch.object(
-            engine,
-            "_trigger_codebase_exploration",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("explore boom"),
-        ):
-            result = await engine.start_interview("Add an endpoint", cwd=str(tmp_path))
-
-        # Interview should still start successfully
         assert result.is_ok
-        assert result.value.is_brownfield is True
+        state = result.value
+        assert state.is_brownfield is True
+        # No codebase_context populated (main session handles this)
+        assert not state.codebase_context
+        assert not state.explore_completed
 
     @pytest.mark.asyncio
     async def test_start_interview_empty_dir_stays_greenfield(self, tmp_path: Path) -> None:
@@ -873,7 +1207,7 @@ class TestSystemPromptBrownfield:
     """Test brownfield system prompt injection."""
 
     def test_system_prompt_brownfield_round_1(self) -> None:
-        """System prompt includes confirmation instructions when brownfield context exists."""
+        """System prompt includes brownfield hint when is_brownfield is set."""
         mock_adapter = MagicMock()
         engine = InterviewEngine(llm_adapter=mock_adapter)
 
@@ -881,12 +1215,47 @@ class TestSystemPromptBrownfield:
             interview_id="test_bf",
             initial_context="Add a REST endpoint",
             is_brownfield=True,
-            codebase_context="Tech: Python\nDeps: flask, sqlalchemy\n",
         )
 
         prompt = engine._build_system_prompt(state)
 
-        assert "Existing Codebase Context" in prompt
-        assert "CONFIRMATION questions" in prompt
-        assert "I found X. Should I assume Y?" in prompt
-        assert "flask" in prompt
+        # New architecture: no codebase_context stuffing, just a brownfield hint
+        assert "BROWNFIELD" in prompt
+        assert "INTENT" in prompt or "DECISIONS" in prompt
+        assert "[from-code]" in prompt
+        assert "### architect" in prompt
+
+    def test_system_prompt_hard_cap_enforced(self) -> None:
+        """Final prompt must never exceed _MAX_SYSTEM_PROMPT_CHARS (3500)."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        # Create state with oversized context to blow past the cap
+        state = InterviewState(
+            interview_id="test_cap",
+            initial_context="X" * 6000,
+            is_brownfield=True,
+            codebase_context="Y" * 3000,
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert len(prompt) <= engine._MAX_SYSTEM_PROMPT_CHARS
+
+    def test_system_prompt_cap_when_header_and_panel_exceed_budget(self) -> None:
+        """Cap holds even when dynamic_header + perspective_panel alone exceed 3500."""
+        mock_adapter = MagicMock()
+        engine = InterviewEngine(llm_adapter=mock_adapter)
+
+        # Brownfield with huge codebase_context inflates dynamic_header;
+        # perspective panel also adds content. Together they can exceed 4800.
+        state = InterviewState(
+            interview_id="test_cap2",
+            initial_context="Z" * 4000,
+            is_brownfield=True,
+            codebase_context="W" * 4000,
+        )
+
+        prompt = engine._build_system_prompt(state)
+
+        assert len(prompt) <= engine._MAX_SYSTEM_PROMPT_CHARS

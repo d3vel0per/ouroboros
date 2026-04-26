@@ -2,12 +2,12 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
 
-class TaskStatus(str, Enum):
+class TaskStatus(StrEnum):
     """Task status enumeration."""
 
     PENDING = "pending"

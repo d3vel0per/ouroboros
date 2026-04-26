@@ -24,9 +24,14 @@ from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
     CompletionResponse,
+    LLMAdapter,
     UsageInfo,
 )
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+
+try:
+    from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+except ImportError:
+    LiteLLMAdapter = None  # type: ignore[assignment, misc]
 
 
 class TestTokenCounting:
@@ -192,6 +197,7 @@ class TestWorkflowContext:
         assert restored.metadata == original.metadata
 
 
+@pytest.mark.skipif(LiteLLMAdapter is None, reason="litellm not installed")
 class TestLLMCompression:
     """Tests for LLM-based compression."""
 
@@ -209,7 +215,7 @@ class TestLLMCompression:
         )
 
         # Mock LLM adapter
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_response = CompletionResponse(
             content="Summary: Set up project with PostgreSQL and API endpoints. Using FastAPI with JWT.",
             model="gpt-4",
@@ -232,7 +238,7 @@ class TestLLMCompression:
         )
 
         # Mock LLM adapter to fail
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_error = ProviderError("API rate limit exceeded", provider="openai", status_code=429)
         mock_adapter.complete.return_value = Result.err(mock_error)
 
@@ -242,6 +248,7 @@ class TestLLMCompression:
         assert result.error.status_code == 429
 
 
+@pytest.mark.skipif(LiteLLMAdapter is None, reason="litellm not installed")
 class TestContextCompression:
     """Tests for full context compression."""
 
@@ -261,7 +268,7 @@ class TestContextCompression:
         )
 
         # Mock successful LLM response
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_response = CompletionResponse(
             content="Completed project setup, database config, and API endpoints with validation and tests.",
             model="gpt-4",
@@ -298,7 +305,7 @@ class TestContextCompression:
         )
 
         # Mock LLM failure
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_error = ProviderError("Timeout", provider="openai")
         mock_adapter.complete.return_value = Result.err(mock_error)
 
@@ -329,7 +336,7 @@ class TestContextCompression:
         )
 
         # Mock LLM success
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_response = CompletionResponse(
             content="Summary of work done",
             model="gpt-4",
@@ -358,7 +365,7 @@ class TestContextCompression:
             history=[{"i": i} for i in range(5)],
         )
 
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_response = CompletionResponse(
             content="Summary",
             model="gpt-4",
@@ -461,6 +468,7 @@ class TestFilteredContext:
         assert len(filtered.relevant_facts) < len(full_context.key_facts)
 
 
+@pytest.mark.skipif(LiteLLMAdapter is None, reason="litellm not installed")
 class TestEdgeCases:
     """Tests for edge cases and error conditions."""
 
@@ -479,7 +487,7 @@ class TestEdgeCases:
             key_facts=[],
         )
 
-        mock_adapter = AsyncMock(spec=LiteLLMAdapter)
+        mock_adapter = AsyncMock(spec=LLMAdapter)
         mock_response = CompletionResponse(
             content="Empty context",
             model="gpt-4",

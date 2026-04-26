@@ -74,6 +74,7 @@ class TransportType(StrEnum):
     STDIO = "stdio"
     SSE = "sse"
     STREAMABLE_HTTP = "streamable-http"
+    HTTP = "http"
 ```
 
 ### Enum: `ContentType`
@@ -122,6 +123,13 @@ config = MCPServerConfig(
     transport=TransportType.SSE,
     url="https://api.example.com/mcp",
     headers={"Authorization": "Bearer xxx"},
+)
+
+# HTTP transport (alias for streamable-http, used by Claude Code)
+http_config = MCPServerConfig(
+    name="github-mcp",
+    transport=TransportType.HTTP,
+    url="http://localhost:3000/mcp",
 )
 ```
 
@@ -244,6 +252,25 @@ class MCPServerInfo:
     resources: tuple[MCPResourceDefinition, ...]
     prompts: tuple[MCPPromptDefinition, ...]
 ```
+
+---
+
+## Ouroboros MCP Tools
+
+Ouroboros exposes workflow tools as ordinary MCP handlers. The MCP server does
+not parse `ooo` syntax and does not receive channel-specific identifiers for
+skill routing.
+
+Runtime integrations that support `ooo <skill>` or `/ouroboros:<skill>` use the
+shared stateless router in `ouroboros.router` before invoking MCP. The router
+loads packaged `SKILL.md` frontmatter, validates `mcp_tool` and `mcp_args`,
+substitutes `$1` / `$CWD` templates, and returns runtime-neutral dispatch
+metadata. The runtime then performs its own structured logging, `AgentMessage`
+assembly, and MCP handler invocation.
+
+For setup and command authoring details, see the
+[Shared `ooo` Skill Dispatch Router](../guides/ooo-skill-dispatch-router.md)
+guide.
 
 ---
 

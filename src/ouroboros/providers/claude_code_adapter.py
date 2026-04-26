@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -35,6 +37,7 @@ from pathlib import Path
 import structlog
 
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.json_utils import extract_json_payload
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
     CompletionConfig,
@@ -48,7 +51,10 @@ log = structlog.get_logger(__name__)
 
 # Retry configuration for transient API errors
 _MAX_RETRIES = 5
-_INITIAL_BACKOFF_SECONDS = 2.0  # Increased for custom CLI startup
+_MAX_JSON_RETRIES = 3  # Extra retries when response_format requires JSON but LLM returns prose
+_INITIAL_BACKOFF_SECONDS = (
+    0.5  # Keep low for interactive loops; exponential backoff handles sustained failures
+)
 _RETRYABLE_ERROR_PATTERNS = (
     "concurrency",
     "rate",
@@ -89,9 +95,11 @@ class ClaudeCodeAdapter:
         self,
         permission_mode: str = "default",
         cli_path: str | Path | None = None,
+        cwd: str | Path | None = None,
         allowed_tools: list[str] | None = None,
         max_turns: int = 1,
         on_message: Callable[[str, str], None] | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Initialize Claude Code adapter.
 
@@ -102,23 +110,34 @@ class ClaudeCodeAdapter:
             cli_path: Path to the Claude CLI binary. If not provided,
                 checks OUROBOROS_CLI_PATH env var, then falls back to
                 SDK's bundled CLI.
-            allowed_tools: List of tools to allow. None means no tools.
-                For interview mode with codebase access, use ["Read", "Glob", "Grep"].
-            max_turns: Maximum turns for the conversation. Default 1 for single response.
-                Increase for tool use scenarios.
+            cwd: Working directory passed to the Claude Agent SDK.
+            allowed_tools: Explicit allow-list for Claude tools. ``None`` keeps
+                the default permissive mode while still blocking dangerous tools.
+                Use ``[]`` to forbid all Claude tools.
+            max_turns: Maximum turns for the conversation. Default 1 for
+                single-response completions (most MCP use cases).
             on_message: Callback for streaming messages. Called with (type, content):
                 - ("thinking", "content") for agent reasoning
                 - ("tool", "tool_name") for tool usage
+            timeout: Optional application-level timeout in seconds for a
+                single completion request. When set, aborts before outer
+                transport timeouts and returns a ProviderError.
         """
         self._permission_mode: str = permission_mode
         self._cli_path: Path | None = self._resolve_cli_path(cli_path)
-        self._allowed_tools: list[str] = allowed_tools or []
+        self._cwd: str = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._allowed_tools: list[str] | None = (
+            list(allowed_tools) if allowed_tools is not None else None
+        )
         self._max_turns: int = max_turns
         self._on_message: Callable[[str, str], None] | None = on_message
+        self._timeout: float | None = timeout if timeout and timeout > 0 else None
         log.info(
             "claude_code_adapter.initialized",
             permission_mode=permission_mode,
             cli_path=str(self._cli_path) if self._cli_path else None,
+            cwd=self._cwd,
+            timeout_seconds=self._timeout,
         )
 
     def _resolve_cli_path(self, cli_path: str | Path | None) -> Path | None:
@@ -222,20 +241,178 @@ class ClaudeCodeAdapter:
                 )
             )
 
-        # Build prompt from messages
-        prompt = self._build_prompt(messages)
+        # Extract system messages and pass as system_prompt (not embedded in user prompt)
+        system_msgs = [m for m in messages if m.role == MessageRole.SYSTEM]
+        non_system_msgs = [m for m in messages if m.role != MessageRole.SYSTEM]
+        system_prompt = system_msgs[0].content if system_msgs else None
+
+        # Claude Code's CLI path does not reliably honor json_schema structured
+        # output. When callers request a schema, reinforce the requirement in the
+        # prompt text and let downstream parsers extract JSON from the plain-text
+        # response rather than depending on SDK-level structured_output.
+        requires_json = bool(
+            config.response_format
+            and config.response_format.get("type") in ("json_schema", "json_object")
+        )
+        if requires_json:
+            fmt_type = config.response_format.get("type")
+            if fmt_type == "json_schema":
+                schema = config.response_format.get("json_schema", {})
+                # Derive the expected top-level type from the schema so the
+                # prompt instruction matches the schema contract (object, array, etc.)
+                top_type = schema.get("type", "object")
+                if top_type == "array":
+                    type_noun = "JSON array"
+                elif top_type == "object":
+                    type_noun = "JSON object"
+                else:
+                    # Primitive schemas (string, number, boolean, null)
+                    type_noun = "JSON value"
+                schema_instruction = (
+                    f"Respond with ONLY a valid {type_noun} that matches this schema. "
+                    "Do not use markdown fences, headers, or explanatory text.\n\n"
+                    f"JSON schema:\n{json.dumps(schema, indent=2, sort_keys=True)}"
+                )
+            else:
+                # json_object — no schema, but still steer toward JSON
+                schema_instruction = (
+                    "Respond with ONLY a valid JSON object. "
+                    "Do not use markdown fences, headers, or explanatory text."
+                )
+            if system_prompt:
+                system_prompt = f"{system_prompt}\n\n{schema_instruction}"
+            else:
+                non_system_msgs = [
+                    Message(role=MessageRole.USER, content=schema_instruction),
+                    *non_system_msgs,
+                ]
+
+        # Build prompt from non-system messages only
+        prompt = self._build_prompt(non_system_msgs)
 
         log.debug(
             "claude_code_adapter.request_started",
             prompt_preview=prompt[:100],
             message_count=len(messages),
+            has_system_prompt=system_prompt is not None,
+            max_turns=self._max_turns,
+            model=config.model,
+            cwd=str(self._cwd) if self._cwd else None,
+            cli_path=str(self._cli_path) if self._cli_path else None,
+            claudecode_present=bool(os.environ.get("CLAUDECODE")),
+            claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
         )
 
+        result = await self._complete_with_transient_retry(prompt, config, system_prompt)
+
+        # JSON enforcement layer: if response_format requires JSON,
+        # normalize or retry until we get valid JSON.
+        if requires_json and result.is_ok:
+            result = await self._enforce_json(result, prompt, config, system_prompt)
+
+        return result
+
+    def _normalize_json_content(
+        self, result: Result[CompletionResponse, ProviderError]
+    ) -> Result[CompletionResponse, ProviderError] | None:
+        """Try to extract and normalize JSON from a successful result.
+
+        Returns:
+            Normalized result if JSON found, None if no valid JSON in content.
+        """
+        if result.is_err:
+            return result
+        extracted = extract_json_payload(result.value.content)
+        if extracted:
+            response = result.value
+            normalized_response = replace(
+                response,
+                content=extracted,
+                raw_response=deepcopy(response.raw_response),
+            )
+            return Result.ok(normalized_response)
+        return None
+
+    async def _enforce_json(
+        self,
+        result: Result[CompletionResponse, ProviderError],
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Normalize JSON content or retry until valid JSON is obtained.
+
+        If the response contains valid JSON (even wrapped in prose/fences),
+        extract and return just the JSON. If no valid JSON, retry up to
+        _MAX_JSON_RETRIES times. If all retries fail, return an error.
+        """
+        # Try to normalize the initial result
+        normalized = self._normalize_json_content(result)
+        if normalized is not None:
+            return normalized
+
+        log.warning(
+            "claude_code_adapter.json_not_found",
+            max_json_retries=_MAX_JSON_RETRIES,
+            response_preview=result.value.content[:120],
+        )
+
+        for json_attempt in range(1, _MAX_JSON_RETRIES + 1):
+            log.info(
+                "claude_code_adapter.json_retry",
+                attempt=json_attempt,
+                max_json_retries=_MAX_JSON_RETRIES,
+            )
+            result = await self._complete_with_transient_retry(prompt, config, system_prompt)
+            if result.is_err:
+                return result
+            normalized = self._normalize_json_content(result)
+            if normalized is not None:
+                return normalized
+
+        # All retries exhausted — return error instead of prose
+        log.error(
+            "claude_code_adapter.json_retries_exhausted",
+            max_json_retries=_MAX_JSON_RETRIES,
+            response_preview=result.value.content[:120] if result.is_ok else "N/A",
+        )
+        return Result.err(
+            ProviderError(
+                message=(
+                    f"JSON format required but LLM returned prose after {_MAX_JSON_RETRIES} retries"
+                ),
+                details={
+                    "last_response_preview": (
+                        result.value.content[:200] if result.is_ok else "N/A"
+                    ),
+                },
+            )
+        )
+
+    async def _complete_with_transient_retry(
+        self,
+        prompt: str,
+        config: CompletionConfig,
+        system_prompt: str | None,
+    ) -> Result[CompletionResponse, ProviderError]:
+        """Inner retry loop for transient API errors (rate limits, timeouts, etc.).
+
+        This handles infrastructure-level failures only. JSON format
+        enforcement is handled by the caller.
+        """
         last_error: ProviderError | None = None
 
         for attempt in range(_MAX_RETRIES):
             try:
-                result = await self._execute_single_request(prompt, config)
+                if self._timeout is None:
+                    result = await self._execute_single_request(
+                        prompt, config, system_prompt=system_prompt
+                    )
+                else:
+                    async with asyncio.timeout(self._timeout):
+                        result = await self._execute_single_request(
+                            prompt, config, system_prompt=system_prompt
+                        )
 
                 if result.is_ok:
                     if attempt > 0:
@@ -263,6 +440,22 @@ class ClaudeCodeAdapter:
                 # Non-retryable error
                 return result
 
+            except TimeoutError:
+                log.warning(
+                    "claude_code_adapter.request_timed_out",
+                    timeout_seconds=self._timeout,
+                    attempt=attempt + 1,
+                )
+                return Result.err(
+                    ProviderError(
+                        message=f"Claude Code request timed out after {self._timeout:.1f}s",
+                        details={
+                            "timed_out": True,
+                            "timeout_seconds": self._timeout,
+                            "attempt": attempt + 1,
+                        },
+                    )
+                )
             except Exception as e:
                 error_str = str(e)
                 error_type = type(e).__name__
@@ -315,6 +508,8 @@ class ClaudeCodeAdapter:
         self,
         prompt: str,
         config: CompletionConfig,
+        *,
+        system_prompt: str | None = None,
     ) -> Result[CompletionResponse, ProviderError]:
         """Execute a single SDK request without retry logic.
 
@@ -324,6 +519,8 @@ class ClaudeCodeAdapter:
         Args:
             prompt: The formatted prompt string.
             config: Configuration for the completion request.
+            system_prompt: Optional system prompt to pass as an authoritative
+                system instruction (not embedded in the user prompt).
 
         Returns:
             Result containing either the completion response or a ProviderError.
@@ -337,9 +534,9 @@ class ClaudeCodeAdapter:
         # This enables MCP tools (mcp__*) and read-only built-in tools
         dangerous_tools = ["Write", "Edit", "Bash", "Task", "NotebookEdit"]
 
-        # If allowed_tools is specified, compute disallowed from it (strict mode)
-        # Otherwise, only block dangerous tools (permissive mode for MCP)
-        if self._allowed_tools:
+        # If allowed_tools is explicitly set (even empty []), compute disallowed
+        # from it (strict mode). None = permissive (only block dangerous).
+        if self._allowed_tools is not None:
             all_tools = [
                 "Read",
                 "Write",
@@ -359,15 +556,44 @@ class ClaudeCodeAdapter:
         else:
             disallowed = dangerous_tools
 
+        # The bundled CLI refuses to start when CLAUDECODE is set (nested
+        # session check).  The Agent SDK sets CLAUDE_CODE_ENTRYPOINT=sdk-py
+        # to signal it's an SDK call, but the older check on CLAUDECODE fires
+        # first, causing silent empty responses.  Strip it via env override.
+        claudecode_present = bool(os.environ.get("CLAUDECODE"))
+        env_overrides: dict[str, str] = {
+            # Skip the per-call `claude -v` subprocess that the Agent SDK runs
+            # to verify version compatibility.  This is advisory-only — version
+            # mismatches surface naturally as API errors — and saves ~0.3-0.8 s
+            # latency on every LLM call.
+            # Honour OUROBOROS_SKIP_VERSION_CHECK if the user/operator sets it
+            # (e.g. "0" to re-enable the check for debugging).
+            "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": os.environ.get(
+                "OUROBOROS_SKIP_VERSION_CHECK", "1"
+            ),
+        }
+        if claudecode_present:
+            env_overrides["CLAUDECODE"] = ""
+
+        stderr_lines: list[str] = []
+
+        def _stderr_callback(line: str) -> None:
+            stderr_lines.append(line[:500])
+            log.debug("claude_code_adapter.stderr", line=line[:200])
+
         options_kwargs: dict = {
-            "allowed_tools": self._allowed_tools if self._allowed_tools else [],
             "disallowed_tools": disallowed,
             "max_turns": self._max_turns,
             # Allow MCP and other ~/.claude/ settings to be inherited
             "permission_mode": self._permission_mode,
-            "cwd": os.getcwd(),
+            "cwd": self._cwd,
             "cli_path": self._cli_path,
+            "stderr": _stderr_callback,
+            "env": env_overrides,
         }
+        if self._allowed_tools is not None:
+            options_kwargs["allowed_tools"] = self._allowed_tools
+
         # Pass model from CompletionConfig if specified
         # "default" is not a valid SDK model — treat it as None (use SDK default)
         if config.model and config.model != "default":
@@ -384,15 +610,30 @@ class ClaudeCodeAdapter:
             if model:
                 options_kwargs["model"] = model
 
-        # Pass structured output format if requested
-        # SDK expects: output_format={"type": "json_schema", "schema": {...}}
-        if config.response_format and config.response_format.get("type") == "json_schema":
-            options_kwargs["output_format"] = {
-                "type": "json_schema",
-                "schema": config.response_format.get("json_schema", {}),
-            }
+        # Pass system prompt as authoritative instruction (matches adapter.py:281-282 pattern)
+        if system_prompt:
+            options_kwargs["system_prompt"] = system_prompt
+
+        # Do not pass output_format here. The Claude CLI path used by the Agent
+        # SDK currently ignores json_schema structured output constraints and may
+        # return plain text, so we enforce schema compliance via prompt text in
+        # complete() and parse the JSON from the response body.
 
         options = ClaudeAgentOptions(**options_kwargs)
+
+        log.debug(
+            "claude_code_adapter.sdk_request_configured",
+            max_turns=self._max_turns,
+            model=options_kwargs.get("model"),
+            cwd=str(self._cwd) if self._cwd else None,
+            cli_path=str(self._cli_path) if self._cli_path else None,
+            permission_mode=self._permission_mode,
+            allowed_tools=self._allowed_tools,
+            disallowed_tools=disallowed,
+            claudecode_present=claudecode_present,
+            claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+            env_override_keys=sorted(env_overrides.keys()),
+        )
 
         # Collect the response - let the generator run to completion
         content = ""
@@ -415,58 +656,99 @@ class ClaudeCodeAdapter:
                 except StopAsyncIteration:
                     break
 
-        async for sdk_message in _safe_query():
-            class_name = type(sdk_message).__name__
+        try:
+            async for sdk_message in _safe_query():
+                class_name = type(sdk_message).__name__
 
-            if class_name == "SystemMessage":
-                # Capture session ID from init
-                msg_data = getattr(sdk_message, "data", {})
-                session_id = msg_data.get("session_id")
+                if class_name == "SystemMessage":
+                    # Capture session ID from init
+                    msg_data = getattr(sdk_message, "data", {})
+                    session_id = msg_data.get("session_id")
 
-            elif class_name == "AssistantMessage":
-                # Extract text content and tool use
-                content_blocks = getattr(sdk_message, "content", [])
-                for block in content_blocks:
-                    block_type = type(block).__name__
-                    if block_type == "TextBlock":
-                        text = getattr(block, "text", "")
-                        content += text
-                        # Callback for thinking/reasoning
-                        if self._on_message and text.strip():
-                            self._on_message("thinking", text.strip())
-                    elif block_type == "ToolUseBlock":
-                        tool_name = getattr(block, "name", "unknown")
-                        tool_input = getattr(block, "input", {})
-                        # Format tool info with key details
-                        tool_info = self._format_tool_info(tool_name, tool_input)
-                        # Callback for tool usage
-                        if self._on_message:
-                            self._on_message("tool", tool_info)
+                elif class_name == "AssistantMessage":
+                    # Extract text content and tool use
+                    content_blocks = getattr(sdk_message, "content", [])
+                    for block in content_blocks:
+                        block_type = type(block).__name__
+                        if block_type == "TextBlock":
+                            text = getattr(block, "text", "")
+                            content += text
+                            # Callback for thinking/reasoning
+                            if self._on_message and text.strip():
+                                self._on_message("thinking", text.strip())
+                        elif block_type == "ToolUseBlock":
+                            tool_name = getattr(block, "name", "unknown")
+                            tool_input = getattr(block, "input", {})
+                            # Format tool info with key details
+                            tool_info = self._format_tool_info(tool_name, tool_input)
+                            # Callback for tool usage
+                            if self._on_message:
+                                self._on_message("tool", tool_info)
 
-            elif class_name == "ResultMessage":
-                # Check for structured output first (from json_schema output_format)
-                structured = getattr(sdk_message, "structured_output", None)
-                if structured is not None:
-                    content = (
-                        json.dumps(structured) if not isinstance(structured, str) else structured
-                    )
+                elif class_name == "ResultMessage":
+                    # Check for structured output first (from json_schema output_format)
+                    structured = getattr(sdk_message, "structured_output", None)
+                    if structured is not None:
+                        content = (
+                            json.dumps(structured)
+                            if not isinstance(structured, str)
+                            else structured
+                        )
 
-                # Final result - use result content if we don't have content yet
-                elif not content:
-                    content = getattr(sdk_message, "result", "") or ""
+                    # Final result - use result content if we don't have content yet
+                    elif not content:
+                        content = getattr(sdk_message, "result", "") or ""
 
-                # Check for errors - don't break, just record
-                is_error = getattr(sdk_message, "is_error", False)
-                if is_error:
-                    error_msg = content or "Unknown error from Claude Agent SDK"
-                    log.warning(
-                        "claude_code_adapter.sdk_error",
-                        error=error_msg,
-                    )
-                    error_result = ProviderError(
-                        message=error_msg,
-                        details={"session_id": session_id},
-                    )
+                    # Check for errors - don't break, just record
+                    is_error = getattr(sdk_message, "is_error", False)
+                    if is_error:
+                        error_msg = (
+                            getattr(sdk_message, "result", "")
+                            or "Unknown error from Claude Agent SDK"
+                        )
+                        log.warning(
+                            "claude_code_adapter.sdk_error",
+                            error=error_msg,
+                            session_id=session_id,
+                            stderr_lines=len(stderr_lines),
+                        )
+                        error_result = ProviderError(
+                            message=error_msg,
+                            details={
+                                "session_id": session_id,
+                                "stderr": "\n".join(stderr_lines[-20:]) if stderr_lines else "",
+                                "claudecode_present": claudecode_present,
+                                "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                            },
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stderr_tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
+            error_message = f"Claude Agent SDK request failed: {exc}"
+            if stderr_tail and "Check stderr output for details" in str(exc):
+                error_message = f"{error_message}\nstderr tail:\n{stderr_tail}"
+            log.exception(
+                "claude_code_adapter.sdk_request_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                session_id=session_id,
+                stderr_lines=len(stderr_lines),
+                claudecode_present=claudecode_present,
+                claude_code_entrypoint=os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+            )
+            return Result.err(
+                ProviderError(
+                    message=error_message,
+                    details={
+                        "error_type": type(exc).__name__,
+                        "session_id": session_id,
+                        "stderr": stderr_tail,
+                        "claudecode_present": claudecode_present,
+                        "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                    },
+                )
+            )
 
         # After generator completes naturally, check for errors
         if error_result:
@@ -474,17 +756,25 @@ class ClaudeCodeAdapter:
 
         # Check for empty response — always an error regardless of session_id
         if not content:
+            # Include captured stderr for diagnostics — helps identify
+            # why the CLI produced no output (rate limits, auth, etc.)
+            stderr_tail = "\n".join(stderr_lines[-20:]) if stderr_lines else ""
             if session_id:
                 log.warning(
                     "claude_code_adapter.empty_response",
                     content_length=0,
                     session_id=session_id,
+                    stderr_lines=len(stderr_lines),
                     hint="CLI started but produced no content",
                 )
                 return Result.err(
                     ProviderError(
                         message="Empty response from CLI - session started but no content produced",
-                        details={"session_id": session_id, "content_length": 0},
+                        details={
+                            "session_id": session_id,
+                            "content_length": 0,
+                            "stderr": stderr_tail,
+                        },
                     )
                 )
             else:
@@ -492,12 +782,17 @@ class ClaudeCodeAdapter:
                     "claude_code_adapter.empty_response",
                     content_length=0,
                     session_id=session_id,
+                    stderr_lines=len(stderr_lines),
                     hint="CLI may still be starting (custom CLI sync, etc.)",
                 )
                 return Result.err(
                     ProviderError(
                         message="Empty response from CLI - may need retry (timeout/startup)",
-                        details={"session_id": session_id, "content_length": 0},
+                        details={
+                            "session_id": session_id,
+                            "content_length": 0,
+                            "stderr": stderr_tail,
+                        },
                     )
                 )
 
@@ -572,6 +867,12 @@ class ClaudeCodeAdapter:
 
         for msg in messages:
             if msg.role == MessageRole.SYSTEM:
+                # System messages should be extracted before _build_prompt() is called
+                # and passed via system_prompt parameter. Log a warning if one leaks through.
+                log.warning(
+                    "claude_code_adapter.system_message_in_build_prompt",
+                    hint="System messages should be extracted before calling _build_prompt()",
+                )
                 parts.append(f"<system>\n{msg.content}\n</system>\n")
             elif msg.role == MessageRole.USER:
                 parts.append(f"User: {msg.content}\n")

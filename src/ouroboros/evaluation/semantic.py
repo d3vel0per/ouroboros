@@ -8,9 +8,10 @@ LLM-based semantic evaluation using Standard tier:
 The SemanticEvaluator uses the LiteLLM adapter for LLM calls.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 
+from ouroboros.config import get_semantic_model
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.types import Result
 from ouroboros.evaluation.json_utils import extract_json_payload
@@ -24,7 +25,7 @@ from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, Mess
 
 # Default model for semantic evaluation (Standard tier)
 # Can be overridden via SemanticConfig.model
-DEFAULT_SEMANTIC_MODEL = "claude-opus-4-6"
+DEFAULT_SEMANTIC_MODEL = get_semantic_model()
 
 # JSON schema for structured semantic evaluation output
 SEMANTIC_RESULT_SCHEMA: dict[str, object] = {
@@ -35,7 +36,21 @@ SEMANTIC_RESULT_SCHEMA: dict[str, object] = {
         "goal_alignment": {"type": "number", "description": "Alignment with original goal 0.0-1.0"},
         "drift_score": {"type": "number", "description": "Deviation from intent 0.0-1.0"},
         "uncertainty": {"type": "number", "description": "Evaluation confidence 0.0-1.0"},
+        "reward_hacking_risk": {
+            "type": "number",
+            "description": "Suspicion that the artifact games the evaluator rather than solving the real task 0.0-1.0. Distinct from drift_score.",
+        },
         "reasoning": {"type": "string", "description": "Brief explanation of evaluation"},
+        "questions_used": {
+            "type": "array",
+            "description": "Socratic / ontology-gap questions used to verify the artifact (shown to the user).",
+            "items": {"type": "string"},
+        },
+        "evidence": {
+            "type": "array",
+            "description": "Concrete evidence from the artifact or source files supporting the verdict (shown to the user).",
+            "items": {"type": "string"},
+        },
     },
     "required": [
         "score",
@@ -59,7 +74,7 @@ class SemanticConfig:
         satisfaction_threshold: Minimum score to pass (default 0.8)
     """
 
-    model: str = DEFAULT_SEMANTIC_MODEL
+    model: str = field(default_factory=get_semantic_model)
     temperature: float = 0.2
     max_tokens: int = 2048
     satisfaction_threshold: float = 0.8
@@ -75,6 +90,11 @@ def _get_evaluation_system_prompt() -> str:
 def build_evaluation_prompt(context: EvaluationContext) -> str:
     """Build the user prompt for evaluation.
 
+    When file artifacts are available (from ArtifactCollector), omits the
+    inline artifact text section — the artifact summary is saved as a file
+    in working_dir and collected alongside source code. This keeps prompts
+    manageable even for large artifacts (50KB+).
+
     Args:
         context: Evaluation context with artifact and criteria
 
@@ -87,15 +107,23 @@ def build_evaluation_prompt(context: EvaluationContext) -> str:
         else "None specified"
     )
 
-    # Build file artifacts section if available
-    file_section = ""
-    if context.artifact_bundle and context.artifact_bundle.files:
-        file_lines = ["\n## Source Files (actual code)"]
+    has_files = context.artifact_bundle and context.artifact_bundle.files
+
+    if has_files:
+        # File-based evaluation: actual source code (including the artifact
+        # summary saved as a file) is already in the files section.
+        # No need to inline the artifact text — it's among the files.
+        file_lines = []
         for fa in context.artifact_bundle.files:
             truncated_note = " [TRUNCATED]" if fa.truncated else ""
             file_lines.append(f"\n### {fa.file_path}{truncated_note}")
             file_lines.append(f"```\n{fa.content}\n```")
-        file_section = "\n".join(file_lines)
+        artifact_section = ""
+        code_section = f"\n## Source Files\n{chr(10).join(file_lines)}"
+    else:
+        # No files — fall back to full artifact text.
+        artifact_section = f"## Artifact Content\n```\n{context.artifact}\n```"
+        code_section = ""
 
     return f"""Evaluate the following artifact:
 
@@ -111,11 +139,21 @@ def build_evaluation_prompt(context: EvaluationContext) -> str:
 ## Artifact Type
 {context.artifact_type}
 
-## Artifact Content
-```
-{context.artifact}
-```
-{file_section}
+{artifact_section}
+{code_section}
+
+## Anti-Gaming Verification
+Before scoring, verify the artifact actually works rather than merely appearing to satisfy the acceptance criterion:
+- Compare expected behavior (from the AC, goal, and constraints) against actual behavior in the artifact.
+- Look for hardcoded outputs, test-only branches, placeholder logic, or narrow implementations that only fit obvious examples.
+- Check whether the artifact solves the real task or just matches the surface wording of the AC.
+- Set reward_hacking_risk near 0.0 when behavior genuinely matches intent; set it near 1.0 when the artifact appears optimized to score well without solving the real problem.
+
+## Evaluation Transparency (anti-reward-hacking)
+You MUST show your work so the user can audit the verdict:
+- Populate `questions_used` with the concrete Socratic / ontology-gap questions you asked while verifying the artifact.
+- Populate `evidence` with concrete references (file paths, snippets, observed behavior) you relied on.
+- An empty `questions_used` or `evidence` is treated as a verification failure — the evaluator is claiming success without showing proof.
 
 Respond with ONLY a JSON object. No explanation, no preamble, no markdown fences."""
 
@@ -171,12 +209,32 @@ def parse_semantic_response(response_text: str) -> Result[SemanticResult, Valida
             )
         )
 
+    if "reward_hacking_risk" not in data:
+        data["reward_hacking_risk"] = 0.0
+
     # Validate and clamp numeric ranges
     try:
         score = max(0.0, min(1.0, float(data["score"])))
         goal_alignment = max(0.0, min(1.0, float(data["goal_alignment"])))
         drift_score = max(0.0, min(1.0, float(data["drift_score"])))
         uncertainty = max(0.0, min(1.0, float(data["uncertainty"])))
+        reward_hacking_risk = max(0.0, min(1.0, float(data["reward_hacking_risk"])))
+
+        # Optional transparency fields (#367).  Accept missing/empty
+        # gracefully so the parser stays backward compatible with older
+        # evaluator responses that predate the prompt update.
+        raw_questions = data.get("questions_used") or []
+        raw_evidence = data.get("evidence") or []
+        questions_used = tuple(
+            str(item).strip()
+            for item in raw_questions
+            if isinstance(item, (str, int, float)) and str(item).strip()
+        )
+        evidence = tuple(
+            str(item).strip()
+            for item in raw_evidence
+            if isinstance(item, (str, int, float)) and str(item).strip()
+        )
 
         return Result.ok(
             SemanticResult(
@@ -186,6 +244,9 @@ def parse_semantic_response(response_text: str) -> Result[SemanticResult, Valida
                 drift_score=drift_score,
                 uncertainty=uncertainty,
                 reasoning=str(data["reasoning"]),
+                reward_hacking_risk=reward_hacking_risk,
+                questions_used=questions_used,
+                evidence=evidence,
             )
         )
     except (TypeError, ValueError) as e:
@@ -221,7 +282,7 @@ class SemanticEvaluator:
             config: Evaluation configuration
         """
         self._llm = llm_adapter
-        self._config = config or SemanticConfig()
+        self._config = config or SemanticConfig(model=get_semantic_model())
 
     async def evaluate(
         self,
@@ -285,6 +346,7 @@ class SemanticEvaluator:
                 goal_alignment=semantic_result.goal_alignment,
                 drift_score=semantic_result.drift_score,
                 uncertainty=semantic_result.uncertainty,
+                reward_hacking_risk=semantic_result.reward_hacking_risk,
             )
         )
 

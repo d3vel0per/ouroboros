@@ -8,10 +8,10 @@ import os
 from typing import Any
 
 import litellm
-import stamina
 import structlog
 
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.retry import retry_async
 from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
@@ -22,6 +22,9 @@ from ouroboros.providers.base import (
 )
 
 log = structlog.get_logger()
+_CREDENTIALS_UNSET = object()
+_PLACEHOLDER_API_KEY_PREFIX = "YOUR_"
+_PLACEHOLDER_API_KEY_SUFFIX = "_API_KEY"
 
 # LiteLLM exceptions that should trigger retries
 RETRIABLE_EXCEPTIONS = (
@@ -75,6 +78,45 @@ class LiteLLMAdapter:
         self._api_base = api_base
         self._timeout = timeout
         self._max_retries = max_retries
+        self._credentials_cache: object = _CREDENTIALS_UNSET
+
+    def _load_credentials_config(self):
+        """Load credentials.yaml once, caching missing-config cases."""
+        if self._credentials_cache is not _CREDENTIALS_UNSET:
+            return self._credentials_cache
+
+        try:
+            from ouroboros.config import load_credentials
+            from ouroboros.core.errors import ConfigError
+
+            self._credentials_cache = load_credentials()
+        except ConfigError:
+            self._credentials_cache = None
+        return self._credentials_cache
+
+    def _get_configured_provider_credentials(self, model: str):
+        """Load provider credentials for a model from credentials.yaml."""
+        credentials = self._load_credentials_config()
+        if credentials is None:
+            return None
+
+        provider_name = self._extract_provider(model)
+        return credentials.providers.get(provider_name)
+
+    @staticmethod
+    def _normalize_api_key(value: str | None) -> str | None:
+        """Treat blank and template placeholder API keys as unset."""
+        if value is None:
+            return None
+
+        candidate = value.strip()
+        if not candidate:
+            return None
+        if candidate.startswith(_PLACEHOLDER_API_KEY_PREFIX) and candidate.endswith(
+            _PLACEHOLDER_API_KEY_SUFFIX
+        ):
+            return None
+        return candidate
 
     def _get_api_key(self, model: str) -> str | None:
         """Get the appropriate API key for the model.
@@ -82,6 +124,7 @@ class LiteLLMAdapter:
         Priority:
         1. Explicit api_key from constructor
         2. Environment variables based on model prefix
+        3. credentials.yaml provider entry
 
         Args:
             model: The model identifier.
@@ -89,19 +132,59 @@ class LiteLLMAdapter:
         Returns:
             The API key or None if not found.
         """
-        if self._api_key:
-            return self._api_key
+        explicit_api_key = self._normalize_api_key(self._api_key)
+        if explicit_api_key:
+            return explicit_api_key
 
         # Check environment variables based on model prefix
         if model.startswith("openrouter/"):
-            return os.environ.get("OPENROUTER_API_KEY")
+            env_key = self._normalize_api_key(os.environ.get("OPENROUTER_API_KEY"))
+            if env_key:
+                return env_key
         if model.startswith("anthropic/") or model.startswith("claude"):
-            return os.environ.get("ANTHROPIC_API_KEY")
+            env_key = self._normalize_api_key(os.environ.get("ANTHROPIC_API_KEY"))
+            if env_key:
+                return env_key
         if model.startswith("openai/") or model.startswith("gpt"):
-            return os.environ.get("OPENAI_API_KEY")
+            env_key = self._normalize_api_key(os.environ.get("OPENAI_API_KEY"))
+            if env_key:
+                return env_key
+        if model.startswith("google/") or model.startswith("gemini"):
+            env_key = self._normalize_api_key(os.environ.get("GOOGLE_API_KEY"))
+            if env_key:
+                return env_key
+
+        configured = self._get_configured_provider_credentials(model)
+        if configured is not None:
+            configured_api_key = self._normalize_api_key(configured.api_key)
+            if configured_api_key:
+                return configured_api_key
+
+        # Unknown/custom models may still be routed through OpenRouter via credentials.
+        provider_name = self._extract_provider(model)
+        if provider_name not in {"openrouter", "openai", "anthropic", "google"}:
+            credentials = self._load_credentials_config()
+            configured = (
+                credentials.providers.get("openrouter") if credentials is not None else None
+            )
+            if configured is not None:
+                configured_api_key = self._normalize_api_key(configured.api_key)
+                if configured_api_key:
+                    return configured_api_key
 
         # Default to OpenRouter for unknown models
-        return os.environ.get("OPENROUTER_API_KEY")
+        return self._normalize_api_key(os.environ.get("OPENROUTER_API_KEY"))
+
+    def _get_api_base(self, model: str) -> str | None:
+        """Get the appropriate API base URL for the model."""
+        if self._api_base:
+            return self._api_base
+
+        configured = self._get_configured_provider_credentials(model)
+        if configured is not None:
+            return configured.base_url
+
+        return None
 
     def _build_completion_kwargs(
         self,
@@ -141,8 +224,9 @@ class LiteLLMAdapter:
         if api_key:
             kwargs["api_key"] = api_key
 
-        if self._api_base:
-            kwargs["api_base"] = self._api_base
+        api_base = self._get_api_base(config.model)
+        if api_base:
+            kwargs["api_base"] = api_base
 
         return kwargs
 
@@ -151,10 +235,7 @@ class LiteLLMAdapter:
         messages: list[Message],
         config: CompletionConfig,
     ) -> litellm.ModelResponse:
-        """Make the raw completion call with stamina retry.
-
-        This method is decorated with stamina retry for transient errors.
-        Exceptions bubble up for stamina to handle.
+        """Make the raw completion call.
 
         Args:
             messages: The conversation messages.
@@ -235,7 +316,7 @@ class LiteLLMAdapter:
     ) -> Result[CompletionResponse, ProviderError]:
         """Make a completion request to the LLM provider.
 
-        This method handles retries internally using stamina and converts
+        This method handles retries internally and converts
         all expected failures to Result.err(ProviderError).
 
         Args:
@@ -247,7 +328,7 @@ class LiteLLMAdapter:
         """
 
         # Create the retry-decorated function with instance's max_retries
-        @stamina.retry(
+        @retry_async(
             on=RETRIABLE_EXCEPTIONS,
             attempts=self._max_retries,
             wait_initial=1.0,
@@ -332,8 +413,15 @@ class LiteLLMAdapter:
         if "/" in model:
             return model.split("/")[0]
         # Common model prefixes
-        if model.startswith("gpt"):
+        if (
+            model.startswith("gpt")
+            or model.startswith("o1")
+            or model.startswith("o3")
+            or model.startswith("o4")
+        ):
             return "openai"
         if model.startswith("claude"):
             return "anthropic"
+        if model.startswith("gemini"):
+            return "google"
         return "unknown"

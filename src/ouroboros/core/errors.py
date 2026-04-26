@@ -12,6 +12,8 @@ Exception Hierarchy:
     └── ValidationError   - Schema and data validation failures
 """
 
+from __future__ import annotations
+
 from typing import Any
 
 
@@ -96,6 +98,34 @@ class ProviderError(OuroborosError):
         )
         error.__cause__ = exc  # Preserve original traceback
         return error
+
+    def format_details(self) -> str:
+        """Render error details in a compact, user-visible form.
+
+        Formats the error message along with key diagnostic fields from
+        the details dict (error_type, session_id, environment markers,
+        stderr tail). Useful for surfacing rich diagnostics in tool
+        error responses.
+        """
+        if not isinstance(self.details, dict) or not self.details:
+            return self.message
+
+        rendered: list[str] = [self.message]
+        for key in (
+            "error_type",
+            "session_id",
+            "claudecode_present",
+            "claude_code_entrypoint",
+            "stderr",
+        ):
+            value = self.details.get(key)
+            if value is None:
+                continue
+            if key == "stderr" and value:
+                rendered.append(f"stderr tail:\n{value}")
+            elif key != "stderr":
+                rendered.append(f"{key}: {value}")
+        return "\n".join(rendered)
 
 
 class ConfigError(OuroborosError):

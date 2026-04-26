@@ -20,7 +20,13 @@ import structlog
 import yaml
 
 from ouroboros.bigbang.ambiguity import AMBIGUITY_THRESHOLD, AmbiguityScore
-from ouroboros.bigbang.interview import InterviewState
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewState,
+    initial_context_summary_missing,
+    prompt_safe_initial_context,
+)
+from ouroboros.config import get_clarification_model
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.seed import (
     BrownfieldContext,
@@ -37,8 +43,6 @@ from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, Mess
 
 log = structlog.get_logger()
 
-# Default model moved to config.models.ClarificationConfig.default_model
-_FALLBACK_MODEL = "claude-opus-4-6"
 EXTRACTION_TEMPERATURE = 0.2
 _MAX_EXTRACTION_RETRIES = 1
 
@@ -70,7 +74,7 @@ class SeedGenerator:
     """
 
     llm_adapter: LLMAdapter
-    model: str = _FALLBACK_MODEL
+    model: str = field(default_factory=get_clarification_model)
     temperature: float = EXTRACTION_TEMPERATURE
     max_tokens: int = 4096
     output_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "seeds")
@@ -130,6 +134,15 @@ class SeedGenerator:
                         "threshold": AMBIGUITY_THRESHOLD,
                         "interview_id": state.interview_id,
                     },
+                )
+            )
+
+        if initial_context_summary_missing(state):
+            return Result.err(
+                ValidationError(
+                    "Initial context summary required before seed generation",
+                    field="initial_context",
+                    details={"interview_id": state.interview_id},
                 )
             )
 
@@ -413,9 +426,11 @@ PROJECT_TYPE: greenfield"""
         Returns:
             Formatted context string.
         """
-        parts = [f"Initial Context: {state.initial_context}"]
+        parts = [f"Initial Context: {prompt_safe_initial_context(state)}"]
 
         for round_data in state.rounds:
+            if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+                continue
             parts.append(f"\nQ: {round_data.question}")
             if round_data.user_response:
                 parts.append(f"A: {round_data.user_response}")

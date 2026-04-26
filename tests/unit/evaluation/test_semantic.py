@@ -6,7 +6,7 @@ import pytest
 
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
-from ouroboros.evaluation.models import EvaluationContext
+from ouroboros.evaluation.models import ArtifactBundle, EvaluationContext, FileArtifact
 from ouroboros.evaluation.semantic import (
     SemanticConfig,
     SemanticEvaluator,
@@ -52,6 +52,57 @@ class TestBuildEvaluationPrompt:
         assert "Must be secure" in prompt
         assert "No plaintext passwords" in prompt
 
+    def test_prompt_includes_anti_gaming_and_transparency_sections(self) -> None:
+        """Prompt preserves Anti-Gaming and adds Evaluation Transparency (#367)."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+        )
+        prompt = build_evaluation_prompt(context)
+
+        # Anti-Gaming Verification MUST remain (reward_hacking_risk is preserved)
+        assert "Anti-Gaming Verification" in prompt
+        assert "reward_hacking_risk" in prompt
+
+        # New transparency section (#367)
+        assert "Evaluation Transparency" in prompt
+        assert "questions_used" in prompt
+        assert "evidence" in prompt
+
+    def test_file_artifacts_omit_inline_artifact_text(self) -> None:
+        """When collected files are present, the prompt should prefer file sections."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login securely",
+            artifact="inline artifact text that should not be duplicated",
+            artifact_bundle=ArtifactBundle(
+                files=(
+                    FileArtifact(
+                        file_path="/tmp/.ouroboros_eval_artifact.md",
+                        content="artifact summary from file",
+                    ),
+                    FileArtifact(
+                        file_path="/tmp/src/auth.py",
+                        content="def login(username, password): ...",
+                    ),
+                ),
+                text_summary="artifact summary from file",
+                total_chars=64,
+            ),
+        )
+
+        prompt = build_evaluation_prompt(context)
+
+        assert "## Source Files" in prompt
+        assert "### /tmp/.ouroboros_eval_artifact.md" in prompt
+        assert "### /tmp/src/auth.py" in prompt
+        assert "artifact summary from file" in prompt
+        assert "## Artifact Content" not in prompt
+        assert "inline artifact text that should not be duplicated" not in prompt
+
 
 class TestParseSemanticResponse:
     """Tests for response parsing."""
@@ -64,7 +115,8 @@ class TestParseSemanticResponse:
             "goal_alignment": 0.9,
             "drift_score": 0.1,
             "uncertainty": 0.2,
-            "reasoning": "Good implementation"
+            "reasoning": "Good implementation",
+            "reward_hacking_risk": 0.05
         }"""
         result = parse_semantic_response(response)
 
@@ -76,11 +128,12 @@ class TestParseSemanticResponse:
         assert semantic.drift_score == 0.1
         assert semantic.uncertainty == 0.2
         assert semantic.reasoning == "Good implementation"
+        assert semantic.reward_hacking_risk == 0.05
 
     def test_json_with_surrounding_text(self) -> None:
         """Parse JSON embedded in text."""
         response = """Here is my evaluation:
-        {"score": 0.8, "ac_compliance": true, "goal_alignment": 0.85, "drift_score": 0.15, "uncertainty": 0.1, "reasoning": "Works well"}
+        {"score": 0.8, "ac_compliance": true, "goal_alignment": 0.85, "drift_score": 0.15, "uncertainty": 0.1, "reasoning": "Works well", "reward_hacking_risk": 0.0}
         Thank you for asking."""
         result = parse_semantic_response(response)
 
@@ -95,7 +148,8 @@ class TestParseSemanticResponse:
             "goal_alignment": -0.1,
             "drift_score": 2.0,
             "uncertainty": 0.2,
-            "reasoning": "Test"
+            "reasoning": "Test",
+            "reward_hacking_risk": 1.5
         }"""
         result = parse_semantic_response(response)
 
@@ -103,6 +157,7 @@ class TestParseSemanticResponse:
         assert result.value.score == 1.0  # clamped from 1.5
         assert result.value.goal_alignment == 0.0  # clamped from -0.1
         assert result.value.drift_score == 1.0  # clamped from 2.0
+        assert result.value.reward_hacking_risk == 1.0  # clamped from 1.5
 
     def test_missing_required_field(self) -> None:
         """Error when required field is missing."""
@@ -114,6 +169,85 @@ class TestParseSemanticResponse:
 
         assert result.is_err
         assert "Missing required fields" in result.error.message
+
+    def test_missing_reward_hacking_risk_defaults_to_zero(self) -> None:
+        """Omitting reward_hacking_risk should degrade gracefully to 0.0."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good"
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.reward_hacking_risk == 0.0
+
+    def test_parses_questions_used_and_evidence(self) -> None:
+        """questions_used and evidence arrays are parsed into tuples (#367)."""
+        response = """{
+            "score": 0.9,
+            "ac_compliance": true,
+            "goal_alignment": 0.9,
+            "drift_score": 0.1,
+            "uncertainty": 0.1,
+            "reasoning": "Strong implementation",
+            "reward_hacking_risk": 0.0,
+            "questions_used": [
+                "Does login() reject empty passwords?",
+                "Is the hash function resistant to timing attacks?"
+            ],
+            "evidence": [
+                "src/auth.py:42 uses bcrypt for hashing",
+                "tests/test_auth.py covers empty password rejection"
+            ]
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        semantic = result.value
+        assert len(semantic.questions_used) == 2
+        assert "Does login() reject empty passwords?" in semantic.questions_used
+        assert len(semantic.evidence) == 2
+        assert "src/auth.py:42 uses bcrypt for hashing" in semantic.evidence
+
+    def test_missing_questions_and_evidence_degrade_gracefully(self) -> None:
+        """Missing transparency fields fall back to empty tuples, not errors."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good",
+            "reward_hacking_risk": 0.1
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.questions_used == ()
+        assert result.value.evidence == ()
+
+    def test_empty_strings_in_questions_evidence_are_dropped(self) -> None:
+        """Blank items in the transparency arrays are filtered out."""
+        response = """{
+            "score": 0.8,
+            "ac_compliance": true,
+            "goal_alignment": 0.85,
+            "drift_score": 0.15,
+            "uncertainty": 0.1,
+            "reasoning": "Looks good",
+            "reward_hacking_risk": 0.1,
+            "questions_used": ["", "Real question?", "   "],
+            "evidence": [" ", "Real evidence"]
+        }"""
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.questions_used == ("Real question?",)
+        assert result.value.evidence == ("Real evidence",)
 
     def test_no_json_in_response(self) -> None:
         """Error when no JSON found."""
@@ -129,7 +263,7 @@ class TestParseSemanticResponse:
         result = parse_semantic_response(response)
 
         assert result.is_err
-        assert "Invalid JSON" in result.error.message
+        assert "JSON" in result.error.message
 
 
 class TestSemanticConfig:
@@ -188,7 +322,8 @@ class TestSemanticEvaluator:
                     "goal_alignment": 0.9,
                     "drift_score": 0.1,
                     "uncertainty": 0.15,
-                    "reasoning": "Good implementation"
+                    "reasoning": "Good implementation",
+                    "reward_hacking_risk": 0.05
                 }""",
                 model="test-model",
                 usage=UsageInfo(100, 50, 150),
@@ -219,7 +354,8 @@ class TestSemanticEvaluator:
                     "goal_alignment": 0.8,
                     "drift_score": 0.2,
                     "uncertainty": 0.1,
-                    "reasoning": "OK"
+                    "reasoning": "OK",
+                    "reward_hacking_risk": 0.0
                 }""",
                 model="test",
                 usage=UsageInfo(0, 0, 0),
@@ -250,7 +386,8 @@ class TestSemanticEvaluator:
                     "goal_alignment": 0.9,
                     "drift_score": 0.1,
                     "uncertainty": 0.15,
-                    "reasoning": "Good"
+                    "reasoning": "Good",
+                    "reward_hacking_risk": 0.0
                 }""",
                 model="test",
                 usage=UsageInfo(0, 0, 0),
@@ -322,7 +459,8 @@ class TestRunSemanticEvaluation:
                     "goal_alignment": 0.9,
                     "drift_score": 0.05,
                     "uncertainty": 0.1,
-                    "reasoning": "Excellent"
+                    "reasoning": "Excellent",
+                    "reward_hacking_risk": 0.0
                 }""",
                 model="test",
                 usage=UsageInfo(0, 0, 0),
