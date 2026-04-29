@@ -25,6 +25,7 @@ from ouroboros.codex.cli_policy import (
     build_codex_child_env,
     resolve_codex_cli_path,
 )
+from ouroboros.codex.runtime_profile import resolve_codex_profile
 from ouroboros.codex_permissions import (
     build_codex_exec_permission_args,
     resolve_codex_permission_mode,
@@ -49,26 +50,6 @@ from ouroboros.providers.codex_cli_stream import (
 log = structlog.get_logger()
 
 _SAFE_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./:@-]+$")
-
-# Mirrors orchestrator.codex_cli_runtime: orchestrator-level runtime_profile
-# names map to a Codex ``--profile`` value. Keep these two tables in sync.
-_RUNTIME_PROFILE_TO_CODEX_PROFILE: dict[str, str] = {
-    "worker": "ouroboros-worker",
-}
-
-
-def _resolve_codex_profile(runtime_profile: str | None) -> str | None:
-    """Map an orchestrator runtime_profile to a Codex --profile name."""
-    if not runtime_profile:
-        return None
-    mapped = _RUNTIME_PROFILE_TO_CODEX_PROFILE.get(runtime_profile)
-    if mapped is None:
-        log.warning(
-            "codex_cli_adapter.runtime_profile_unmapped",
-            runtime_profile=runtime_profile,
-            hint="No Codex backend mapping; running without --profile.",
-        )
-    return mapped
 
 
 _RETRYABLE_ERROR_PATTERNS = (
@@ -118,7 +99,11 @@ class CodexCliLLMAdapter:
         self._ephemeral = ephemeral
         self._timeout = timeout if timeout and timeout > 0 else None
         self._runtime_profile = runtime_profile
-        self._codex_profile = _resolve_codex_profile(runtime_profile)
+        self._codex_profile = resolve_codex_profile(
+            runtime_profile,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
 
     def _resolve_permission_mode(self, permission_mode: str | None) -> str:
         """Validate and normalize the adapter permission mode."""

@@ -23,6 +23,7 @@ from ouroboros.codex.cli_policy import (
     build_codex_child_env,
     resolve_codex_cli_path,
 )
+from ouroboros.codex.runtime_profile import resolve_codex_profile
 from ouroboros.codex_permissions import (
     build_codex_exec_permission_args,
     resolve_codex_permission_mode,
@@ -56,27 +57,6 @@ _INTERVIEW_SESSION_METADATA_KEY = "ouroboros_interview_session_id"
 
 _SAFE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_LINE_BUFFER_BYTES = 50 * 1024 * 1024  # 50 MB
-
-# Maps the orchestrator-level runtime_profile name to the Codex-side
-# ``--profile`` value. Phase 1 only ships ``worker``; new entries should land
-# alongside the matching ``[profiles.<name>]`` section written by setup.
-_RUNTIME_PROFILE_TO_CODEX_PROFILE: dict[str, str] = {
-    "worker": "ouroboros-worker",
-}
-
-
-def _resolve_codex_profile(runtime_profile: str | None) -> str | None:
-    """Map an orchestrator runtime_profile to a Codex --profile name."""
-    if not runtime_profile:
-        return None
-    mapped = _RUNTIME_PROFILE_TO_CODEX_PROFILE.get(runtime_profile)
-    if mapped is None:
-        log.warning(
-            "codex_cli_runtime.runtime_profile_unmapped",
-            runtime_profile=runtime_profile,
-            hint="No Codex backend mapping; running without --profile.",
-        )
-    return mapped
 
 
 class CodexCliRuntime:
@@ -120,7 +100,11 @@ class CodexCliRuntime:
         self._skill_dispatcher = skill_dispatcher
         self._llm_backend = llm_backend or self._default_llm_backend
         self._runtime_profile = runtime_profile
-        self._codex_profile = _resolve_codex_profile(runtime_profile)
+        self._codex_profile = resolve_codex_profile(
+            runtime_profile,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
         self._builtin_mcp_handlers: dict[str, Any] | None = None
 
         log.info(
