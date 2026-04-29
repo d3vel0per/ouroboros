@@ -282,13 +282,25 @@ def _trim_managed_codex_worker_profile_comments(lines: list[str]) -> None:
 
 
 def _upsert_codex_worker_profile_section(raw: str) -> tuple[str, bool]:
-    """Insert or replace the managed Codex worker-profile block.
+    """Refresh the managed comment block for ``[profiles.ouroboros-worker]``.
 
-    Mirrors :func:`_upsert_codex_mcp_section` but targets
-    ``[profiles.ouroboros-worker]``. Existing user-edited keys inside the
-    block are removed by design — the worker profile is managed by
-    ``ouroboros setup``. Users keep customizations in their own
-    ``[profiles.<name>]`` sections.
+    Behaviour:
+      * If the table does not exist yet, append the managed comment block
+        followed by an empty ``[profiles.ouroboros-worker]`` header so
+        ``codex exec --profile ouroboros-worker`` resolves cleanly.
+      * If the table already exists, only the *managed comment block*
+        immediately preceding the primary header is rewritten. The body of
+        ``[profiles.ouroboros-worker]`` and every
+        ``[profiles.ouroboros-worker.<sub>]`` subtable is preserved
+        verbatim, including any keys (``model``, ``notify``, ``sandbox``,
+        …) the operator added per the runtime guide.
+
+    The previous implementation deleted everything inside the table on
+    every rerun, which made ``ouroboros setup --runtime codex`` a silent
+    config-loss path the moment a user wrote any worker overrides into
+    that section. This function trades aggressive ownership for safe
+    upsert: setup only guarantees the managed *header + comment* are
+    present and current; the table body belongs to the user.
 
     Returns:
         Tuple of (updated_contents, existed_before).
@@ -298,32 +310,32 @@ def _upsert_codex_worker_profile_section(raw: str) -> tuple[str, bool]:
     output_lines: list[str] = []
     index = 0
     existed_before = False
-    inserted = False
+    refreshed = False
 
     while index < len(input_lines):
-        stripped = input_lines[index].strip()
-        if _is_codex_ouroboros_worker_profile_header(stripped):
+        line = input_lines[index]
+        stripped = line.strip()
+        if stripped == "[profiles.ouroboros-worker]" and not refreshed:
             existed_before = True
-            if not inserted:
-                _trim_managed_codex_worker_profile_comments(output_lines)
-                if output_lines and output_lines[-1].strip():
-                    output_lines.append("")
-                output_lines.extend(section_lines)
-                inserted = True
-
+            refreshed = True
+            _trim_managed_codex_worker_profile_comments(output_lines)
+            if output_lines and output_lines[-1].strip():
+                output_lines.append("")
+            output_lines.extend(section_lines)
             index += 1
-            while index < len(input_lines):
-                next_stripped = input_lines[index].strip()
-                is_table_header = next_stripped.startswith("[") and next_stripped.endswith("]")
-                if is_table_header and not _is_codex_ouroboros_worker_profile_header(next_stripped):
-                    break
-                index += 1
             continue
-
-        output_lines.append(input_lines[index])
+        if _is_codex_ouroboros_worker_profile_header(stripped):
+            # Either a duplicate primary header (already handled once) or
+            # a ``[profiles.ouroboros-worker.<sub>]`` subtable. Both stay
+            # untouched: subtable contents are user-owned.
+            existed_before = True
+            output_lines.append(line)
+            index += 1
+            continue
+        output_lines.append(line)
         index += 1
 
-    if not inserted:
+    if not refreshed:
         if output_lines and output_lines[-1].strip():
             output_lines.append("")
         output_lines.extend(section_lines)
@@ -456,26 +468,32 @@ def _register_codex_worker_profile() -> None:
         except tomllib.TOMLDecodeError:
             print_error(f"Could not parse {codex_config} — skipping worker-profile registration.")
             return
-
-        updated_raw, existed_before = _upsert_codex_worker_profile_section(raw)
-        if updated_raw == raw:
-            print_info("Codex worker profile already up to date.")
-            return
-
-        codex_config.write_text(updated_raw, encoding="utf-8")
-        if existed_before:
-            print_success(f"Updated Codex worker profile in {codex_config}")
-        else:
-            print_success(f"Registered Codex worker profile in {codex_config}")
     else:
-        codex_config.write_text(_CODEX_WORKER_PROFILE_SECTION.lstrip("\n"), encoding="utf-8")
+        # Route the new-file case through the same upsert helper so both
+        # paths produce identical output (trailing-newline normalization,
+        # comment-block placement, etc.).
+        raw = ""
+
+    updated_raw, existed_before = _upsert_codex_worker_profile_section(raw)
+    if updated_raw == raw:
+        print_info("Codex worker profile already up to date.")
+        return
+
+    codex_config.write_text(updated_raw, encoding="utf-8")
+    if existed_before:
+        print_success(f"Updated Codex worker profile in {codex_config}")
+    else:
         print_success(f"Registered Codex worker profile in {codex_config}")
 
 
 def _print_codex_config_guidance(config_path: Path) -> None:
     """Explain where Codex users should configure Ouroboros vs. Codex settings."""
     print_info(f"Configure Ouroboros runtime and per-role model overrides in {config_path}.")
-    print_info("Use ~/.codex/config.toml only for the Codex MCP/env hookup written by setup.")
+    print_info(
+        "Use ~/.codex/config.toml for the managed Codex MCP/env hookup and for "
+        "any [profiles.ouroboros-worker] worker overrides "
+        "(see docs/runtime-guides/codex.md → 'Worker subprocess isolation')."
+    )
 
 
 def _install_codex_artifacts() -> None:
