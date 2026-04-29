@@ -304,11 +304,7 @@ class BrownfieldHandler:
             store_to_close: BrownfieldStore | None = None
             async with self._init_lock:
                 self._refcount -= 1
-                if (
-                    self._refcount == 0
-                    and self._store_owned
-                    and self._store is not None
-                ):
+                if self._refcount == 0 and self._store_owned and self._store is not None:
                     store_to_close = self._store
                     self._store = None
                     self._store_ready = False
