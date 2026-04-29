@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -298,13 +299,73 @@ class TestBrownfieldHandlerDispatch:
             "ouroboros.mcp.tools.brownfield_handler.scan_and_register",
             new_callable=AsyncMock,
             return_value=[_REPO_A],
-        ):
+        ) as mock_scan:
             result = await handler.handle({"action": "scan"})
 
         assert result.is_ok
         meta = result.value.meta
         assert meta["action"] == "scan"
         assert meta["count"] == 1
+        mock_scan.assert_awaited_once_with(store=store, llm_adapter=None, root=None)
+
+    @pytest.mark.asyncio
+    async def test_scan_action_passes_scan_root(self, tmp_path: Path) -> None:
+        store = _make_store_stub(repos=[_REPO_A], default=_REPO_A)
+        handler = BrownfieldHandler(_store=store)
+
+        with patch(
+            "ouroboros.mcp.tools.brownfield_handler.scan_and_register",
+            new_callable=AsyncMock,
+            return_value=[_REPO_A],
+        ) as mock_scan:
+            result = await handler.handle({"action": "scan", "scan_root": str(tmp_path)})
+
+        assert result.is_ok
+        # The handler resolves scan_root before passing it down so the validity
+        # check and the walk operate on the same path. Compare against the
+        # resolved tmp_path (e.g. macOS prefixes /private/var with /private).
+        mock_scan.assert_awaited_once_with(store=store, llm_adapter=None, root=tmp_path.resolve())
+
+    @pytest.mark.asyncio
+    async def test_scan_action_rejects_nonexistent_scan_root(self, tmp_path: Path) -> None:
+        """A nonexistent scan_root must be rejected before scan runs.
+
+        Without validation, the scan walks zero directories and the empty-scan
+        fallback would falsely report previously registered repos as found.
+        """
+        store = _make_store_stub(repos=[_REPO_A], default=_REPO_A)
+        handler = BrownfieldHandler(_store=store)
+        bogus = tmp_path / "does-not-exist"
+
+        with patch(
+            "ouroboros.mcp.tools.brownfield_handler.scan_and_register",
+            new_callable=AsyncMock,
+            return_value=[_REPO_A],
+        ) as mock_scan:
+            result = await handler.handle({"action": "scan", "scan_root": str(bogus)})
+
+        assert result.is_err
+        assert "scan_root" in str(result.error)
+        mock_scan.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scan_action_rejects_file_scan_root(self, tmp_path: Path) -> None:
+        """A scan_root that points at a file (not a directory) must be rejected."""
+        store = _make_store_stub(repos=[_REPO_A], default=_REPO_A)
+        handler = BrownfieldHandler(_store=store)
+        not_a_dir = tmp_path / "regular.txt"
+        not_a_dir.write_text("hello")
+
+        with patch(
+            "ouroboros.mcp.tools.brownfield_handler.scan_and_register",
+            new_callable=AsyncMock,
+            return_value=[_REPO_A],
+        ) as mock_scan:
+            result = await handler.handle({"action": "scan", "scan_root": str(not_a_dir)})
+
+        assert result.is_err
+        assert "scan_root" in str(result.error)
+        mock_scan.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_auto_detect_register(self) -> None:

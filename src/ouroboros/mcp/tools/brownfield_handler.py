@@ -3,9 +3,12 @@
 Provides an ``ouroboros_brownfield`` MCP tool for managing brownfield
 repository registrations in the SQLite database. Supports four actions:
 
-- **scan** — Scan home directory for git repos with GitHub origins and
-  register them in the DB. Optionally generates one-line descriptions
-  via a Frugal-tier LLM.
+- **scan** — Walk ``scan_root`` (or the current user's home directory when omitted) for seed git
+  repos/worktrees and register them in the DB. For each normal repo root, also
+  register Git-reported linked worktrees, even when those linked worktrees live
+  outside the scan root. Linked worktree seeds are registered themselves, but do
+  not pull their main/sibling worktrees outside the scan root. Local repos and
+  repos with any remote name are eligible.
 - **register** — Manually register a single repository by path.
 - **query** — List all registered repos or get the current default.
 - **set_default** — Set a registered repo as the default brownfield context.
@@ -73,7 +76,8 @@ class BrownfieldHandler:
 
     Manages brownfield repository registrations with action-based dispatch:
 
-    - ``scan`` — Walk ``~/`` for GitHub repos and register them.
+    - ``scan`` — Walk a caller-supplied root for seed repos/worktrees, then include
+      Git-reported linked worktrees for normal repo roots.
     - ``register`` — Manually register one repo.
     - ``query`` — List repos or fetch the default.
     - ``set_default`` — Set a repo as the default brownfield context.
@@ -91,7 +95,7 @@ class BrownfieldHandler:
             name=_TOOL_NAME,
             description=(
                 "Manage brownfield repository registrations. "
-                "Scan home directory for repos, register/query repos, "
+                "Scan a requested root for repos/worktrees, register/query repos, "
                 "or set the default brownfield context for PM interviews."
             ),
             parameters=(
@@ -99,7 +103,8 @@ class BrownfieldHandler:
                     name="action",
                     type=ToolInputType.STRING,
                     description=(
-                        "Action to perform: 'scan' to discover repos from ~/,"
+                        "Action to perform: 'scan' to discover seed repos/worktrees "
+                        "from scan_root plus Git-reported linked worktrees from normal repos,"
                         " 'register' to add a single repo,"
                         " 'query' to list all repos or get default,"
                         " 'set_default' to toggle a repo's default flag"
@@ -158,7 +163,14 @@ class BrownfieldHandler:
                 MCPToolParameter(
                     name="scan_root",
                     type=ToolInputType.STRING,
-                    description=("Root directory for 'scan' action. Defaults to ~/."),
+                    description=(
+                        "Root directory for the 'scan' filesystem walk. "
+                        "Defaults to the current user's home directory. "
+                        "Only seed repos/worktrees are discovered by walking this root; "
+                        "linked worktrees reported by Git for normal repo roots may be "
+                        "included even when their paths are outside scan_root. Linked "
+                        "worktree seeds are registered themselves only."
+                    ),
                     required=False,
                 ),
                 MCPToolParameter(
@@ -252,26 +264,50 @@ class BrownfieldHandler:
                 self._store = None
 
     # ──────────────────────────────────────────────────────────────
-    # scan — Discover repos from home directory
+    # scan — Discover repos/worktrees from a caller-provided root
     # ──────────────────────────────────────────────────────────────
 
     async def _handle_scan(
         self,
         arguments: dict[str, Any],
     ) -> Result[MCPToolResult, MCPServerError]:
-        """Scan home directory for git repos and register them.
+        """Scan a caller-provided root for git repos/worktrees and register them.
 
         Delegates to ``bigbang.brownfield.scan_and_register`` which handles
-        directory walking, GitHub origin filtering, LLM description generation,
-        and DB upsert.
+        directory walking, linked worktree discovery, LLM description generation,
+        and DB upsert. The directory walk is bounded to ``scan_root`` (or the
+        current user's home directory when omitted), but linked worktrees
+        reported by Git for discovered normal repo roots may be outside that
+        root. Linked worktree seeds are registered themselves only.
         """
         scan_root_str = arguments.get("scan_root")
-        scan_root = Path(scan_root_str) if scan_root_str else None
+        if scan_root_str:
+            # Resolve before validating so the existence/dir checks apply to
+            # the same path the walk will actually traverse. Without this,
+            # symlinks and TOCTOU swaps could let a caller pass an exists+dir
+            # check while the underlying walk runs against a different target.
+            scan_root = Path(scan_root_str).resolve()
+            if not scan_root.exists():
+                return Result.err(
+                    MCPToolError(
+                        f"scan_root does not exist: {scan_root_str!r}",
+                        tool_name=_TOOL_NAME,
+                    )
+                )
+            if not scan_root.is_dir():
+                return Result.err(
+                    MCPToolError(
+                        f"scan_root is not a directory: {scan_root_str!r}",
+                        tool_name=_TOOL_NAME,
+                    )
+                )
+        else:
+            scan_root = None
 
         store = await self._get_store()
 
         # scan_and_register handles the full workflow:
-        # walk dirs → filter GitHub origins → generate descs → upsert
+        # walk dirs -> discover linked worktrees -> upsert
         repos = await scan_and_register(
             store=store,
             llm_adapter=None,  # No LLM in MCP context for now
