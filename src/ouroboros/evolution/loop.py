@@ -308,6 +308,31 @@ class EvolutionaryLoop:
             )
         )
 
+    async def _phase_for_failed_step_directive(
+        self,
+        *,
+        lineage_id: str,
+        generation_number: int,
+    ) -> str:
+        """Return the phase recorded by the generation failure event.
+
+        ``evolve_step`` emits its StepAction-level directive after
+        ``_run_generation`` has already emitted the phase-specific
+        ``lineage.generation.failed`` event. Replaying that last failure
+        preserves the real phase (wondering/reflecting/seeding/etc.)
+        instead of stamping every failed step as ``executing``.
+        """
+        events = await self.event_store.replay_lineage(lineage_id)
+        for event in reversed(events):
+            if (
+                event.type == "lineage.generation.failed"
+                and event.data.get("generation_number") == generation_number
+            ):
+                phase = event.data.get("phase")
+                if isinstance(phase, str) and phase:
+                    return phase
+        return GenerationPhase.FAILED.value
+
     async def run(
         self,
         initial_seed: Seed,
@@ -729,7 +754,10 @@ class EvolutionaryLoop:
                 StepAction.FAILED,
                 lineage_id=lineage.lineage_id,
                 generation_number=generation_number,
-                phase="executing",
+                phase=await self._phase_for_failed_step_directive(
+                    lineage_id=lineage.lineage_id,
+                    generation_number=generation_number,
+                ),
                 reason=conv_signal.reason,
             )
             return Result.ok(
@@ -761,7 +789,10 @@ class EvolutionaryLoop:
                 StepAction.FAILED,
                 lineage_id=lineage.lineage_id,
                 generation_number=generation_number,
-                phase="executing",
+                phase=await self._phase_for_failed_step_directive(
+                    lineage_id=lineage.lineage_id,
+                    generation_number=generation_number,
+                ),
                 reason=conv_signal.reason,
             )
             return Result.ok(

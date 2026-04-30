@@ -895,6 +895,50 @@ class TestRunGenerationFailures:
         assert failed[0].data["phase"] == GenerationPhase.SEEDING.value
         assert "synthetic seed generation failure" in failed[0].data["error"]
 
+    @pytest.mark.asyncio
+    async def test_evolve_step_failed_directive_uses_generation_failure_phase(self) -> None:
+        """StepAction.FAILED directive should preserve the failed runtime phase."""
+        store = await create_event_store()
+        seed_v1 = make_seed(seed_id="seed_step_seedfail_1")
+        await seed_events_for_gen1(store, "lin_step_seedgen_fail", seed_v1, make_eval_summary())
+
+        wonder_engine = MagicMock()
+        wonder_engine.wonder = AsyncMock(return_value=Result.ok(make_wonder_output()))
+
+        reflect_engine = MagicMock()
+        reflect_engine.reflect = AsyncMock(
+            return_value=Result.ok(
+                ReflectOutput(
+                    refined_goal=seed_v1.goal,
+                    refined_constraints=seed_v1.constraints,
+                    refined_acs=seed_v1.acceptance_criteria,
+                    ontology_mutations=(),
+                    reasoning="test",
+                )
+            )
+        )
+
+        seed_generator = MagicMock()
+        seed_generator.generate_from_reflect = MagicMock(
+            return_value=Result.err("synthetic seed generation failure")
+        )
+
+        loop = EvolutionaryLoop(
+            event_store=store,
+            wonder_engine=wonder_engine,
+            reflect_engine=reflect_engine,
+            seed_generator=seed_generator,
+        )
+
+        result = await loop.evolve_step("lin_step_seedgen_fail")
+        assert result.is_ok
+        assert result.value.action is StepAction.FAILED
+
+        events = await store.replay_lineage("lin_step_seedgen_fail")
+        directive = [e for e in events if e.type == "control.directive.emitted"][-1]
+        assert directive.data["phase"] == GenerationPhase.SEEDING.value
+        assert directive.data["directive"] == "retry"
+
 
 class TestLineageStatusHandler:
     """Test LineageStatusHandler MCP tool."""
