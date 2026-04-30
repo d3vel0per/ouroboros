@@ -112,12 +112,12 @@ class TestRuntimeProfileConfig:
         config = OrchestratorConfig(
             runtime_profile=RuntimeProfileConfig(
                 default="codex",
-                stages={"evaluate": "claude"},
+                stages={"evaluate": "claude_code"},
             )
         )
         assert config.runtime_profile is not None
         assert config.runtime_profile.default == "codex"
-        assert config.runtime_profile.stages == {"evaluate": "claude"}
+        assert config.runtime_profile.stages == {"evaluate": "claude_code"}
 
     def test_unknown_stage_key_rejected_at_validation(self) -> None:
         # Pydantic wraps validator-raised exceptions in its own
