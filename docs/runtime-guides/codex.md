@@ -146,9 +146,14 @@ llm_role_profiles:
   reflect: deep
   consensus_vote: deep
   consensus_judge: frontier
+  agent_runtime: standard
+  agent_runtime_implementation: standard
+  agent_runtime_interview: standard
+  agent_runtime_coordinator: deep
+  agent_runtime_evaluation: deep
 ```
 
-When a Codex provider profile is resolved, Ouroboros invokes `codex exec --profile <name>` instead of passing `--model`. If a role has no task profile, the existing `*_model` fields and Codex's default behavior are unchanged.
+When a Codex provider or agent-runtime profile is resolved, Ouroboros invokes `codex exec --profile <name>` instead of passing `--model`. If a role has no task profile, the existing `*_model` fields and Codex's default behavior are unchanged. Explicit runtime model overrides still use `--model` and do not apply the profile.
 
 `ouroboros setup --runtime codex` creates matching flat Codex profile anchors:
 
@@ -182,7 +187,7 @@ Under the hood, `CodexCliRuntime` still talks to the local `codex` executable, b
 
 - Detects the `codex` binary on your `PATH`
 - Writes `orchestrator.runtime_backend: codex` and `llm.backend: codex` to `~/.ouroboros/config.yaml`
-- Adds missing provider-neutral `llm_profiles` and `llm_role_profiles` defaults for Codex
+- Adds missing provider-neutral `llm_profiles` and `llm_role_profiles` defaults for Codex LLM calls and agent-runtime sessions
 - Records `orchestrator.codex_cli_path` when available
 - Installs managed Ouroboros rules into `~/.codex/rules/`
 - Installs managed Ouroboros skills into `~/.codex/skills/`

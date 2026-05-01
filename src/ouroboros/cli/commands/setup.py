@@ -276,6 +276,11 @@ _CODEX_DEFAULT_LLM_ROLE_PROFILES: dict[str, str] = {
     "semantic_evaluation": "deep",
     "wonder": "deep",
     "consensus_judge": "frontier",
+    "agent_runtime": "standard",
+    "agent_runtime_implementation": "standard",
+    "agent_runtime_interview": "standard",
+    "agent_runtime_coordinator": "deep",
+    "agent_runtime_evaluation": "deep",
 }
 
 _DEFAULT_CONSENSUS_MODELS = (

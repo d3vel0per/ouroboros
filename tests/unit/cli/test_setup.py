@@ -224,6 +224,11 @@ class TestCodexSetup:
         assert config_dict["llm_role_profiles"]["qa"] == "fast"
         assert config_dict["llm_role_profiles"]["semantic_evaluation"] == "deep"
         assert config_dict["llm_role_profiles"]["consensus_judge"] == "frontier"
+        assert config_dict["llm_role_profiles"]["agent_runtime"] == "standard"
+        assert config_dict["llm_role_profiles"]["agent_runtime_implementation"] == "standard"
+        assert config_dict["llm_role_profiles"]["agent_runtime_interview"] == "standard"
+        assert config_dict["llm_role_profiles"]["agent_runtime_coordinator"] == "deep"
+        assert config_dict["llm_role_profiles"]["agent_runtime_evaluation"] == "deep"
         mock_install.assert_called_once_with()
         mock_register.assert_called_once_with()
         mock_profiles.assert_called_once_with()

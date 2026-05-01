@@ -108,6 +108,11 @@ llm_role_profiles:
   reflect: deep
   consensus_vote: deep
   consensus_judge: frontier
+  agent_runtime: standard
+  agent_runtime_implementation: standard
+  agent_runtime_interview: standard
+  agent_runtime_coordinator: deep
+  agent_runtime_evaluation: deep
 ```
 
 Resolution order is: role mapping, profile provider mapping for the active backend, existing `*_model` field, then backend default behavior.
@@ -237,6 +242,8 @@ Profile fields:
 | `providers` | `dict` | Backend-specific overrides keyed by `codex`, `claude_code`, `gemini`, `opencode`, `litellm`, or provider aliases such as `openrouter`. |
 
 Provider-specific fields use the same keys plus `profile`. `profile` is currently backend-native metadata; Codex maps it to `codex exec --profile <name>`, while non-Codex adapters ignore it unless they add native profile support later. `ouroboros setup --runtime codex` installs missing default profiles and role mappings but preserves existing profile definitions and skips role mappings where explicit legacy model overrides are already configured.
+
+Codex agent-runtime tasks also use these mappings. Runtime handles with `session_role: implementation`, `coordinator`, `interview`, or `evaluation` resolve through `agent_runtime_<session_role>`; tasks without a role fall back to `agent_runtime`. Explicit runtime models still win and are passed with `--model` instead of `--profile`.
 
 ---
 
