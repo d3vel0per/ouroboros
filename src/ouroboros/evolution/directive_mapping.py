@@ -71,7 +71,7 @@ def step_action_to_directive(
     ============================  ==================================
     ``CONTINUE``                  ``None`` (no emission)
     ``CONVERGED``                 ``CONVERGE``
-    ``STAGNATED``                 ``CONVERGE``
+    ``STAGNATED``                 ``UNSTUCK``
     ``EXHAUSTED``                 ``CANCEL``
     ``FAILED`` (budget > 0)       ``RETRY``
     ``FAILED`` (budget == 0)      ``CANCEL``
@@ -84,7 +84,7 @@ def step_action_to_directive(
     if value == "converged":
         return Directive.CONVERGE
     if value == "stagnated":
-        return Directive.CONVERGE
+        return Directive.UNSTUCK
     if value == "exhausted":
         return Directive.CANCEL
     if value == "failed":

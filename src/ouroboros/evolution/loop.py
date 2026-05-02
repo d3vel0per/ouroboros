@@ -323,11 +323,21 @@ class EvolutionaryLoop:
         instead of stamping every failed step as ``executing``.
         """
         events = await self.event_store.replay_lineage(lineage_id)
+        saw_cancelled_failure = False
         for event in reversed(events):
-            if (
-                event.type == "lineage.generation.failed"
-                and event.data.get("generation_number") == generation_number
-            ):
+            if event.data.get("generation_number") != generation_number:
+                continue
+            if event.type == "lineage.generation.failed":
+                phase = event.data.get("phase")
+                if isinstance(phase, str) and phase:
+                    if phase != GenerationPhase.CANCELLED.value:
+                        return phase
+                    saw_cancelled_failure = True
+                    continue
+            if saw_cancelled_failure and event.type in {
+                "lineage.generation.phase_changed",
+                "lineage.generation.started",
+            }:
                 phase = event.data.get("phase")
                 if isinstance(phase, str) and phase:
                     return phase
@@ -524,7 +534,9 @@ class EvolutionaryLoop:
                             self.config.stagnation_window,
                         )
                     )
-                    lineage = lineage.with_status(LineageStatus.CONVERGED)
+                    # Stagnation is a non-terminal control handoff: the shared
+                    # Directive contract maps STAGNATED to UNSTUCK, so keep the
+                    # lineage resumable for the lateral-thinking recovery path.
                 else:
                     await self.event_store.append(
                         lineage_converged(
@@ -906,7 +918,9 @@ class EvolutionaryLoop:
                         self.config.stagnation_window,
                     )
                 )
-                lineage = lineage.with_status(LineageStatus.CONVERGED)
+                # Stagnation is a non-terminal control handoff: the shared
+                # Directive contract maps STAGNATED to UNSTUCK, so keep the
+                # lineage resumable for the lateral-thinking recovery path.
                 action = StepAction.STAGNATED
             else:
                 await self.event_store.append(
