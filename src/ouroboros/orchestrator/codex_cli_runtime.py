@@ -227,11 +227,14 @@ class CodexCliRuntime:
 
         return _RUNTIME_PROFILE_ROLE_PREFIX
 
-    def _resolve_runtime_codex_profile(self, runtime_handle: RuntimeHandle | None) -> str | None:
-        """Resolve the Codex profile for an agent-runtime task, if configured."""
+    def _resolve_runtime_codex_config(
+        self,
+        runtime_handle: RuntimeHandle | None,
+    ) -> CompletionConfig:
+        """Resolve model/profile settings for an agent-runtime task."""
         native_profile = self._codex_profile_from_metadata(runtime_handle)
         if native_profile:
-            return native_profile
+            return CompletionConfig(model="default", profile=native_profile)
 
         profile_name = self._runtime_profile_from_metadata(runtime_handle)
         role = None if profile_name else self._runtime_profile_role(runtime_handle)
@@ -239,7 +242,9 @@ class CodexCliRuntime:
             CompletionConfig(model="default", profile=profile_name, role=role),
             backend="codex",
         )
-        return resolved.backend_profile
+        if resolved.backend_profile is not None:
+            return replace(resolved.config, profile=resolved.backend_profile)
+        return resolved.config
 
     def _build_runtime_handle(
         self,
@@ -633,9 +638,13 @@ class CodexCliRuntime:
         if normalized_model:
             command.extend(["--model", normalized_model])
         else:
-            runtime_profile = self._resolve_runtime_codex_profile(runtime_handle)
-            if runtime_profile:
-                command.extend(["--profile", runtime_profile])
+            runtime_config = self._resolve_runtime_codex_config(runtime_handle)
+            if runtime_config.profile:
+                command.extend(["--profile", runtime_config.profile])
+            else:
+                runtime_model = self._normalize_model(runtime_config.model)
+                if runtime_model:
+                    command.extend(["--model", runtime_model])
 
         command.extend(self._build_permission_args())
         if resume_session_id:

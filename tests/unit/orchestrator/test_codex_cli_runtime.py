@@ -266,6 +266,56 @@ class TestCodexCliRuntime:
         assert command[command.index("--profile") + 1] == "ouroboros-standard"
         assert "--model" not in command
 
+    def test_build_command_uses_runtime_profile_provider_model_fallback(self) -> None:
+        """Codex runtime profiles without Codex-native profile anchors should use models."""
+        runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project")
+        runtime_handle = RuntimeHandle(
+            backend="codex_cli",
+            kind="implementation_session",
+            metadata={"session_role": "implementation"},
+        )
+        config = OuroborosConfig(
+            llm_profiles={
+                "standard": {
+                    "providers": {"codex": {"model": "gpt-5.3-codex"}},
+                },
+            },
+            llm_role_profiles={"agent_runtime_implementation": "standard"},
+        )
+
+        with patch("ouroboros.providers.profiles.load_config", return_value=config):
+            command = runtime._build_command(
+                output_last_message_path="/tmp/out.txt",
+                runtime_handle=runtime_handle,
+            )
+
+        assert "--model" in command
+        assert command[command.index("--model") + 1] == "gpt-5.3-codex"
+        assert "--profile" not in command
+
+    def test_build_command_uses_runtime_profile_top_level_model_fallback(self) -> None:
+        """Agent runtime should honor provider-neutral profile model fallback."""
+        runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project")
+        runtime_handle = RuntimeHandle(
+            backend="codex_cli",
+            kind="implementation_session",
+            metadata={"session_role": "implementation"},
+        )
+        config = OuroborosConfig(
+            llm_profiles={"standard": {"model": "gpt-5.3-codex"}},
+            llm_role_profiles={"agent_runtime_implementation": "standard"},
+        )
+
+        with patch("ouroboros.providers.profiles.load_config", return_value=config):
+            command = runtime._build_command(
+                output_last_message_path="/tmp/out.txt",
+                runtime_handle=runtime_handle,
+            )
+
+        assert "--model" in command
+        assert command[command.index("--model") + 1] == "gpt-5.3-codex"
+        assert "--profile" not in command
+
     def test_build_command_explicit_model_wins_over_runtime_profile(self) -> None:
         """Explicit runtime model overrides keep existing --model behavior."""
         runtime = CodexCliRuntime(cli_path="codex", model="gpt-5.5", cwd="/tmp/project")
@@ -437,7 +487,7 @@ class TestCodexCliRuntime:
         assert message.resume_handle is not None
         assert message.resume_handle.native_session_id == "thread-123"
         assert message.resume_handle.kind == "level_coordinator"
-        assert message.resume_handle.cwd == _EXPECTED_PROJECT_CWD
+        assert message.resume_handle.cwd == seeded_handle.cwd
         assert message.resume_handle.approval_mode == "acceptEdits"
         assert message.resume_handle.metadata == seeded_handle.metadata
 
