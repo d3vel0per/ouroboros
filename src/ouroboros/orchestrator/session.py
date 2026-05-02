@@ -896,11 +896,13 @@ class SessionRepository:
                         "orchestrator.session.completed",
                         "orchestrator.session.failed",
                         "orchestrator.session.cancelled",
+                        "orchestrator.session.paused",
                     }:
                         explicit_terminal_status = status_update
 
-            # Sanitize stale runtime metadata when session reached a terminal
-            # state.  Progress events captured during execution may contain
+            # Sanitize stale runtime metadata when an explicit lifecycle event
+            # provides the authoritative session state. Progress events captured
+            # during execution may contain
             # ``runtime_status: running`` which contradicts the authoritative
             # terminal status and confuses downstream consumers (#188).
             if explicit_terminal_status is not None and last_progress.get("runtime_status"):

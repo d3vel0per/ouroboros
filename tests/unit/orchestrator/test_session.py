@@ -1639,3 +1639,44 @@ class TestStaleRuntimeMetadataCleansing:
         tracker = result.value
         assert tracker.status == SessionStatus.COMPLETED
         assert tracker.progress.get("runtime_status") == "completed"
+
+    async def test_paused_session_overwrites_stale_runtime_status(self) -> None:
+        """runtime_status should reflect 'paused' after usage-limit pause replay."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={"execution_id": "exec-3", "seed_id": "seed-3"},
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={"progress": {"runtime_status": "running", "phase": "executing"}},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.paused",
+                    aggregate_type="session",
+                    aggregate_id="sess-paused",
+                    data={
+                        "reason": "Usage limit reached",
+                        "pause_kind": "usage_limit",
+                        "pause_seconds": 18000,
+                    },
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-paused")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.PAUSED
+        assert tracker.progress.get("runtime_status") == "paused"
