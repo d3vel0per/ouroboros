@@ -304,3 +304,26 @@ def test_store_load_rejects_unknown_required_grade(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="required_grade"):
         store.load(state.auto_session_id)
+
+
+def test_recover_rejects_terminal_phase_from_blocked_state() -> None:
+    state = AutoPipelineState(goal="Build a CLI", cwd="/repo")
+    state.transition(AutoPhase.INTERVIEW, "interview")
+    state.mark_blocked("needs user input")
+
+    with pytest.raises(ValueError, match="blocked -> complete"):
+        state.recover(AutoPhase.COMPLETE, "do not skip work")
+
+    assert state.phase is AutoPhase.BLOCKED
+    assert state.last_error == "needs user input"
+
+
+def test_recover_uses_transition_table_from_failed_state() -> None:
+    state = AutoPipelineState(goal="Build a CLI", cwd="/repo")
+    state.transition(AutoPhase.INTERVIEW, "interview")
+    state.mark_failed("tool failed")
+
+    state.recover(AutoPhase.REVIEW, "retry review")
+
+    assert state.phase is AutoPhase.REVIEW
+    assert state.last_error is None

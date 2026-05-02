@@ -484,6 +484,9 @@ def test_auto_answerer_non_goals_respect_explicit_goal_scope() -> None:
     cases = (
         ("Deploy this service to production", "production deployment"),
         ("Add authentication to the app", "authentication"),
+        ("Enable SSO for enterprise users", "authentication"),
+        ("Add OAuth support to the CLI", "authentication"),
+        ("Implement authorization roles", "authentication"),
     )
 
     for goal, forbidden_non_goal in cases:

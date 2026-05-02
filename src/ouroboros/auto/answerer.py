@@ -115,7 +115,12 @@ class AutoAnswerer:
     def _non_goal_answer(self, question: str, ledger: SeedDraftLedger) -> AutoAnswer:  # noqa: ARG002
         goal_text = _latest_resolved_goal(ledger).lower()
         excluded = ["cloud sync", "paid services"]
-        if not re.search(r"\b(auth|authentication|login|sign[- ]?in|signup|password)\b", goal_text):
+        identity_terms = (
+            r"auth|authentication|authorization|authorize|login|sign[- ]?in|signup|"
+            r"password|sso|single sign[- ]?on|oauth|oidc|saml|identity|"
+            r"role[- ]?based|roles?|permissions?|access control"
+        )
+        if not re.search(rf"\b({identity_terms})\b", goal_text):
             excluded.append("authentication")
         if not re.search(r"\b(production|prod|deploy|deployment|release|publish)\b", goal_text):
             excluded.append("production deployment")
