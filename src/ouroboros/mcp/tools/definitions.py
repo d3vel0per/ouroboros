@@ -168,6 +168,26 @@ def interview_handler(
     )
 
 
+def auto_handler(
+    *,
+    llm_backend: str | None = None,
+    runtime_backend: str | None = None,
+    mcp_manager: object | None = None,
+    mcp_tool_prefix: str = "",
+    opencode_mode: str | None = None,
+) -> object:
+    """Create an AutoHandler instance without adding it to legacy static tool tuples."""
+    from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+    return AutoHandler(
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+        mcp_manager=mcp_manager,
+        mcp_tool_prefix=mcp_tool_prefix,
+    )
+
+
 def lateral_think_handler(
     *,
     runtime_backend: str | None = None,
@@ -285,6 +305,7 @@ def get_ouroboros_tools(
     mcp_manager: object | None = None,
     mcp_tool_prefix: str = "",
     opencode_mode: str | None = None,
+    include_auto: bool = True,
 ) -> OuroborosToolHandlers:
     """Create the default set of Ouroboros MCP tool handlers.
 
@@ -325,9 +346,23 @@ def get_ouroboros_tools(
         agent_runtime_backend=runtime_backend,
         opencode_mode=opencode_mode,
     )
+    auto = (
+        (
+            auto_handler(
+                llm_backend=llm_backend,
+                runtime_backend=runtime_backend,
+                mcp_manager=mcp_manager,
+                mcp_tool_prefix=mcp_tool_prefix,
+                opencode_mode=opencode_mode,
+            ),
+        )
+        if include_auto
+        else ()
+    )
     return (
         execute_seed,
         start_execute,
+        *auto,
         SessionStatusHandler(),
         job_status,
         job_wait,
@@ -373,5 +408,29 @@ def get_ouroboros_tools(
     )
 
 
+class _LazyAutoHandler:
+    """Lazy static auto handler to avoid import cycles in OUROBOROS_TOOLS."""
+
+    @property
+    def definition(self):
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return AutoHandler().definition
+
+    async def handle(self, arguments):
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return await AutoHandler().handle(arguments)
+
+
+def __getattr__(name: str) -> object:
+    """Lazily re-export handlers that would otherwise create import cycles."""
+    if name == "AutoHandler":
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return AutoHandler
+    raise AttributeError(name)
+
+
 # List of all Ouroboros tools for registration
-OUROBOROS_TOOLS: OuroborosToolHandlers = get_ouroboros_tools()
+OUROBOROS_TOOLS = (*get_ouroboros_tools(include_auto=False), _LazyAutoHandler())
