@@ -9,7 +9,7 @@ Coverage:
   behaviour byte-for-byte by always returning the orchestrator's
   ``runtime_backend``.
 - A typo in ``runtime_profile.stages`` (e.g. ``"interveiw"``) raises
-  :class:`UnknownStageError` at config validation time, not later.
+  a Pydantic validation error at config validation time, not later.
 - ``OrchestratorConfig.runtime_profile`` is optional (``None``
   default) so existing configs construct unchanged.
 """
@@ -116,15 +116,37 @@ class TestRuntimeProfileConfig:
             )
         )
         assert config.runtime_profile is not None
+        assert config.runtime_profile.backend_profile is None
         assert config.runtime_profile.default == "codex"
         assert config.runtime_profile.stages == {"evaluate": "claude_code"}
 
+    def test_runtime_profile_object_can_hold_backend_profile_and_stage_routing(self) -> None:
+        config = OrchestratorConfig(
+            runtime_profile=RuntimeProfileConfig(
+                backend_profile="worker",
+                default="codex",
+                stages={"execute": "opencode"},
+            )
+        )
+
+        assert config.runtime_profile is not None
+        assert config.runtime_profile.backend_profile == "worker"
+        assert config.runtime_profile.default == "codex"
+        assert config.runtime_profile.stages == {"execute": "opencode"}
+
+    def test_runtime_profile_string_is_backend_profile_shorthand(self) -> None:
+        """Accept PR #505's string shape without stealing stage-routing fields."""
+        config = OrchestratorConfig(runtime_profile="worker")
+
+        assert config.runtime_profile is not None
+        assert config.runtime_profile.backend_profile == "worker"
+        assert config.runtime_profile.default is None
+        assert config.runtime_profile.stages == {}
+
     def test_unknown_stage_key_rejected_at_validation(self) -> None:
-        # Pydantic wraps validator-raised exceptions in its own
-        # ``ValidationError``; the original :class:`UnknownStageError`
-        # message survives as the cause so operators see "Unknown
-        # runtime_profile.stages key: 'interveiw'" alongside the valid
-        # set.
+        # Pydantic wraps validator-raised ValueError in its own
+        # ``ValidationError`` while preserving the helpful typo message
+        # and valid stage set.
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError) as info:
@@ -175,3 +197,30 @@ class TestRuntimeProfileConfig:
         assert "runtime_profile.stages['execute']" in msg
         assert "claude" in msg
         assert "codex" in msg
+
+    def test_runtime_profile_accepts_runtime_factory_backend_aliases(self) -> None:
+        profile = RuntimeProfileConfig(
+            default="codex_cli",
+            stages={
+                "interview": "claude_code",
+                "execute": "opencode_cli",
+                "reflect": "hermes_cli",
+                "evaluate": "gemini_cli",
+            },
+        )
+
+        assert profile.default == "codex_cli"
+        assert profile.stages == {
+            "interview": "claude_code",
+            "execute": "opencode_cli",
+            "reflect": "hermes_cli",
+            "evaluate": "gemini_cli",
+        }
+
+    def test_empty_runtime_profile_backend_profile_rejected(self) -> None:
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as info:
+            RuntimeProfileConfig(backend_profile=" ")
+
+        assert "runtime_profile.backend_profile" in str(info.value)
