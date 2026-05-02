@@ -230,11 +230,11 @@ class CodexCliRuntime:
     def _resolve_runtime_codex_config(
         self,
         runtime_handle: RuntimeHandle | None,
-    ) -> CompletionConfig:
+    ) -> tuple[str | None, str | None]:
         """Resolve model/profile settings for an agent-runtime task."""
         native_profile = self._codex_profile_from_metadata(runtime_handle)
         if native_profile:
-            return CompletionConfig(model="default", profile=native_profile)
+            return None, native_profile
 
         profile_name = self._runtime_profile_from_metadata(runtime_handle)
         role = None if profile_name else self._runtime_profile_role(runtime_handle)
@@ -242,9 +242,7 @@ class CodexCliRuntime:
             CompletionConfig(model="default", profile=profile_name, role=role),
             backend="codex",
         )
-        if resolved.backend_profile is not None:
-            return replace(resolved.config, profile=resolved.backend_profile)
-        return resolved.config
+        return resolved.config.model, resolved.backend_profile
 
     def _build_runtime_handle(
         self,
@@ -638,13 +636,13 @@ class CodexCliRuntime:
         if normalized_model:
             command.extend(["--model", normalized_model])
         else:
-            runtime_config = self._resolve_runtime_codex_config(runtime_handle)
-            if runtime_config.profile:
-                command.extend(["--profile", runtime_config.profile])
+            runtime_model, runtime_profile = self._resolve_runtime_codex_config(runtime_handle)
+            if runtime_profile:
+                command.extend(["--profile", runtime_profile])
             else:
-                runtime_model = self._normalize_model(runtime_config.model)
-                if runtime_model:
-                    command.extend(["--model", runtime_model])
+                normalized_runtime_model = self._normalize_model(runtime_model)
+                if normalized_runtime_model:
+                    command.extend(["--model", normalized_runtime_model])
 
         command.extend(self._build_permission_args())
         if resume_session_id:

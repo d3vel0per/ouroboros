@@ -368,6 +368,26 @@ class TestCodexCliRuntime:
         assert "--profile" in command
         assert command[command.index("--profile") + 1] == "ouroboros-deep"
 
+    def test_build_command_uses_explicit_runtime_profile_model_fallback(self) -> None:
+        """Explicit Ouroboros profile metadata should still fall back to model."""
+        runtime = CodexCliRuntime(cli_path="codex", cwd="/tmp/project")
+        runtime_handle = RuntimeHandle(
+            backend="codex_cli",
+            kind="evaluation_session",
+            metadata={"llm_profile": "deep"},
+        )
+        config = OuroborosConfig(llm_profiles={"deep": {"model": "gpt-5.5"}})
+
+        with patch("ouroboros.providers.profiles.load_config", return_value=config):
+            command = runtime._build_command(
+                output_last_message_path="/tmp/out.txt",
+                runtime_handle=runtime_handle,
+            )
+
+        assert "--model" in command
+        assert command[command.index("--model") + 1] == "gpt-5.5"
+        assert "--profile" not in command
+
     def test_resolve_cli_path_falls_back_from_wrapper(self, tmp_path: Path) -> None:
         """Runtime should bypass wrappers the same way provider adapters do."""
         wrapper = self._write_wrapper(tmp_path / "codex-wrapper")
