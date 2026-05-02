@@ -75,8 +75,13 @@ Useful variants:
 
 ```bash
 ooo auto "Build a local-first habit tracker CLI" --skip-run
-ooo auto "Build a local-first habit tracker CLI" --show-ledger
 ooo auto --resume auto_abc123
+```
+
+When using the shell CLI directly, add `--show-ledger` to print the assumptions and non-goals captured during convergence:
+
+```bash
+ouroboros auto "Build a local-first habit tracker CLI" --show-ledger
 ```
 
 Auto mode is hang-resistant by design: interview and repair loops are bounded, slow tool calls transition the auto session to `blocked` or `failed`, and execution handoff returns job/session IDs instead of waiting forever for completion. If auto mode stops, resume with the printed `ooo auto --resume <auto_session_id>` command.
