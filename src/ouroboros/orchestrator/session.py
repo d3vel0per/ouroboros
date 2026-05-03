@@ -974,7 +974,18 @@ class SessionRepository:
                 status_update = self._status_from_event(event.type, event.data)
                 if status_update is not None:
                     tracker = tracker.with_status(status_update)
-                    if event.type in {
+                    if status_update == SessionStatus.RUNNING:
+                        explicit_terminal_status = None
+                        for key in (
+                            "pause_kind",
+                            "pause_seconds",
+                            "resume_after",
+                            "resume_hint",
+                            "paused_at",
+                            "pause_reason",
+                        ):
+                            last_progress.pop(key, None)
+                    elif event.type in {
                         "orchestrator.session.completed",
                         "orchestrator.session.failed",
                         "orchestrator.session.cancelled",

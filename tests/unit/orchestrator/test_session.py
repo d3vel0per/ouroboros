@@ -1791,3 +1791,47 @@ class TestStaleRuntimeMetadataCleansing:
         tracker = result.value
         assert tracker.status == SessionStatus.PAUSED
         assert tracker.progress.get("runtime_status") == "paused"
+
+    async def test_resumed_session_progress_clears_stale_pause_status(self) -> None:
+        """Later running progress should clear an earlier usage-limit pause replay state."""
+        from ouroboros.events.base import BaseEvent
+
+        mock_event_store = AsyncMock()
+        mock_event_store.replay = AsyncMock(
+            return_value=[
+                BaseEvent(
+                    type="orchestrator.session.started",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={"execution_id": "exec-4", "seed_id": "seed-4"},
+                ),
+                BaseEvent(
+                    type="orchestrator.session.paused",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={
+                        "reason": "Usage limit reached",
+                        "pause_kind": "usage_limit",
+                        "pause_seconds": 18000,
+                        "resume_after": "2026-01-01T05:00:00+00:00",
+                    },
+                ),
+                BaseEvent(
+                    type="orchestrator.progress.updated",
+                    aggregate_type="session",
+                    aggregate_id="sess-resumed",
+                    data={"progress": {"runtime_status": "running", "phase": "resumed"}},
+                ),
+            ]
+        )
+        mock_event_store.query_session_related_events = None
+
+        repository = SessionRepository(mock_event_store)
+        result = await repository.reconstruct_session("sess-resumed")
+
+        assert result.is_ok
+        tracker = result.value
+        assert tracker.status == SessionStatus.RUNNING
+        assert tracker.progress.get("runtime_status") == "running"
+        assert "pause_kind" not in tracker.progress
+        assert "resume_after" not in tracker.progress
