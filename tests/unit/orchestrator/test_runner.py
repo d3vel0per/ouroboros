@@ -1393,6 +1393,26 @@ class TestOrchestratorRunner:
         assert pause.resume_after == now + timedelta(hours=1, minutes=30)
         assert OrchestratorRunner._duration_text_to_seconds("resets in 2h 15m") == 8100
 
+    @pytest.mark.parametrize(
+        ("metadata", "expected_seconds"),
+        [
+            ({"retry_after_ms": 1500}, 2),
+            ({"retryAfterMs": "1500"}, 2),
+            ({"retry_after": "2026-01-01T00:00:01.900000+00:00"}, 2),
+            ({"resume_after": "2026-01-01T00:00:01.900000+00:00"}, 2),
+            ({"retry_after_seconds": 1.1}, 2),
+        ],
+    )
+    def test_recoverable_failure_rounds_retry_windows_up(
+        self,
+        metadata: dict[str, object],
+        expected_seconds: int,
+    ) -> None:
+        """Sub-second retry hints must not resume before the provider boundary."""
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+
+        assert OrchestratorRunner._duration_from_metadata(metadata, now=now) == expected_seconds
+
     def test_recoverable_failure_propagates_invalid_usage_limit_config(
         self,
         runner: OrchestratorRunner,

@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+import math
 import re
 from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
@@ -915,7 +916,7 @@ class OrchestratorRunner:
             total_seconds += seconds
         if total_seconds <= 0:
             return None
-        return max(1, int(total_seconds))
+        return max(1, math.ceil(total_seconds))
 
     @classmethod
     def _duration_value_to_seconds(cls, value: object) -> int | None:
@@ -925,7 +926,7 @@ class OrchestratorRunner:
         if isinstance(value, int | float):
             if value <= 0:
                 return None
-            return max(1, int(value))
+            return max(1, math.ceil(value))
         if isinstance(value, str):
             stripped = value.strip()
             if not stripped:
@@ -936,7 +937,7 @@ class OrchestratorRunner:
                 return cls._duration_text_to_seconds(stripped)
             if numeric <= 0:
                 return None
-            return max(1, int(numeric))
+            return max(1, math.ceil(numeric))
         return None
 
     @classmethod
@@ -961,13 +962,13 @@ class OrchestratorRunner:
         for key in ("retry_after_ms", "retryAfterMs", "reset_after_ms", "resetAfterMs"):
             parsed = cls._duration_value_to_seconds(metadata.get(key))
             if parsed is not None:
-                return max(1, parsed // 1000)
+                return max(1, math.ceil(parsed / 1000))
 
         for key in ("retry_after", "retryAfter", "reset_after", "resetAfter"):
             value = metadata.get(key)
             parsed_datetime = cls._parse_datetime(value)
             if parsed_datetime is not None:
-                seconds = int((parsed_datetime - now).total_seconds())
+                seconds = math.ceil((parsed_datetime - now).total_seconds())
                 if seconds > 0:
                     return seconds
             parsed_duration = cls._duration_value_to_seconds(value)
@@ -977,7 +978,7 @@ class OrchestratorRunner:
         for key in ("resume_after", "resumeAfter", "reset_at", "resetAt"):
             parsed_datetime = cls._parse_datetime(metadata.get(key))
             if parsed_datetime is not None:
-                seconds = int((parsed_datetime - now).total_seconds())
+                seconds = math.ceil((parsed_datetime - now).total_seconds())
                 if seconds > 0:
                     return seconds
 
