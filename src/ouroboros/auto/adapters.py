@@ -132,11 +132,23 @@ def _turn_from_result(
         raise HandlerError("ouroboros_interview did not return a session_id")
     text = result.content[0].text if result.content else ""
     return InterviewTurn(
-        question=text,
+        question=_extract_interview_question(text),
         session_id=session_id,
         seed_ready=bool(meta.get("seed_ready")),
         completed=bool(meta.get("completed")),
     )
+
+
+def _extract_interview_question(text: str) -> str:
+    """Strip human-readable interview envelopes from handler responses."""
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if "\n\n" in stripped:
+        head, tail = stripped.split("\n\n", 1)
+        if head.startswith("Interview started. Session ID:") or head.startswith("Session "):
+            return tail.strip()
+    return stripped
 
 
 def _extract_seed_yaml(text: str) -> str:

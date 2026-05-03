@@ -54,7 +54,12 @@ class _FakeInterviewHandler:
         assert arguments == {"session_id": "interview_1"}
         return Result.ok(
             MCPToolResult(
-                content=(MCPContentItem(type=ContentType.TEXT, text="Pending question?"),),
+                content=(
+                    MCPContentItem(
+                        type=ContentType.TEXT,
+                        text="Session interview_1\n\nPending question?",
+                    ),
+                ),
                 is_error=False,
                 meta={"session_id": "interview_1"},
             )
@@ -67,6 +72,33 @@ async def test_handler_interview_backend_resume_fetches_pending_question() -> No
 
     assert turn.session_id == "interview_1"
     assert turn.question == "Pending question?"
+
+
+class _FakeStartInterviewHandler:
+    async def handle(self, arguments):
+        assert arguments == {"initial_context": "goal", "cwd": "."}
+        return Result.ok(
+            MCPToolResult(
+                content=(
+                    MCPContentItem(
+                        type=ContentType.TEXT,
+                        text="Interview started. Session ID: interview_2\n\nWhat should we build?",
+                    ),
+                ),
+                is_error=False,
+                meta={"session_id": "interview_2"},
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_handler_interview_backend_start_strips_session_envelope() -> None:
+    turn = await HandlerInterviewBackend(_FakeStartInterviewHandler(), cwd=".").start(
+        "goal", cwd="."
+    )
+
+    assert turn.session_id == "interview_2"
+    assert turn.question == "What should we build?"
 
 
 class _FakeErrorInterviewHandler:
