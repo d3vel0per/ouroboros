@@ -581,20 +581,56 @@ def get_usage_limit_pause_seconds() -> int:
         )
         return max(1, int(hours * _SECONDS_PER_HOUR))
 
-    try:
-        config = load_config()
-        hours = _parse_positive_float(
-            config.orchestrator.usage_limit_pause_hours,
-            config_key=_USAGE_LIMIT_PAUSE_CONFIG_KEY,
-        )
-    except ConfigError as exc:
-        config_keys = exc.details.get("config_keys", []) if isinstance(exc.details, dict) else []
-        if exc.config_key == _USAGE_LIMIT_PAUSE_CONFIG_KEY or (
-            _USAGE_LIMIT_PAUSE_CONFIG_KEY in config_keys
-        ):
-            raise
-        hours = _DEFAULT_USAGE_LIMIT_PAUSE_HOURS
+    config_path = get_config_dir() / "config.yaml"
+    if not config_path.exists():
+        # No config file means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
 
+    try:
+        with config_path.open() as f:
+            config_dict = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(
+            f"Failed to parse configuration file: {e}",
+            config_file=str(config_path),
+            details={"yaml_error": str(e)},
+        ) from e
+    except OSError as e:
+        raise ConfigError(
+            f"Failed to read configuration file: {e}",
+            config_file=str(config_path),
+            details={"os_error": str(e), "error_type": type(e).__name__},
+        ) from e
+
+    if config_dict is None:
+        # Empty config means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(config_dict, dict):
+        raise ConfigError(
+            "Configuration file must contain a mapping",
+            config_file=str(config_path),
+            details={"value_type": type(config_dict).__name__},
+        )
+
+    orchestrator_config = config_dict.get("orchestrator")
+    if orchestrator_config is None:
+        # Missing orchestrator section means no pause-window override.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(orchestrator_config, dict):
+        raise ConfigError(
+            "orchestrator must be a mapping",
+            config_key="orchestrator",
+            config_file=str(config_path),
+            details={"value": orchestrator_config},
+        )
+    if "usage_limit_pause_hours" not in orchestrator_config:
+        # Missing pause-window key means no override; invalid values still raise below.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+
+    hours = _parse_positive_float(
+        orchestrator_config["usage_limit_pause_hours"],
+        config_key=_USAGE_LIMIT_PAUSE_CONFIG_KEY,
+    )
     return max(1, int(hours * _SECONDS_PER_HOUR))
 
 
