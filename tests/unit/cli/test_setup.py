@@ -411,6 +411,42 @@ class TestCodexSetup:
         assert fast_profile["providers"]["codex"]["profile"] == "ouroboros-fast"
         assert config_dict["llm_role_profiles"]["assertion_extraction"] == "fast"
 
+    def test_setup_codex_preserves_existing_codex_model_profile_mapping(
+        self, tmp_path: Path
+    ) -> None:
+        """Existing same-name Codex model pins should not be shadowed by profile anchors."""
+        config_dir = tmp_path / ".ouroboros"
+        config_dir.mkdir()
+        config_path = config_dir / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "llm_profiles": {
+                        "fast": {
+                            "providers": {"codex": {"model": "gpt-existing-pin"}},
+                        }
+                    }
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("ouroboros.config.loader.ensure_config_dir", return_value=config_dir),
+            patch("ouroboros.cli.commands.setup._install_codex_artifacts"),
+            patch("ouroboros.cli.commands.setup._register_codex_mcp_server"),
+            patch("ouroboros.cli.commands.setup._register_codex_default_profiles"),
+        ):
+            setup_cmd._setup_codex("/usr/local/bin/codex")
+
+        config_dict = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        codex_profile = config_dict["llm_profiles"]["fast"]["providers"]["codex"]
+        assert codex_profile == {"model": "gpt-existing-pin"}
+        assert config_dict["llm_role_profiles"]["assertion_extraction"] == "fast"
+
     def test_setup_codex_does_not_register_claude_integration(self, tmp_path: Path) -> None:
         """Codex setup should stay scoped to Codex even when Claude is installed."""
         config_dir = tmp_path / ".ouroboros"

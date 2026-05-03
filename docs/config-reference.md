@@ -52,7 +52,7 @@ For Codex-backed Ouroboros workflows:
 
 ### Portable Task Profiles
 
-`llm_profiles` are top-level, provider-neutral task profiles. `llm_role_profiles` maps logical Ouroboros roles to those profiles. For Codex, a provider mapping can use `profile`, which is passed as `codex exec --profile <name>`. For other backends, profiles resolve to supported fields such as `model`, `temperature`, `max_tokens`, `top_p`, and `max_turns`.
+`llm_profiles` are top-level, provider-neutral task profiles. `llm_role_profiles` maps logical Ouroboros roles to those profiles. For Codex, a provider mapping can use `profile`, which is passed as `codex exec --profile <name>`. Role mappings route model/native-profile selection and CLI turn budgets while preserving each call site's tuned sampling and token settings; explicit per-request `profile` selection opts into the profile's full tuning envelope.
 
 ```yaml
 llm_profiles:
@@ -252,7 +252,7 @@ Profile fields:
 | `max_turns` | `int \| null` | Portable CLI-agent turn budget where supported. |
 | `providers` | `dict` | Backend-specific overrides keyed by `codex`, `claude_code`, `gemini`, `opencode`, `litellm`, or provider aliases such as `openrouter`. |
 
-Provider-specific fields use the same keys plus `profile`. `profile` is currently backend-native metadata; Codex maps it to `codex exec --profile <name>`, while non-Codex adapters ignore it unless they add native profile support later. `ouroboros setup --runtime codex` installs missing default profiles and role mappings but preserves existing profile definitions and skips role mappings where explicit legacy model overrides are already configured.
+Provider-specific fields use the same keys plus `profile`. `profile` is currently backend-native metadata; Codex maps it to `codex exec --profile <name>`, while non-Codex adapters ignore it unless they add native profile support later. Role-based resolution uses these profile fields for model/native-profile routing and `max_turns` only; it intentionally preserves request-level `temperature`, `max_tokens`, and `top_p` so existing task-specific tuning does not change just because a role was annotated. Explicit `CompletionConfig.profile` requests use the profile's full sampling/token envelope. `ouroboros setup --runtime codex` installs missing default profiles and role mappings but preserves existing profile definitions, existing Codex provider model pins, and skips role mappings where explicit legacy model overrides are already configured.
 
 Codex agent-runtime tasks also use these mappings. Runtime handles with `session_role: implementation`, `coordinator`, `interview`, or `evaluation` resolve through `agent_runtime_<session_role>`; tasks without a role fall back to `agent_runtime`. Explicit runtime models still win and are passed with `--model` instead of `--profile`.
 

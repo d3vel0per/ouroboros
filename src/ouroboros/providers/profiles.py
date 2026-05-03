@@ -98,6 +98,7 @@ def resolve_completion_profile(
     normalized_backend = _normalize_backend(backend)
     provider = _provider_config(profile, normalized_backend)
     model_override = _has_request_model_override(config)
+    explicit_profile = config.profile is not None
 
     effective = replace(
         config,
@@ -112,17 +113,23 @@ def resolve_completion_profile(
             provider.temperature if provider is not None else None,
             profile.temperature,
             config.temperature,
-        ),
+        )
+        if explicit_profile
+        else config.temperature,
         max_tokens=_coalesce(
             provider.max_tokens if provider is not None else None,
             profile.max_tokens,
             config.max_tokens,
-        ),
+        )
+        if explicit_profile
+        else config.max_tokens,
         top_p=_coalesce(
             provider.top_p if provider is not None else None,
             profile.top_p,
             config.top_p,
-        ),
+        )
+        if explicit_profile
+        else config.top_p,
         max_turns=_coalesce(
             provider.max_turns if provider is not None else None,
             profile.max_turns,

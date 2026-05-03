@@ -34,7 +34,7 @@ def test_resolve_completion_profile_uses_codex_backend_profile() -> None:
     assert resolved.profile_name == "fast"
     assert resolved.backend_profile == "ouroboros-fast"
     assert resolved.config.model == "gpt-5.3-codex-spark"
-    assert resolved.config.temperature == 0.2
+    assert resolved.config.temperature == 0.7
     assert resolved.config.max_turns == 1
 
 
@@ -61,8 +61,8 @@ def test_resolve_completion_profile_uses_provider_aliases() -> None:
 
     assert resolved.backend_profile is None
     assert resolved.config.model == "openrouter/anthropic/claude-opus-4-6"
-    assert resolved.config.temperature == 0.4
-    assert resolved.config.max_tokens == 8192
+    assert resolved.config.temperature == 0.7
+    assert resolved.config.max_tokens == 4096
 
 
 def test_resolve_completion_profile_explicit_profile_overrides_role() -> None:
@@ -106,7 +106,7 @@ def test_resolve_completion_profile_preserves_explicit_role_model() -> None:
 
     assert resolved.profile_name == "fast"
     assert resolved.config.model == "request-model"
-    assert resolved.config.temperature == 0.2
+    assert resolved.config.temperature == 0.7
 
 
 def test_resolve_completion_profile_replaces_implicit_legacy_model() -> None:
@@ -137,6 +137,67 @@ def test_resolve_completion_profile_resolves_empty_role_model() -> None:
 
     assert resolved.profile_name == "deep"
     assert resolved.config.model == "profile-model"
+
+
+def test_resolve_completion_profile_preserves_role_request_sampling_settings() -> None:
+    """Role mappings should route models without changing tuned request behavior."""
+    config = OuroborosConfig(
+        llm_profiles={
+            "fast": {
+                "model": "profile-model",
+                "temperature": 0.2,
+                "max_tokens": 1024,
+                "top_p": 0.5,
+            },
+        },
+        llm_role_profiles={"brownfield_explore": "fast"},
+    )
+    request = CompletionConfig(
+        model="legacy-helper-default",
+        role="brownfield_explore",
+        temperature=0.0,
+        max_tokens=60,
+        top_p=0.9,
+    )
+
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        resolved = resolve_completion_profile(request, backend="litellm")
+
+    assert resolved.profile_name == "fast"
+    assert resolved.config.model == "profile-model"
+    assert resolved.config.temperature == 0.0
+    assert resolved.config.max_tokens == 60
+    assert resolved.config.top_p == 0.9
+
+
+def test_resolve_completion_profile_applies_explicit_profile_sampling_settings() -> None:
+    """Explicit profile selection opts into the profile's full tuning envelope."""
+    config = OuroborosConfig(
+        llm_profiles={
+            "deep": {
+                "model": "profile-model",
+                "temperature": 0.3,
+                "max_tokens": 8192,
+                "top_p": 0.8,
+            },
+        },
+    )
+    request = CompletionConfig(
+        model="fallback",
+        profile="deep",
+        temperature=0.7,
+        max_tokens=4096,
+        top_p=1.0,
+    )
+
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        resolved = resolve_completion_profile(request, backend="litellm")
+
+    assert resolved.profile_name == "deep"
+    assert resolved.config.model == "profile-model"
+    assert resolved.config.temperature == 0.3
+    assert resolved.config.max_tokens == 8192
+    assert resolved.config.top_p == 0.8
 
 
 def test_resolve_completion_profile_falls_back_when_config_missing() -> None:

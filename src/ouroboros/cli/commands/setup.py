@@ -607,7 +607,7 @@ def _install_codex_default_llm_profiles(
 
         default_codex = profile["providers"]["codex"]  # type: ignore[index]
         codex_provider = _ensure_profile_provider_mapping(existing_profile, "codex")
-        if "profile" not in codex_provider:
+        if "profile" not in codex_provider and "model" not in codex_provider:
             codex_provider["profile"] = default_codex["profile"]  # type: ignore[index]
             updated_profiles.append(name)
 
