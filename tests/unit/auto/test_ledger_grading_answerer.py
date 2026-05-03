@@ -263,6 +263,23 @@ def test_auto_answerer_preserves_product_behavior_phrasing_variants() -> None:
     assert all("product behavior" in answer.text.lower() for answer in answers)
 
 
+def test_auto_answerer_preserves_passive_product_behavior_variants() -> None:
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a source-control compliance tool")
+
+    examples = (
+        "Should branches be deleted after merge?",
+        "Should API keys be removed after rotation?",
+        "Should legal documents be edited?",
+    )
+
+    answers = [answerer.answer(question, ledger) for question in examples]
+
+    assert all(answer.blocker is None for answer in answers)
+    assert all(answer.source != AutoAnswerSource.BLOCKER for answer in answers)
+    assert all("product behavior" in answer.text.lower() for answer in answers)
+
+
 def test_auto_answerer_still_blocks_current_branch_deletion_authority() -> None:
     answer = AutoAnswerer().answer(
         "Should we delete the current branch?",
