@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from enum import Enum
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -91,6 +92,14 @@ def auto_command(
         raise typer.Exit(1)
 
 
+def _safe_default_cwd() -> Path:
+    """Return a writable default cwd for fresh CLI auto sessions."""
+    cwd = Path.cwd()
+    if cwd == Path("/") or not os.access(cwd, os.W_OK):
+        return Path.home()
+    return cwd
+
+
 async def _run_auto(
     *,
     goal: str | None,
@@ -112,7 +121,7 @@ async def _run_auto(
         runtime = runtime or state.runtime_backend
         skip_run = skip_run or state.skip_run
     else:
-        state = AutoPipelineState(goal=goal or "", cwd=str(Path.cwd()))
+        state = AutoPipelineState(goal=goal or "", cwd=str(_safe_default_cwd()))
         state.runtime_backend = runtime
         state.skip_run = skip_run
 

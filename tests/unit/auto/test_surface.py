@@ -397,6 +397,52 @@ async def test_cli_resume_rejects_runtime_mismatch(monkeypatch, tmp_path) -> Non
         )
 
 
+@pytest.mark.asyncio
+async def test_cli_fresh_auto_uses_safe_default_cwd(monkeypatch, tmp_path) -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.auto.state import AutoStore
+    from ouroboros.cli.commands import auto as auto_command
+
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            captured["skip_run"] = kwargs.get("skip_run")
+
+        async def run(self, run_state):  # noqa: ANN001
+            captured["cwd"] = run_state.cwd
+            return AutoPipelineResult(
+                status="complete",
+                auto_session_id=run_state.auto_session_id,
+                phase="complete",
+            )
+
+    class FakeHandler:
+        def __init__(self, **kwargs):  # noqa: ARG002
+            pass
+
+    monkeypatch.setattr(Path, "cwd", lambda: Path("/"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(auto_command, "AutoStore", lambda: AutoStore(tmp_path))
+    monkeypatch.setattr(auto_command, "AutoPipeline", FakePipeline)
+    monkeypatch.setattr(auto_command, "InterviewHandler", FakeHandler)
+    monkeypatch.setattr(auto_command, "GenerateSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_command, "ExecuteSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_command, "StartExecuteSeedHandler", FakeHandler)
+
+    result = await auto_command._run_auto(
+        goal="Build a CLI",
+        resume=None,
+        runtime=None,
+        max_interview_rounds=1,
+        max_repair_rounds=1,
+        skip_run=False,
+    )
+
+    assert result.status == "complete"
+    assert captured["cwd"] == str(tmp_path)
+
+
 def test_static_ouroboros_tools_exports_auto_handler() -> None:
     from ouroboros.mcp.tools.definitions import OUROBOROS_TOOLS
 
