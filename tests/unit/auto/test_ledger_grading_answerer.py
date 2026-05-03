@@ -747,3 +747,35 @@ def test_auto_answerer_allows_user_managed_token_and_key_product_questions() -> 
         answer = answerer.answer(question, SeedDraftLedger.from_goal("Build identity settings"))
         assert answer.blocker is None
         assert "product behavior" in answer.text.lower()
+
+
+def test_auto_answerer_allows_production_credential_product_semantics() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        "Should users be able to configure production credentials?",
+        "Should the app store production credentials?",
+        "What credential fields should the production settings form display?",
+    )
+
+    for question in questions:
+        answer = answerer.answer(
+            question,
+            SeedDraftLedger.from_goal("Build credential management settings"),
+        )
+        assert answer.blocker is None
+        assert answer.source != AutoAnswerSource.BLOCKER
+        assert "product behavior" in answer.text.lower()
+
+
+def test_auto_answerer_still_blocks_real_production_credential_authority() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        "Which credential value should production use?",
+        "Which credentials should CI configure for production?",
+        "Use the production credential secret for deployment?",
+    )
+
+    for question in questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Deploy a service"))
+        assert answer.blocker is not None
+        assert answer.source == AutoAnswerSource.BLOCKER
