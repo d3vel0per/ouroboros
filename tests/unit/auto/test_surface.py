@@ -486,6 +486,50 @@ def test_static_ouroboros_tools_exports_auto_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_handler_resume_uses_persisted_cwd_without_revalidating_server_cwd(
+    monkeypatch, tmp_path
+) -> None:
+    from ouroboros.auto.pipeline import AutoPipelineResult
+    from ouroboros.auto.state import AutoPipelineState, AutoStore
+    from ouroboros.mcp.tools import auto_handler as auto_module
+
+    store = AutoStore(tmp_path)
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path / "project"))
+    state.runtime_backend = "codex"
+    store.save(state)
+    captured: dict[str, object] = {}
+
+    class FakePipeline:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            captured["skip_run"] = kwargs.get("skip_run")
+
+        async def run(self, run_state):  # noqa: ANN001
+            captured["cwd"] = run_state.cwd
+            return AutoPipelineResult(
+                status="complete",
+                auto_session_id=run_state.auto_session_id,
+                phase="complete",
+            )
+
+    class FakeHandler:
+        def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003, ARG002
+            pass
+
+    monkeypatch.setattr(auto_module.Path, "cwd", lambda: tmp_path / "server")
+    monkeypatch.setattr(auto_module.os, "access", lambda *_args: False)
+    monkeypatch.setattr(auto_module, "AutoPipeline", FakePipeline)
+    monkeypatch.setattr(auto_module, "InterviewHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "GenerateSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "ExecuteSeedHandler", FakeHandler)
+    monkeypatch.setattr(auto_module, "StartExecuteSeedHandler", FakeHandler)
+
+    result = await AutoHandler(store=store).handle({"resume": state.auto_session_id})
+
+    assert result.is_ok
+    assert captured["cwd"] == str(tmp_path / "project")
+
+
+@pytest.mark.asyncio
 async def test_auto_handler_rejects_zero_loop_bounds() -> None:
     for field_name in ("max_interview_rounds", "max_repair_rounds"):
         result = await AutoHandler().handle({"goal": "Build a CLI", field_name: 0})

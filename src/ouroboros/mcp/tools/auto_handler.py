@@ -122,7 +122,6 @@ class AutoHandler:
     async def _run(self, arguments: dict[str, Any]) -> AutoPipelineResult:
         store = self.store or AutoStore()
         resume = arguments.get("resume")
-        requested_cwd = str(_resolve_cwd(arguments.get("cwd")))
         requested_skip_run = bool(arguments.get("skip_run", False))
         if isinstance(resume, str) and resume:
             state = store.load(resume)
@@ -134,7 +133,7 @@ class AutoHandler:
             goal = arguments.get("goal")
             if not isinstance(goal, str) or not goal.strip():
                 raise ValueError("goal is required when not resuming")
-            cwd = requested_cwd
+            cwd = str(_resolve_cwd(arguments.get("cwd")))
             runtime_backend = self.agent_runtime_backend
             opencode_mode = self.opencode_mode
             skip_run = requested_skip_run
