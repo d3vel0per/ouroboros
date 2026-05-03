@@ -147,7 +147,11 @@ def resolve_completion_profile(
     return ResolvedCompletionProfile(
         config=effective,
         profile_name=profile_name,
-        backend_profile=provider.profile if provider is not None else None,
+        backend_profile=None
+        if model_override
+        else provider.profile
+        if provider is not None
+        else None,
     )
 
 

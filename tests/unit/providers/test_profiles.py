@@ -111,6 +111,30 @@ def test_resolve_completion_profile_preserves_explicit_role_model() -> None:
     assert resolved.config.temperature == 0.7
 
 
+def test_resolve_completion_profile_suppresses_backend_profile_for_explicit_model() -> None:
+    """Codex native profiles must not shadow explicit request model pins."""
+    config = OuroborosConfig(
+        llm_profiles={
+            "fast": {
+                "providers": {"codex": {"profile": "ouroboros-fast"}},
+            },
+        },
+        llm_role_profiles={"atomicity": "fast"},
+    )
+    request = CompletionConfig(
+        model="custom-codex-model",
+        role="atomicity",
+        model_is_explicit=True,
+    )
+
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        resolved = resolve_completion_profile(request, backend="codex")
+
+    assert resolved.profile_name == "fast"
+    assert resolved.backend_profile is None
+    assert resolved.config.model == "custom-codex-model"
+
+
 def test_resolve_completion_profile_replaces_implicit_legacy_model() -> None:
     """Role profiles should replace helper/config defaults that are not request pins."""
     config = OuroborosConfig(
