@@ -229,14 +229,20 @@ def test_auto_answerer_allows_product_domain_file_removal_questions() -> None:
 
 
 def test_auto_answerer_allows_git_product_branch_deletion_questions() -> None:
-    answer = AutoAnswerer().answer(
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a Git branch manager")
+
+    examples = (
         "Should users be able to delete the branch?",
-        SeedDraftLedger.from_goal("Build a Git branch manager"),
+        "Should the app delete the branch automatically?",
+        "Should the tool remove the branch after merge?",
     )
 
-    assert answer.blocker is None
-    assert answer.source != AutoAnswerSource.BLOCKER
-    assert "product behavior" in answer.text.lower()
+    answers = [answerer.answer(question, ledger) for question in examples]
+
+    assert all(answer.blocker is None for answer in answers)
+    assert all(answer.source != AutoAnswerSource.BLOCKER for answer in answers)
+    assert all("product behavior" in answer.text.lower() for answer in answers)
 
 
 def test_auto_answerer_still_blocks_current_branch_deletion_authority() -> None:

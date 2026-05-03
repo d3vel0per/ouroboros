@@ -453,9 +453,12 @@ def _latest_resolved_goal(ledger: SeedDraftLedger) -> str:
 
 def _is_safe_product_branch_question(lowered: str) -> bool:
     return bool(
-        re.search(
-            r"\b(users?|customers?|admins?|maintainers?|owners?)\b.+\b(delete|remove)\b.+\b(branch|branches)\b",
+        _matches_any(
             lowered,
+            (
+                r"\b(users?|customers?|admins?|maintainers?|owners?)\b.+\b(delete|remove)\b.+\b(branch|branches)\b",
+                r"\b(app|application|tool|system|service|cli|workflow|feature)\b.+\b(delete|remove)\b.+\b(branch|branches)\b",
+            ),
         )
         and _is_product_behavior_question(lowered)
         and not re.search(
