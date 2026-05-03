@@ -533,7 +533,8 @@ def _ensure_mapping_section(config_dict: dict, key: str) -> dict:
     if isinstance(section, dict):
         return section
     if section is not None:
-        print_warning(f"Replacing invalid non-mapping {key!r} section in config.yaml.")
+        msg = f"Invalid non-mapping {key!r} section in config.yaml."
+        raise ValueError(msg)
     section = {}
     config_dict[key] = section
     return section
@@ -544,7 +545,8 @@ def _ensure_profile_provider_mapping(profile: dict, provider: str) -> dict:
     providers = profile.get("providers")
     if not isinstance(providers, dict):
         if providers is not None:
-            print_warning("Replacing invalid non-mapping 'providers' in an LLM profile.")
+            msg = "Invalid non-mapping 'providers' in an LLM profile."
+            raise ValueError(msg)
         providers = {}
         profile["providers"] = providers
 
@@ -552,7 +554,8 @@ def _ensure_profile_provider_mapping(profile: dict, provider: str) -> dict:
     if isinstance(provider_config, dict):
         return provider_config
     if provider_config is not None:
-        print_warning(f"Replacing invalid non-mapping {provider!r} provider profile.")
+        msg = f"Invalid non-mapping {provider!r} provider profile."
+        raise ValueError(msg)
     provider_config = {}
     providers[provider] = provider_config
     return provider_config
@@ -600,10 +603,8 @@ def _install_codex_default_llm_profiles(
 
         existing_profile = llm_profiles[name]
         if not isinstance(existing_profile, dict):
-            print_warning(f"Replacing invalid non-mapping llm_profiles.{name!s}.")
-            llm_profiles[name] = deepcopy(profile)
-            added_profiles.append(name)
-            continue
+            msg = f"Invalid non-mapping llm_profiles.{name!s}."
+            raise ValueError(msg)
 
         default_codex = profile["providers"]["codex"]  # type: ignore[index]
         codex_provider = _ensure_profile_provider_mapping(existing_profile, "codex")
@@ -657,20 +658,25 @@ def _setup_codex(codex_path: str, *, mcp_mode: CodexMcpMode = "auto") -> None:
         config_dict = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 
     if not isinstance(config_dict, dict):
-        print_warning("Replacing invalid non-mapping config.yaml contents.")
-        config_dict = {}
+        print_error("Invalid non-mapping config.yaml contents; aborting without changes.")
+        return
 
-    # Set runtime and LLM backend to codex
-    orchestrator_config = _ensure_mapping_section(config_dict, "orchestrator")
-    orchestrator_config["runtime_backend"] = "codex"
-    orchestrator_config["codex_cli_path"] = codex_path
+    try:
+        # Set runtime and LLM backend to codex
+        orchestrator_config = _ensure_mapping_section(config_dict, "orchestrator")
+        orchestrator_config["runtime_backend"] = "codex"
+        orchestrator_config["codex_cli_path"] = codex_path
 
-    llm_config = _ensure_mapping_section(config_dict, "llm")
-    llm_config["backend"] = "codex"
+        llm_config = _ensure_mapping_section(config_dict, "llm")
+        llm_config["backend"] = "codex"
 
-    added_profiles, updated_profiles, added_role_profiles = _install_codex_default_llm_profiles(
-        config_dict
-    )
+        added_profiles, updated_profiles, added_role_profiles = _install_codex_default_llm_profiles(
+            config_dict
+        )
+    except ValueError as exc:
+        print_error(f"Invalid config.yaml structure: {exc}")
+        print_info("Aborting Codex setup without rewriting config.yaml.")
+        return
 
     with config_path.open("w", encoding="utf-8") as f:
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)

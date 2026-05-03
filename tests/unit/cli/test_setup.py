@@ -281,6 +281,85 @@ class TestCodexSetup:
         assert any("Configure Ouroboros runtime" in message for message in info_messages)
         assert any("Codex profile anchors" in message for message in info_messages)
 
+    def test_setup_codex_aborts_on_non_mapping_config(self, tmp_path: Path) -> None:
+        """Malformed top-level config should not be rewritten by Codex setup."""
+        config_dir = tmp_path / ".ouroboros"
+        config_dir.mkdir()
+        config_path = config_dir / "config.yaml"
+        original = "- not-a-mapping\n"
+        config_path.write_text(original, encoding="utf-8")
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("ouroboros.config.loader.ensure_config_dir", return_value=config_dir),
+            patch("ouroboros.cli.commands.setup._install_codex_artifacts") as mock_install,
+            patch("ouroboros.cli.commands.setup._register_codex_mcp_server") as mock_register,
+            patch("ouroboros.cli.commands.setup._register_codex_default_profiles") as mock_profiles,
+            patch("ouroboros.cli.commands.setup.print_error") as mock_error,
+        ):
+            setup_cmd._setup_codex("/usr/local/bin/codex")
+
+        assert config_path.read_text(encoding="utf-8") == original
+        mock_error.assert_called_once()
+        mock_install.assert_not_called()
+        mock_register.assert_not_called()
+        mock_profiles.assert_not_called()
+
+    def test_setup_codex_aborts_on_invalid_existing_llm_profiles_section(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid existing profile sections should be reported, not replaced."""
+        config_dir = tmp_path / ".ouroboros"
+        config_dir.mkdir()
+        config_path = config_dir / "config.yaml"
+        original = yaml.safe_dump({"llm_profiles": ["not", "a", "mapping"]}, sort_keys=False)
+        config_path.write_text(original, encoding="utf-8")
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("ouroboros.config.loader.ensure_config_dir", return_value=config_dir),
+            patch("ouroboros.cli.commands.setup._install_codex_artifacts") as mock_install,
+            patch("ouroboros.cli.commands.setup._register_codex_mcp_server") as mock_register,
+            patch("ouroboros.cli.commands.setup._register_codex_default_profiles") as mock_profiles,
+            patch("ouroboros.cli.commands.setup.print_error") as mock_error,
+        ):
+            setup_cmd._setup_codex("/usr/local/bin/codex")
+
+        assert config_path.read_text(encoding="utf-8") == original
+        assert "llm_profiles" in mock_error.call_args.args[0]
+        mock_install.assert_not_called()
+        mock_register.assert_not_called()
+        mock_profiles.assert_not_called()
+
+    def test_setup_codex_aborts_on_invalid_existing_profile_provider_mapping(
+        self, tmp_path: Path
+    ) -> None:
+        """Invalid nested provider profile mappings should not be auto-repaired."""
+        config_dir = tmp_path / ".ouroboros"
+        config_dir.mkdir()
+        config_path = config_dir / "config.yaml"
+        original = yaml.safe_dump(
+            {"llm_profiles": {"fast": {"providers": ["not-a-mapping"]}}},
+            sort_keys=False,
+        )
+        config_path.write_text(original, encoding="utf-8")
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("ouroboros.config.loader.ensure_config_dir", return_value=config_dir),
+            patch("ouroboros.cli.commands.setup._install_codex_artifacts") as mock_install,
+            patch("ouroboros.cli.commands.setup._register_codex_mcp_server") as mock_register,
+            patch("ouroboros.cli.commands.setup._register_codex_default_profiles") as mock_profiles,
+            patch("ouroboros.cli.commands.setup.print_error") as mock_error,
+        ):
+            setup_cmd._setup_codex("/usr/local/bin/codex")
+
+        assert config_path.read_text(encoding="utf-8") == original
+        assert "providers" in mock_error.call_args.args[0]
+        mock_install.assert_not_called()
+        mock_register.assert_not_called()
+        mock_profiles.assert_not_called()
+
     def test_setup_codex_preserves_existing_role_overrides(self, tmp_path: Path) -> None:
         """Re-running Codex setup should not wipe role-specific model overrides."""
         config_dir = tmp_path / ".ouroboros"
