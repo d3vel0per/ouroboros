@@ -47,6 +47,13 @@ _QA_SCORE_RE = re.compile(r"Score:\s*([\d.]+)")
 _QA_VERDICT_RE = re.compile(r"Verdict:\s*(\w+)")
 
 
+def _resolve_project_dir(project_dir: str | None) -> str | None:
+    """Return an absolute project directory path for MCP calls."""
+    if not project_dir:
+        return None
+    return str(Path(project_dir).expanduser().resolve())
+
+
 def parse_evolve_text(text: str) -> dict[str, Any]:
     """Parse the markdown text returned by ouroboros_evolve_step.
 
@@ -111,6 +118,9 @@ async def _call_evolve(session: Any, args: argparse.Namespace) -> dict[str, Any]
     """Invoke evolve_step, handle stagnation with lateral_think retries."""
     # Build arguments for evolve_step
     tool_args: dict[str, Any] = {"lineage_id": args.lineage_id}
+    project_dir = _resolve_project_dir(getattr(args, "project_dir", None))
+    if project_dir:
+        tool_args["project_dir"] = project_dir
     if args.seed_file:
         seed_path = Path(args.seed_file)
         if not seed_path.exists():
@@ -164,8 +174,14 @@ async def _call_evolve(session: Any, args: argparse.Namespace) -> dict[str, Any]
 
             # Re-run evolve_step after lateral thinking
             retry_args: dict[str, Any] = {"lineage_id": lineage_id}
+            if project_dir:
+                retry_args["project_dir"] = project_dir
             if args.no_execute:
                 retry_args["execute"] = False
+            if args.no_parallel:
+                retry_args["parallel"] = False
+            if args.no_qa:
+                retry_args["skip_qa"] = True
             result = await session.call_tool("ouroboros_evolve_step", retry_args)
             text = _extract_text(result)
             if text is None:
@@ -224,6 +240,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--lineage-id", required=True, help="Lineage ID to evolve")
     p.add_argument("--seed-file", default=None, help="Path to seed YAML (Gen 1 only)")
+    p.add_argument(
+        "--project-dir",
+        default=None,
+        help="Target project directory for evolve_step operations",
+    )
     p.add_argument(
         "--no-execute", action="store_true", help="Ontology-only evolution (skip execution)"
     )
