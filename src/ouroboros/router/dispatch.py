@@ -396,6 +396,15 @@ def _extract_dispatch_template_values(
         "max_repair_rounds": "",
     }
     tokens = _shell_split_remainder(remainder)
+    if not tokens and first_argument:
+        # Multiline payloads intentionally skip shell tokenization so Seed YAML
+        # and free-form goals keep their original bytes. Named-template skills
+        # must therefore fall back to the legacy full-remainder payload instead
+        # of treating the goal as empty.
+        values["args"] = first_argument
+        values["goal"] = first_argument
+        return values
+
     positional: list[str] = []
     index = 0
     while index < len(tokens):

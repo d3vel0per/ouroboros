@@ -229,6 +229,33 @@ def test_valid_dispatch_preserves_goal_after_boolean_option(
     }
 
 
+def test_valid_dispatch_preserves_multiline_auto_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+    goal = "Build a CLI tool\nConstraints:\n  - supports --json output"
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=f"/ouroboros:auto\n{goal}",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == goal
+    assert result.mcp_args == {
+        "goal": goal,
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
 def test_valid_dispatch_preserves_unknown_double_dash_tokens_in_goal(
     tmp_path: Path,
 ) -> None:
