@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ouroboros.config.models import RuntimeControlsConfig
 from ouroboros.core.errors import ConfigError
 from ouroboros.core.types import Result
 from ouroboros.mcp.tools.authoring_handlers import _is_interview_completion_signal
@@ -487,6 +488,7 @@ class TestQueryEventsHandler:
                 aggregate_type="execution",
                 aggregate_id="exec_parallel_123_sub_ac_0_0",
                 data={
+                    "execution_id": "exec_parallel_123",
                     "session_id": "native-codex-session",
                     "session_scope_id": "exec_parallel_123_sub_ac_0_0",
                 },
@@ -690,6 +692,15 @@ class TestAsyncJobHandlers:
     def test_start_evolve_step_definition_name(self) -> None:
         handler = StartEvolveStepHandler()
         assert handler.definition.name == "ouroboros_start_evolve_step"
+
+    def test_evolve_step_has_no_fixed_mcp_timeout_by_default(self) -> None:
+        """evolve_step uses progress-aware controls rather than a hard 2h wall clock."""
+        handler = EvolveStepHandler()
+        with patch(
+            "ouroboros.mcp.tools.evolution_handlers.get_runtime_controls_config",
+            return_value=RuntimeControlsConfig(),
+        ):
+            assert handler.TIMEOUT_SECONDS == 0
 
 
 VALID_SEED_YAML = """\
