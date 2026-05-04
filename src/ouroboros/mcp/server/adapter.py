@@ -17,6 +17,8 @@ from typing import Any
 import structlog
 
 from ouroboros.core.types import Result
+from ouroboros.events.io import new_call_id
+from ouroboros.events.io_recorder import IOJournalRecorder, use_io_journal_recorder
 from ouroboros.mcp.errors import (
     MCPResourceNotFoundError,
     MCPServerError,
@@ -36,7 +38,7 @@ from ouroboros.mcp.types import (
     ToolInputType,
 )
 from ouroboros.orchestrator.agent_runtime_context import AgentRuntimeContext
-from ouroboros.orchestrator.control_bus import ControlBus
+from ouroboros.orchestrator.control_bus import ControlBus, ControlBusDrainError
 
 log = structlog.get_logger(__name__)
 
@@ -61,6 +63,24 @@ def _default_interview_state_dir() -> Path:
     from ouroboros.config.models import get_config_dir
 
     return get_config_dir() / "data"
+
+
+def _string_argument(arguments: dict[str, Any], *names: str) -> str | None:
+    """Return the first non-empty string argument among *names*."""
+    for name in names:
+        value = arguments.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _int_argument(arguments: dict[str, Any], *names: str) -> int | None:
+    """Return the first integer argument among *names*."""
+    for name in names:
+        value = arguments.get(name)
+        if isinstance(value, int):
+            return value
+    return None
 
 
 def validate_transport(transport: str) -> str:
@@ -449,10 +469,18 @@ class MCPServerAdapter:
 
         try:
             timeout = getattr(handler, "TIMEOUT_SECONDS", None)
-            if timeout is not None and timeout > 0:
-                result = await asyncio.wait_for(handler.handle(arguments), timeout=timeout)
+
+            async def invoke_handler() -> Result[MCPToolResult, MCPServerError]:
+                if timeout is not None and timeout > 0:
+                    return await asyncio.wait_for(handler.handle(arguments), timeout=timeout)
+                return await handler.handle(arguments)
+
+            recorder = self._io_recorder_for_tool_call(name, arguments)
+            if recorder is not None:
+                with use_io_journal_recorder(recorder):
+                    result = await invoke_handler()
             else:
-                result = await handler.handle(arguments)
+                result = await invoke_handler()
             return result
         except TimeoutError:
             log.error("mcp.server.tool_timeout", tool=name)
@@ -713,6 +741,49 @@ class MCPServerAdapter:
         """Register a resource whose ``close()`` will be called on shutdown."""
         self._owned_resources.append(resource)
 
+    def _io_recorder_for_tool_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> IOJournalRecorder | None:
+        """Build a per-MCP-call recorder for shared LLM adapters."""
+        context = self._runtime_context
+        if context is None:
+            return None
+        event_store = getattr(context, "event_store", None)
+        if event_store is None:
+            return None
+
+        session_id = _string_argument(arguments, "session_id", "qa_session_id")
+        execution_id = _string_argument(arguments, "execution_id")
+        lineage_id = _string_argument(arguments, "lineage_id")
+        generation_number = _int_argument(arguments, "generation_number", "generation")
+        phase = _string_argument(arguments, "phase", "current_phase")
+
+        if execution_id is not None:
+            target_type = "execution"
+            target_id = execution_id
+        elif lineage_id is not None:
+            target_type = "lineage"
+            target_id = lineage_id
+        elif session_id is not None:
+            target_type = "session"
+            target_id = session_id
+        else:
+            target_type = "mcp_tool"
+            target_id = f"{name}:{new_call_id()}"
+
+        return IOJournalRecorder(
+            event_store=event_store,
+            target_type=target_type,
+            target_id=target_id,
+            session_id=session_id,
+            execution_id=execution_id,
+            lineage_id=lineage_id,
+            generation_number=generation_number,
+            phase=phase,
+        )
+
     async def shutdown(self) -> None:
         """Shutdown the server gracefully, closing owned resources."""
         log.info("mcp.server.shutdown", name=self._name)
@@ -721,6 +792,12 @@ class MCPServerAdapter:
             if callable(close_fn):
                 try:
                     await close_fn()
+                except ControlBusDrainError:
+                    log.error(
+                        "mcp.server.control_bus_close_failed",
+                        resource=type(resource).__name__,
+                    )
+                    raise
                 except Exception as exc:
                     log.warning(
                         "mcp.server.resource_close_failed",
@@ -790,9 +867,7 @@ def create_ouroboros_server(
     from ouroboros.config import (
         get_assertion_extraction_model,
         get_clarification_model,
-        get_reflect_model,
         get_semantic_model,
-        get_wonder_model,
     )
     from ouroboros.evaluation import (
         EvaluationContext,
@@ -899,13 +974,22 @@ def create_ouroboros_server(
     from ouroboros.verification.extractor import AssertionExtractor
     from ouroboros.verification.verifier import SpecVerifier
 
+    def fresh_llm_adapter():
+        return create_llm_adapter(
+            backend=llm_backend if llm_backend is not None else None,
+            max_turns=1,
+            cwd=effective_cwd,
+        )
+
     wonder_engine = WonderEngine(
         llm_adapter=llm_adapter,
-        model=get_wonder_model(llm_backend),
+        adapter_factory=fresh_llm_adapter,
+        adapter_backend=llm_backend,
     )
     reflect_engine = ReflectEngine(
         llm_adapter=llm_adapter,
-        model=get_reflect_model(llm_backend),
+        adapter_factory=fresh_llm_adapter,
+        adapter_backend=llm_backend,
     )
 
     # Wire real execution/evaluation callables for evolve_step so that
@@ -1467,24 +1551,27 @@ def create_ouroboros_server(
         rate_limit_config=rate_limit_config,
     )
 
-    # The server owns the shared event store lifecycle
-    server.register_owned_resource(event_store)
-    if brownfield_store is not None:
-        server.register_owned_resource(brownfield_store)
-
     # Build the AgentRuntimeContext that #474 funnels through every
     # handler. For now the context only exposes the EventStore, the
     # backend labels, the optional MCP bridge, and a fresh ControlBus
     # for #515. Subsequent migration slices move handler internals to
     # consume context.mcp_bridge directly instead of self.mcp_manager.
+    control_bus = ControlBus()
     agent_runtime_context = AgentRuntimeContext(
         event_store=event_store,
         runtime_backend=resolved_runtime_backend,
         llm_backend=llm_backend,
         mcp_bridge=mcp_bridge,
-        control=ControlBus(),
+        control=control_bus,
     )
     server.set_runtime_context(agent_runtime_context)
+
+    # Close the reactive control surface before stores/bridges it may
+    # reference from subscriber tasks.
+    server.register_owned_resource(control_bus)
+    server.register_owned_resource(event_store)
+    if brownfield_store is not None:
+        server.register_owned_resource(brownfield_store)
 
     # Inject the bridge from the runtime context into every
     # BridgeAwareMixin handler. ``inject_runtime_context`` is byte-

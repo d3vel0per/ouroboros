@@ -168,14 +168,14 @@ class TestCodexSetup:
         contents = config_path.read_text(encoding="utf-8")
 
         assert "[profiles.ouroboros-fast]" in contents
-        assert 'model = "gpt-5.4-mini"' in contents
         assert 'model_reasoning_effort = "low"' in contents
         assert "[profiles.ouroboros-standard]" in contents
-        assert 'model = "gpt-5.4"' in contents
+        assert 'model_reasoning_effort = "medium"' in contents
         assert "[profiles.ouroboros-deep]" in contents
+        assert 'model_reasoning_effort = "high"' in contents
         assert "[profiles.ouroboros-frontier]" in contents
-        assert 'model = "gpt-5.5"' in contents
         assert 'model_reasoning_effort = "xhigh"' in contents
+        assert 'model = "' not in contents
 
     def test_register_codex_default_profiles_preserves_existing_profile(
         self,

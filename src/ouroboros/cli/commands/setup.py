@@ -214,22 +214,10 @@ _CODEX_PROFILE_COMMENT = (
 )
 
 _CODEX_DEFAULT_PROFILE_SECTIONS: dict[str, dict[str, str]] = {
-    "ouroboros-fast": {
-        "model": "gpt-5.4-mini",
-        "model_reasoning_effort": "low",
-    },
-    "ouroboros-standard": {
-        "model": "gpt-5.4",
-        "model_reasoning_effort": "medium",
-    },
-    "ouroboros-deep": {
-        "model": "gpt-5.5",
-        "model_reasoning_effort": "high",
-    },
-    "ouroboros-frontier": {
-        "model": "gpt-5.5",
-        "model_reasoning_effort": "xhigh",
-    },
+    "ouroboros-fast": {"model_reasoning_effort": "low"},
+    "ouroboros-standard": {"model_reasoning_effort": "medium"},
+    "ouroboros-deep": {"model_reasoning_effort": "high"},
+    "ouroboros-frontier": {"model_reasoning_effort": "xhigh"},
 }
 
 _CODEX_DEFAULT_LLM_PROFILES: dict[str, dict[str, object]] = {

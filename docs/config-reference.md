@@ -132,23 +132,19 @@ For Codex, setup creates flat profile anchors in `~/.codex/config.toml`:
 
 ```toml
 [profiles.ouroboros-fast]
-model = "gpt-5.4-mini"
 model_reasoning_effort = "low"
 
 [profiles.ouroboros-standard]
-model = "gpt-5.4"
 model_reasoning_effort = "medium"
 
 [profiles.ouroboros-deep]
-model = "gpt-5.5"
 model_reasoning_effort = "high"
 
 [profiles.ouroboros-frontier]
-model = "gpt-5.5"
 model_reasoning_effort = "xhigh"
 ```
 
-These are intentionally sparse, flat Codex profiles. Codex currently exposes a single `--profile <name>` selector; setup does not depend on unsupported profile-to-profile inheritance. Edit these anchors if your local Codex account does not expose a listed model.
+These are intentionally sparse, flat Codex profiles. Codex currently exposes a single `--profile <name>` selector; setup does not depend on unsupported profile-to-profile inheritance. Setup leaves `model` unset so the generated anchors inherit the user's local Codex default model instead of assuming account access to a specific frontier model. Add a `model = "..."` line to an anchor only when you want to pin a model that your account exposes.
 
 If `~/.codex/config.toml` already contains a URL-based Ouroboros MCP server, setup preserves it instead of replacing it with a stdio command block:
 
