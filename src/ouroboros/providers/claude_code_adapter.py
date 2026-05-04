@@ -645,6 +645,8 @@ class ClaudeCodeAdapter:
         content = ""
         session_id = None
         error_result: ProviderError | None = None
+        finish_reason = "stop"
+        raw_response: dict[str, object] = {"session_id": None}
 
         # Wrap query() to skip unknown message types (e.g., rate_limit_event)
         # that the SDK doesn't recognize yet. Without this, a single
@@ -705,18 +707,56 @@ class ClaudeCodeAdapter:
                     elif not content:
                         content = getattr(sdk_message, "result", "") or ""
 
-                    # Check for errors - don't break, just record
+                    # Check for errors - don't break, just record.
                     is_error = getattr(sdk_message, "is_error", False)
                     if is_error:
+                        subtype = getattr(sdk_message, "subtype", None)
+                        stop_reason = getattr(sdk_message, "stop_reason", None)
+                        errors = getattr(sdk_message, "errors", None)
+                        if subtype == "error_max_turns" and self._is_usable_max_turns_partial(
+                            content,
+                            stop_reason=stop_reason,
+                        ):
+                            # Claude Code can emit a useful AssistantMessage and then
+                            # finish with ResultMessage(error_max_turns) after trying
+                            # to continue with tools. Surface the already-streamed
+                            # text as a truncated partial result instead of crashing
+                            # the interview loop or pretending completion was clean.
+                            finish_reason = "length"
+                            raw_response.update(
+                                {
+                                    "subtype": subtype,
+                                    "stop_reason": stop_reason,
+                                    "errors": errors,
+                                    "partial_result": True,
+                                }
+                            )
+                            log.warning(
+                                "claude_code_adapter.max_turns_partial_result",
+                                session_id=session_id,
+                                content_length=len(content),
+                                max_turns=self._max_turns,
+                                stop_reason=stop_reason,
+                            )
+                            continue
+
                         error_msg = (
                             getattr(sdk_message, "result", "")
                             or "Unknown error from Claude Agent SDK"
                         )
+                        partial_content = content.strip() if subtype == "error_max_turns" else ""
+                        if subtype == "error_max_turns" and partial_content:
+                            error_msg = (
+                                "Claude Agent SDK reached max turns before producing "
+                                "a usable final response"
+                            )
                         log.warning(
                             "claude_code_adapter.sdk_error",
                             error=error_msg,
                             session_id=session_id,
                             stderr_lines=len(stderr_lines),
+                            subtype=subtype,
+                            partial_rejected=bool(partial_content),
                         )
                         error_result = ProviderError(
                             message=error_msg,
@@ -725,6 +765,11 @@ class ClaudeCodeAdapter:
                                 "stderr": "\n".join(stderr_lines[-20:]) if stderr_lines else "",
                                 "claudecode_present": claudecode_present,
                                 "claude_code_entrypoint": os.environ.get("CLAUDE_CODE_ENTRYPOINT"),
+                                "subtype": subtype,
+                                "stop_reason": stop_reason,
+                                "errors": errors,
+                                "partial_content": partial_content or None,
+                                "partial_rejected": bool(partial_content),
                             },
                         )
         except asyncio.CancelledError:
@@ -808,9 +853,11 @@ class ClaudeCodeAdapter:
             "claude_code_adapter.request_completed",
             content_length=len(content),
             session_id=session_id,
+            finish_reason=finish_reason,
         )
 
         # Build response
+        raw_response["session_id"] = session_id
         response = CompletionResponse(
             content=content,
             model=config.model,
@@ -819,11 +866,26 @@ class ClaudeCodeAdapter:
                 completion_tokens=0,
                 total_tokens=0,
             ),
-            finish_reason="stop",
-            raw_response={"session_id": session_id},
+            finish_reason=finish_reason,
+            raw_response=raw_response,
         )
 
         return Result.ok(response)
+
+    @staticmethod
+    def _is_usable_max_turns_partial(content: str, *, stop_reason: object) -> bool:
+        """Return whether max-turn partial text is safe to surface as a completion.
+
+        Claude Code may stream natural-language preambles before attempting a tool
+        call and then finish with ``error_max_turns``. Those preambles are not a
+        final answer, and this provider layer cannot reliably distinguish them by
+        inspecting text shape. Keep tool-use-stopped max-turns on the error path
+        and only surface non-tool-use partials as length-limited completions.
+        """
+        text = content.strip()
+        if not text:
+            return False
+        return stop_reason != "tool_use"
 
     def _format_tool_info(self, tool_name: str, tool_input: dict) -> str:
         """Format tool name and input for display.
