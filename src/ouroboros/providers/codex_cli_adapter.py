@@ -45,7 +45,7 @@ from ouroboros.providers.codex_cli_stream import (
     iter_stream_lines,
     terminate_process,
 )
-from ouroboros.providers.profiles import resolve_completion_profile
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger()
 
@@ -684,7 +684,10 @@ class CodexCliLLMAdapter:
         config: CompletionConfig,
     ) -> Result[CompletionResponse, ProviderError]:
         """Execute a single Codex CLI completion request."""
-        resolved = resolve_completion_profile(config, backend="codex")
+        profile_result = resolve_completion_profile_result(config, backend="codex")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        resolved = profile_result.value
         effective_config = resolved.config
         prompt = self._build_prompt(messages, max_turns=effective_config.max_turns)
         normalized_model = (

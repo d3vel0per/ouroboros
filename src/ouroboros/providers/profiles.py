@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 
 from ouroboros.config.loader import ConfigError, load_config
 from ouroboros.config.models import LLMProviderProfileConfig, LLMTaskProfileConfig
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.types import Result
 from ouroboros.providers.base import CompletionConfig
 
 _BACKEND_ALIASES = {
@@ -162,4 +164,30 @@ def resolve_completion_profile(
     )
 
 
-__all__ = ["ResolvedCompletionProfile", "resolve_completion_profile"]
+def resolve_completion_profile_result(
+    config: CompletionConfig,
+    *,
+    backend: str,
+) -> Result[ResolvedCompletionProfile, ProviderError]:
+    """Resolve a completion profile without leaking ConfigError from adapters."""
+    try:
+        return Result.ok(resolve_completion_profile(config, backend=backend))
+    except ConfigError as exc:
+        return Result.err(
+            ProviderError(
+                message=f"Invalid LLM profile configuration: {exc.message}",
+                provider=backend,
+                details={
+                    "original_exception": type(exc).__name__,
+                    "config_key": getattr(exc, "config_key", None),
+                    "config_file": str(getattr(exc, "config_file", "") or ""),
+                },
+            )
+        )
+
+
+__all__ = [
+    "ResolvedCompletionProfile",
+    "resolve_completion_profile",
+    "resolve_completion_profile_result",
+]

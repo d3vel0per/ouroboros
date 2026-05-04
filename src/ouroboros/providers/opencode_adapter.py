@@ -59,7 +59,7 @@ from ouroboros.providers.codex_cli_stream import (
     iter_stream_lines,
     terminate_process,
 )
-from ouroboros.providers.profiles import resolve_completion_profile
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger()
 
@@ -464,7 +464,10 @@ class OpenCodeLLMAdapter:
             :class:`~ouroboros.providers.base.CompletionResponse` or
             a :class:`~ouroboros.core.errors.ProviderError`.
         """
-        config = resolve_completion_profile(config, backend="opencode").config
+        profile_result = resolve_completion_profile_result(config, backend="opencode")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
         prompt = self._build_prompt(messages, max_turns=config.max_turns)
         if len(prompt) > MAX_LLM_RESPONSE_LENGTH:
             return Result.err(

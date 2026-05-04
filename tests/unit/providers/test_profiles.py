@@ -5,9 +5,12 @@ from unittest.mock import patch
 import pytest
 
 from ouroboros.config.models import OuroborosConfig
-from ouroboros.core.errors import ConfigError
+from ouroboros.core.errors import ConfigError, ProviderError
 from ouroboros.providers.base import CompletionConfig
-from ouroboros.providers.profiles import resolve_completion_profile
+from ouroboros.providers.profiles import (
+    resolve_completion_profile,
+    resolve_completion_profile_result,
+)
 
 
 def test_resolve_completion_profile_uses_codex_backend_profile() -> None:
@@ -321,3 +324,16 @@ def test_resolve_completion_profile_skips_config_load_without_role_or_profile() 
 
     mock_load_config.assert_not_called()
     assert resolved.config is request
+
+
+def test_resolve_completion_profile_result_converts_config_error() -> None:
+    """Adapter-facing wrapper should convert bad profile config to ProviderError."""
+    request = CompletionConfig(model="gpt-4", profile="missing-profile")
+
+    with patch("ouroboros.providers.profiles.load_config", side_effect=ConfigError("bad config")):
+        result = resolve_completion_profile_result(request, backend="litellm")
+
+    assert result.is_err
+    assert isinstance(result.error, ProviderError)
+    assert result.error.provider == "litellm"
+    assert "Invalid LLM profile configuration" in result.error.message

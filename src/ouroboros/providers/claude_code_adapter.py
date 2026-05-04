@@ -46,7 +46,7 @@ from ouroboros.providers.base import (
     MessageRole,
     UsageInfo,
 )
-from ouroboros.providers.profiles import resolve_completion_profile
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger(__name__)
 
@@ -242,7 +242,10 @@ class ClaudeCodeAdapter:
                 )
             )
 
-        config = resolve_completion_profile(config, backend="claude_code").config
+        profile_result = resolve_completion_profile_result(config, backend="claude_code")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
 
         # Extract system messages and pass as system_prompt (not embedded in user prompt)
         system_msgs = [m for m in messages if m.role == MessageRole.SYSTEM]

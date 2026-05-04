@@ -22,7 +22,7 @@ from ouroboros.providers.base import (
     Message,
     UsageInfo,
 )
-from ouroboros.providers.profiles import resolve_completion_profile
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 if TYPE_CHECKING:
     from ouroboros.events.io_recorder import IOJournalRecorder
@@ -390,7 +390,10 @@ class LiteLLMAdapter:
         Returns:
             Result containing either the completion response or a ProviderError.
         """
-        config = resolve_completion_profile(config, backend="litellm").config
+        profile_result = resolve_completion_profile_result(config, backend="litellm")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
 
         # Create the retry-decorated function with instance's max_retries
         @retry_async(
