@@ -215,6 +215,13 @@ class _FakeSession:
         return _ToolResult(self._responses.pop(0))
 
 
+def test_resolve_project_dir_rejects_missing_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="does not exist"):
+        _ralph._resolve_project_dir(str(missing))
+
+
 @pytest.mark.asyncio
 async def test_call_evolve_forwards_project_dir(tmp_path: Path) -> None:
     project_dir = tmp_path / "target repo"

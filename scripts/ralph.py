@@ -51,7 +51,12 @@ def _resolve_project_dir(project_dir: str | None) -> str | None:
     """Return an absolute project directory path for MCP calls."""
     if not project_dir:
         return None
-    return str(Path(project_dir).expanduser().resolve())
+    resolved = Path(project_dir).expanduser().resolve()
+    if not resolved.exists():
+        raise ValueError(f"--project-dir does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValueError(f"--project-dir is not a directory: {resolved}")
+    return str(resolved)
 
 
 def parse_evolve_text(text: str) -> dict[str, Any]:
@@ -279,6 +284,11 @@ def main() -> None:
 
     if not args.lineage_id:
         parser.error("--lineage-id is required")
+
+    try:
+        args.project_dir = _resolve_project_dir(args.project_dir)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     try:
         output = asyncio.run(connect_and_run(args))
