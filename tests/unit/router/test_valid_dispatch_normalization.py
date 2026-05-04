@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from ouroboros.router import (
+    InvalidInputReason,
+    InvalidSkill,
     MCPDispatchTarget,
     NormalizedMCPFrontmatter,
     ParsedOooCommand,
@@ -329,6 +331,25 @@ def test_valid_dispatch_preserves_resume_like_tokens_after_unquoted_goal(
         "max_repair_rounds": "",
         "skip_run": "",
     }
+
+
+def test_valid_dispatch_rejects_missing_value_for_control_option(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto --resume",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, InvalidSkill)
+    assert result.category is InvalidInputReason.TEMPLATE_RESOLUTION_ERROR
+    assert "--resume requires a value" in result.reason
 
 
 def test_valid_dispatch_resolves_resume_option_template_without_goal(

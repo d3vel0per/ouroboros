@@ -446,6 +446,8 @@ def _extract_dispatch_template_values(
             raw_name = option
             option_value = tokens[index + 1]
             index += 1
+        elif option_name in _VALUE_OPTION_NAMES:
+            raise ValueError(f"--{option} requires a value")
         else:
             raw_name = option
             option_value = True
