@@ -128,6 +128,8 @@ async def _run_auto(
             )
             raise ValueError(msg)
         runtime = resolve_agent_runtime_backend(runtime or persisted_runtime)
+        max_interview_rounds = state.max_interview_rounds
+        max_repair_rounds = state.max_repair_rounds
         skip_run = skip_run or state.skip_run
     else:
         if goal is None or not goal.strip():
@@ -136,6 +138,8 @@ async def _run_auto(
         state = AutoPipelineState(goal=goal.strip(), cwd=str(_safe_default_cwd()))
         state.runtime_backend = runtime
         state.skip_run = skip_run
+        state.max_interview_rounds = max_interview_rounds
+        state.max_repair_rounds = max_repair_rounds
 
     if runtime == "opencode":
         opencode_mode = state.opencode_mode or get_opencode_mode()

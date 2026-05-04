@@ -135,6 +135,8 @@ class AutoHandler:
             opencode_mode = _resolved_opencode_mode(
                 runtime_backend, state.opencode_mode or self.opencode_mode
             )
+            max_interview_rounds = state.max_interview_rounds
+            max_repair_rounds = state.max_repair_rounds
             skip_run = requested_skip_run or state.skip_run
         else:
             goal = arguments.get("goal")
@@ -143,8 +145,12 @@ class AutoHandler:
             cwd = str(_resolve_cwd(arguments.get("cwd")))
             runtime_backend = resolve_agent_runtime_backend(self.agent_runtime_backend)
             opencode_mode = _resolved_opencode_mode(runtime_backend, self.opencode_mode)
+            max_interview_rounds = _positive_int_arg(arguments, "max_interview_rounds", 12)
+            max_repair_rounds = _positive_int_arg(arguments, "max_repair_rounds", 5)
             skip_run = requested_skip_run
             state = AutoPipelineState(goal=goal.strip(), cwd=cwd)
+            state.max_interview_rounds = max_interview_rounds
+            state.max_repair_rounds = max_repair_rounds
         state.runtime_backend = runtime_backend
         state.opencode_mode = opencode_mode
         state.skip_run = skip_run
@@ -174,16 +180,14 @@ class AutoHandler:
         driver = AutoInterviewDriver(
             HandlerInterviewBackend(interview_handler, cwd=cwd),
             store=store,
-            max_rounds=_positive_int_arg(arguments, "max_interview_rounds", 12),
+            max_rounds=max_interview_rounds,
         )
         pipeline = AutoPipeline(
             driver,
             HandlerSeedGenerator(generate_seed_handler),
             run_starter=HandlerRunStarter(start_execute, cwd=cwd),
             store=store,
-            repairer=SeedRepairer(
-                max_repair_rounds=_positive_int_arg(arguments, "max_repair_rounds", 5)
-            ),
+            repairer=SeedRepairer(max_repair_rounds=max_repair_rounds),
             seed_saver=save_seed,
             seed_loader=load_seed,
             skip_run=skip_run,

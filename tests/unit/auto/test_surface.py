@@ -469,12 +469,16 @@ async def test_cli_resume_replays_persisted_runtime_and_skip_run(monkeypatch, tm
     state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
     state.runtime_backend = "codex"
     state.skip_run = True
+    state.max_interview_rounds = 2
+    state.max_repair_rounds = 3
     store.save(state)
     captured: dict[str, object] = {}
 
     class FakePipeline:
         def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
             captured["skip_run"] = kwargs.get("skip_run")
+            captured["driver_rounds"] = args[0].max_rounds
+            captured["repair_rounds"] = kwargs["repairer"].max_repair_rounds
 
         async def run(self, run_state):  # noqa: ANN001
             captured["state_runtime"] = run_state.runtime_backend
@@ -510,6 +514,8 @@ async def test_cli_resume_replays_persisted_runtime_and_skip_run(monkeypatch, tm
     assert captured["state_runtime"] == "codex"
     assert captured["state_skip_run"] is True
     assert captured["skip_run"] is True
+    assert captured["driver_rounds"] == 2
+    assert captured["repair_rounds"] == 3
     assert captured["runtimes"] == ["codex", "codex", "codex", "codex"]
 
 
@@ -725,6 +731,8 @@ async def test_cli_fresh_auto_uses_safe_default_cwd(monkeypatch, tmp_path) -> No
     class FakePipeline:
         def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
             captured["skip_run"] = kwargs.get("skip_run")
+            captured["driver_rounds"] = args[0].max_rounds
+            captured["repair_rounds"] = kwargs["repairer"].max_repair_rounds
 
         async def run(self, run_state):  # noqa: ANN001
             captured["cwd"] = run_state.cwd
@@ -984,12 +992,16 @@ async def test_auto_handler_resume_uses_persisted_cwd_without_revalidating_serve
     store = AutoStore(tmp_path)
     state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path / "project"))
     state.runtime_backend = "codex"
+    state.max_interview_rounds = 2
+    state.max_repair_rounds = 3
     store.save(state)
     captured: dict[str, object] = {}
 
     class FakePipeline:
         def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
             captured["skip_run"] = kwargs.get("skip_run")
+            captured["driver_rounds"] = args[0].max_rounds
+            captured["repair_rounds"] = kwargs["repairer"].max_repair_rounds
 
         async def run(self, run_state):  # noqa: ANN001
             captured["cwd"] = run_state.cwd
@@ -1015,6 +1027,44 @@ async def test_auto_handler_resume_uses_persisted_cwd_without_revalidating_serve
 
     assert result.is_ok
     assert captured["cwd"] == str(tmp_path / "project")
+    assert captured["driver_rounds"] == 2
+    assert captured["repair_rounds"] == 3
+
+
+def test_auto_state_persists_loop_bounds() -> None:
+    from ouroboros.auto.state import AutoPipelineState
+
+    state = AutoPipelineState(goal="Build a CLI", cwd="/repo")
+    state.max_interview_rounds = 2
+    state.max_repair_rounds = 3
+
+    restored = AutoPipelineState.from_dict(state.to_dict())
+
+    assert restored.max_interview_rounds == 2
+    assert restored.max_repair_rounds == 3
+
+
+def test_auto_state_loads_legacy_sessions_with_default_loop_bounds() -> None:
+    from ouroboros.auto.state import AutoPipelineState
+
+    payload = AutoPipelineState(goal="Build a CLI", cwd="/repo").to_dict()
+    payload.pop("max_interview_rounds")
+    payload.pop("max_repair_rounds")
+
+    restored = AutoPipelineState.from_dict(payload)
+
+    assert restored.max_interview_rounds == 12
+    assert restored.max_repair_rounds == 5
+
+
+def test_auto_state_rejects_invalid_loop_bounds() -> None:
+    from ouroboros.auto.state import AutoPipelineState
+
+    payload = AutoPipelineState(goal="Build a CLI", cwd="/repo").to_dict()
+    payload["max_interview_rounds"] = True
+
+    with pytest.raises(ValueError, match="max_interview_rounds"):
+        AutoPipelineState.from_dict(payload)
 
 
 @pytest.mark.asyncio
