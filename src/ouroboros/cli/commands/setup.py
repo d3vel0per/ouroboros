@@ -299,7 +299,10 @@ _CODEX_ROLE_MODEL_OVERRIDE_DEFAULTS: dict[str, tuple[tuple[tuple[str, ...], obje
     "dependency_analysis": ((("llm", "dependency_analysis_model"), "claude-opus-4-6"),),
     "double_diamond": ((("execution", "double_diamond_model"), "claude-opus-4-6"),),
     "mechanical_detection": ((("evaluation", "assertion_extraction_model"), "claude-sonnet-4-6"),),
-    "ontology_analysis": ((("llm", "ontology_analysis_model"), "claude-opus-4-6"),),
+    "ontology_analysis": (
+        (("llm", "ontology_analysis_model"), "claude-opus-4-6"),
+        (("consensus", "devil_model"), "openrouter/openai/gpt-4o"),
+    ),
     "pm_interview": ((("clarification", "default_model"), "claude-opus-4-6"),),
     "qa": ((("llm", "qa_model"), "claude-sonnet-4-20250514"),),
     "reflect": ((("resilience", "reflect_model"), "claude-opus-4-6"),),

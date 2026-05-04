@@ -419,6 +419,7 @@ class TestCodexSetup:
         assert "semantic_evaluation" not in config_dict["llm_role_profiles"]
         assert "consensus_advocate" not in config_dict["llm_role_profiles"]
         assert "consensus_judge" not in config_dict["llm_role_profiles"]
+        assert "ontology_analysis" not in config_dict["llm_role_profiles"]
 
     def test_setup_codex_preserves_pinned_legacy_default_model(self, tmp_path: Path) -> None:
         """Presence of a legacy model key should count as an explicit user override."""
