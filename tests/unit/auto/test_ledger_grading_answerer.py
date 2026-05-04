@@ -228,6 +228,68 @@ def test_auto_answerer_allows_product_domain_file_removal_questions() -> None:
     assert answer.source != AutoAnswerSource.BLOCKER
 
 
+def test_auto_answerer_allows_git_product_branch_deletion_questions() -> None:
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a Git branch manager")
+
+    examples = (
+        "Should users be able to delete the branch?",
+        "Should the app delete the branch automatically?",
+        "Should the tool remove the branch after merge?",
+    )
+
+    answers = [answerer.answer(question, ledger) for question in examples]
+
+    assert all(answer.blocker is None for answer in answers)
+    assert all(answer.source != AutoAnswerSource.BLOCKER for answer in answers)
+    assert all("product behavior" in answer.text.lower() for answer in answers)
+
+
+def test_auto_answerer_preserves_product_behavior_phrasing_variants() -> None:
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a compliance SaaS")
+
+    examples = (
+        "Should legal documents be editable?",
+        "Should users subscribe to paid service tiers?",
+        "Should legal review workflows be tracked?",
+        "Which password rules should the signup form enforce?",
+    )
+
+    answers = [answerer.answer(question, ledger) for question in examples]
+
+    assert all(answer.blocker is None for answer in answers)
+    assert all(answer.source != AutoAnswerSource.BLOCKER for answer in answers)
+    assert all("product behavior" in answer.text.lower() for answer in answers)
+
+
+def test_auto_answerer_preserves_passive_product_behavior_variants() -> None:
+    answerer = AutoAnswerer()
+    ledger = SeedDraftLedger.from_goal("Build a source-control compliance tool")
+
+    examples = (
+        "Should branches be deleted after merge?",
+        "Should API keys be removed after rotation?",
+        "Should legal documents be edited?",
+    )
+
+    answers = [answerer.answer(question, ledger) for question in examples]
+
+    assert all(answer.blocker is None for answer in answers)
+    assert all(answer.source != AutoAnswerSource.BLOCKER for answer in answers)
+    assert all("product behavior" in answer.text.lower() for answer in answers)
+
+
+def test_auto_answerer_still_blocks_current_branch_deletion_authority() -> None:
+    answer = AutoAnswerer().answer(
+        "Should we delete the current branch?",
+        SeedDraftLedger.from_goal("Clean up repository branches"),
+    )
+
+    assert answer.blocker is not None
+    assert answer.source == AutoAnswerSource.BLOCKER
+
+
 def test_auto_answerer_returns_blocker_for_plain_secret_questions() -> None:
     answer = AutoAnswerer().answer(
         "Which secret should the workflow use?",
@@ -726,3 +788,35 @@ def test_auto_answerer_allows_user_managed_token_and_key_product_questions() -> 
         answer = answerer.answer(question, SeedDraftLedger.from_goal("Build identity settings"))
         assert answer.blocker is None
         assert "product behavior" in answer.text.lower()
+
+
+def test_auto_answerer_allows_production_credential_product_semantics() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        "Should users be able to configure production credentials?",
+        "Should the app store production credentials?",
+        "What credential fields should the production settings form display?",
+    )
+
+    for question in questions:
+        answer = answerer.answer(
+            question,
+            SeedDraftLedger.from_goal("Build credential management settings"),
+        )
+        assert answer.blocker is None
+        assert answer.source != AutoAnswerSource.BLOCKER
+        assert "product behavior" in answer.text.lower()
+
+
+def test_auto_answerer_still_blocks_real_production_credential_authority() -> None:
+    answerer = AutoAnswerer()
+    questions = (
+        "Which credential value should production use?",
+        "Which credentials should CI configure for production?",
+        "Use the production credential secret for deployment?",
+    )
+
+    for question in questions:
+        answer = answerer.answer(question, SeedDraftLedger.from_goal("Deploy a service"))
+        assert answer.blocker is not None
+        assert answer.source == AutoAnswerSource.BLOCKER

@@ -387,7 +387,7 @@ def _slug_key(value: str) -> str:
 def _is_product_behavior_question(lowered: str) -> bool:
     return bool(
         re.search(
-            r"\b(should|must|can|will|do|does|is|are)\b.+\b(mark|marked|show|display|write|return|create|update|edit|delete|remove|rotate|store|save|send|generate|filter|sort|search|export|import|notify|report|use)\b",
+            r"\b(should|must|can|will|do|does|is|are)\b.+\b(mark|marked|show|display|write|return|create|update|edit|delete|remove|rotate|store|save|send|generate|filter|sort|search|export|import|notify|report|use|configure)\b",
             lowered,
         )
         or re.search(r"\bwhat\s+(output|input)\b.+\b(should|does|do|format|write|use)\b", lowered)
@@ -396,10 +396,28 @@ def _is_product_behavior_question(lowered: str) -> bool:
             lowered,
         )
         or re.search(
+            r"\bwhat\b.+\b(fields?|settings?)\b.+\b(should|does|do)\b.+\b(display|show|store|use)\b",
+            lowered,
+        )
+        or re.search(
             r"\bhow\s+should\b.+\b(behave|work|display|return|write|store|mark)\b", lowered
         )
         or re.search(
             r"\b(which|what)\b.+\b(can|should)\b.+\b(edit|delete|remove|update|create|view|access)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(should|must|can|will|do|does|is|are)\b.+\b(be|become)\s+"
+            r"(editable|edited|deleted|removed|trackable|tracked|enforced|configurable|visible|searchable|exportable|importable)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(should|must|can|will|do|does)\b.+\b(subscribe|track|enforce)\b",
+            lowered,
+        )
+        or re.search(
+            r"\b(which|what)\b.+\b(rules?|polic(?:y|ies)|workflows?|documents?|tiers?)\b.+"
+            r"\b(should|must|can|will|do|does|enforce|track|edit|subscribe)\b",
             lowered,
         )
     )
@@ -447,8 +465,67 @@ def _latest_resolved_goal(ledger: SeedDraftLedger) -> str:
     return ""
 
 
+def _is_safe_product_branch_question(lowered: str) -> bool:
+    return bool(
+        _matches_any(
+            lowered,
+            (
+                r"\b(users?|customers?|admins?|maintainers?|owners?)\b.+\b(delete|remove)\b.+\b(branch|branches)\b",
+                r"\b(app|application|tool|system|service|cli|workflow|feature)\b.+\b(delete|remove)\b.+\b(branch|branches)\b",
+            ),
+        )
+        and _is_product_behavior_question(lowered)
+        and not re.search(
+            r"\b(current|this|production|prod|live|external|remote|local)\b.+\b(branch|branches)\b",
+            lowered,
+        )
+    )
+
+
+def _asks_for_sensitive_value_or_authority(lowered: str) -> bool:
+    """Return True when the question asks auto mode to choose/use real secrets."""
+    return bool(
+        _matches_any(
+            lowered,
+            (
+                r"\b(provide|enter|paste|supply)\b.+\b(credential|credentials|secret|token|key|password)\b",
+                r"\b(credential|credentials|secret|token|key|password)\b.+\b(value|secret)\b",
+                r"\b(which|what)\b.+\b(credential|credentials|access token|auth token|private key|api key|password|secret)\b.+\b(use|configure|set|env|environment|workflow|ci)\b",
+                r"\b(which|what)\b.+\b(value|secret)\b.+\b(credential|credentials|access token|auth token|private key|api key|password)\b",
+                r"\b(use|configure|set)\b.+\b(production|prod|live|external)\b.+\b(credential|credentials|secret|api key|private key|access token|auth token)\b",
+                r"\b(use|configure|set)\b.+\b(credential|credentials|secret|api key|private key|access token|auth token)\b.+\b(production|prod|live|external)\b",
+            ),
+        )
+    )
+
+
+def _is_safe_product_sensitive_question(lowered: str) -> bool:
+    """Allow product-semantics questions that mention sensitive-domain nouns.
+
+    Auto mode must not invent real credential values or production authority,
+    but it can answer bounded requirements questions about product-managed
+    credential/token/key/secret features.  These questions are routed to the
+    product-behavior answerer so the Seed keeps the requested semantics.
+    """
+    if not _is_product_behavior_question(lowered):
+        return False
+    if _asks_for_sensitive_value_or_authority(lowered):
+        return False
+    return bool(
+        _matches_any(
+            lowered,
+            (
+                r"\b(users?|customers?|admins?|maintainers?|owners?|the app|app|system|settings form)\b.+\b(credential|credentials|secret|token|tokens|api keys?|private keys?|passwords?)\b",
+                r"\b(credential|credentials|secret|token|tokens|api keys?|private keys?|passwords?)\b.+\b(fields?|settings?|form|login|authentication|rotation|display|store|save|delete|remove)\b",
+            ),
+        )
+    )
+
+
 def _blocker_for(question: str) -> AutoBlocker | None:
     lowered = question.lower()
+    if _is_safe_product_branch_question(lowered) or _is_safe_product_sensitive_question(lowered):
+        return None
 
     external_action_patterns = (
         (
