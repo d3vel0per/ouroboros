@@ -72,7 +72,7 @@ def auto_command(
     The command returns execution IDs after the run starts; it does not wait
     indefinitely for long-running execution completion.
     """
-    if not resume and not goal:
+    if not resume and (goal is None or not goal.strip()):
         print_error("goal is required unless --resume is provided")
         raise typer.Exit(1)
     try:
@@ -100,8 +100,8 @@ def _safe_default_cwd() -> Path:
     cwd = Path.cwd()
     if cwd == Path("/"):
         return Path.home()
-    if not os.access(cwd, os.W_OK):
-        msg = f"current working directory is not writable: {cwd}"
+    if not os.access(cwd, os.W_OK | os.X_OK):
+        msg = f"current working directory is not writable/searchable: {cwd}"
         raise ValueError(msg)
     return cwd
 
@@ -130,8 +130,10 @@ async def _run_auto(
         runtime = resolve_agent_runtime_backend(runtime)
         skip_run = skip_run or state.skip_run
     else:
+        if goal is None or not goal.strip():
+            raise ValueError("goal is required when not resuming")
         runtime = resolve_agent_runtime_backend(runtime)
-        state = AutoPipelineState(goal=goal or "", cwd=str(_safe_default_cwd()))
+        state = AutoPipelineState(goal=goal.strip(), cwd=str(_safe_default_cwd()))
         state.runtime_backend = runtime
         state.skip_run = skip_run
 

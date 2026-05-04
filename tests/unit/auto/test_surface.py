@@ -409,6 +409,15 @@ def test_auto_handler_explicit_cwd_rejects_non_writable_project(monkeypatch, tmp
         _resolve_cwd(str(tmp_path))
 
 
+def test_auto_handler_explicit_cwd_rejects_non_searchable_project(monkeypatch, tmp_path) -> None:
+    from ouroboros.mcp.tools import auto_handler as auto_module
+
+    monkeypatch.setattr(auto_module.os, "access", lambda _path, mode: mode == auto_module.os.W_OK)
+
+    with pytest.raises(ValueError, match="not writable"):
+        _resolve_cwd(str(tmp_path))
+
+
 def test_auto_handler_explicit_relative_cwd_is_persisted_as_absolute(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "project").mkdir()
@@ -611,6 +620,31 @@ async def test_cli_resume_rejects_runtime_mismatch(monkeypatch, tmp_path) -> Non
             max_repair_rounds=1,
             skip_run=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_cli_fresh_auto_rejects_blank_goal() -> None:
+    from ouroboros.cli.commands import auto as auto_command
+
+    with pytest.raises(ValueError, match="goal is required"):
+        await auto_command._run_auto(
+            goal="   ",
+            resume=None,
+            runtime=None,
+            max_interview_rounds=1,
+            max_repair_rounds=1,
+            skip_run=False,
+        )
+
+
+def test_cli_default_cwd_rejects_non_searchable_project(monkeypatch, tmp_path) -> None:
+    from ouroboros.cli.commands import auto as auto_command
+
+    monkeypatch.setattr(Path, "cwd", lambda: tmp_path)
+    monkeypatch.setattr(auto_command.os, "access", lambda _path, mode: mode == auto_command.os.W_OK)
+
+    with pytest.raises(ValueError, match="not writable"):
+        auto_command._safe_default_cwd()
 
 
 @pytest.mark.asyncio
