@@ -300,10 +300,13 @@ def _execution_start_handler(
         handler, "_execute_handler", None
     )
     llm_adapter = getattr(original_execute, "llm_adapter", None)
+    resolved_llm_backend = (
+        llm_backend if llm_backend is not None else getattr(original_execute, "llm_backend", None)
+    )
     execute_seed = ExecuteSeedHandler(
         event_store=event_store,
         llm_adapter=llm_adapter,
-        llm_backend=llm_backend,
+        llm_backend=resolved_llm_backend,
         agent_runtime_backend=agent_runtime_backend,
         opencode_mode=opencode_mode,
         mcp_manager=mcp_manager,

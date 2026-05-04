@@ -21,6 +21,18 @@ from ouroboros.mcp.tools.execution_handlers import ExecuteSeedHandler, StartExec
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
 
 
+def test_cli_auto_runtime_enum_matches_supported_backends() -> None:
+    from ouroboros.cli.commands.auto import AgentRuntimeBackend
+
+    assert {item.value for item in AgentRuntimeBackend} == {
+        "claude",
+        "codex",
+        "opencode",
+        "hermes",
+        "gemini",
+    }
+
+
 def test_cli_auto_help_is_registered() -> None:
     result = CliRunner().invoke(app, ["auto", "--help"])
 
@@ -241,6 +253,7 @@ def test_auto_handler_rebuilds_injected_execution_handler_for_persisted_runtime(
     adapter = object()
     execute_handler = ExecuteSeedHandler(
         llm_adapter=adapter,
+        llm_backend="anthropic",
         agent_runtime_backend="codex",
         opencode_mode=None,
     )
@@ -267,6 +280,7 @@ def test_auto_handler_rebuilds_injected_execution_handler_for_persisted_runtime(
     assert normalized.execute_handler.agent_runtime_backend == "opencode"
     assert normalized.execute_handler.opencode_mode == "subprocess"
     assert normalized.execute_handler.llm_adapter is adapter
+    assert normalized.execute_handler.llm_backend == "anthropic"
 
 
 def test_auto_handler_fresh_execution_preserves_bridge_wiring() -> None:
@@ -629,6 +643,7 @@ async def test_auto_handler_resume_rebuilds_injected_handlers_for_persisted_runt
             captured["run_runtime"] = run_starter.handler.agent_runtime_backend
             captured["run_mode"] = run_starter.handler.opencode_mode
             captured["run_adapter"] = run_starter.handler.execute_handler.llm_adapter
+            captured["run_llm_backend"] = run_starter.handler.execute_handler.llm_backend
             captured["run_mcp_manager"] = run_starter.handler.execute_handler.mcp_manager
             captured["run_mcp_prefix"] = run_starter.handler.execute_handler.mcp_tool_prefix
 
@@ -652,6 +667,7 @@ async def test_auto_handler_resume_rebuilds_injected_handlers_for_persisted_runt
         start_execute_seed_handler=StartExecuteSeedHandler(
             execute_handler=ExecuteSeedHandler(
                 llm_adapter=adapter,
+                llm_backend="anthropic",
                 agent_runtime_backend="codex",
                 opencode_mode=None,
             ),
@@ -673,6 +689,7 @@ async def test_auto_handler_resume_rebuilds_injected_handlers_for_persisted_runt
         "run_runtime": "opencode",
         "run_mode": "subprocess",
         "run_adapter": adapter,
+        "run_llm_backend": "anthropic",
         "run_mcp_manager": manager,
         "run_mcp_prefix": "bridge__",
     }

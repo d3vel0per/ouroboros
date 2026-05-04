@@ -35,6 +35,8 @@ class AgentRuntimeBackend(str, Enum):  # noqa: UP042
     CLAUDE = "claude"
     CODEX = "codex"
     OPENCODE = "opencode"
+    HERMES = "hermes"
+    GEMINI = "gemini"
 
 
 app = typer.Typer(
