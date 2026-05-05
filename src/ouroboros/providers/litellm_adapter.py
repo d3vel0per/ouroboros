@@ -15,12 +15,14 @@ from ouroboros.core.errors import ProviderError
 from ouroboros.core.retry import retry_async
 from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
 from ouroboros.core.types import Result
+from ouroboros.events.io_recorder import get_current_io_journal_recorder
 from ouroboros.providers.base import (
     CompletionConfig,
     CompletionResponse,
     Message,
     UsageInfo,
 )
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 if TYPE_CHECKING:
     from ouroboros.events.io_recorder import IOJournalRecorder
@@ -388,6 +390,10 @@ class LiteLLMAdapter:
         Returns:
             Result containing either the completion response or a ProviderError.
         """
+        profile_result = resolve_completion_profile_result(config, backend="litellm")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
 
         # Create the retry-decorated function with instance's max_retries
         @retry_async(
@@ -398,7 +404,7 @@ class LiteLLMAdapter:
             wait_jitter=1.0,
         )
         async def _with_retry() -> CompletionResponse:
-            recorder = self._io_recorder
+            recorder = get_current_io_journal_recorder() or self._io_recorder
             if recorder is None or not recorder.is_active:
                 response = await self._raw_complete(messages, config)
                 return self._parse_response(response, config)

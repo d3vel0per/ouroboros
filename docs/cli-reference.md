@@ -40,6 +40,7 @@ ouroboros [OPTIONS] COMMAND [ARGS]...
 |---------|-------------|
 | `setup` | Detect runtimes and configure Ouroboros for your environment |
 | `init` | Start interactive interview to refine requirements |
+| `auto` | Run bounded goal → A-grade Seed → execution handoff pipeline |
 | `run` | Execute Ouroboros workflows |
 | `cancel` | Cancel stuck or orphaned executions |
 | `config` | Manage Ouroboros configuration (show, switch backend, set values) |
@@ -48,6 +49,30 @@ ouroboros [OPTIONS] COMMAND [ARGS]...
 | `tui` | Interactive TUI monitor for real-time workflow monitoring |
 | `monitor` | Shorthand for `tui monitor` |
 | `mcp` | MCP server commands for Claude Desktop and other MCP clients |
+
+---
+
+
+## `ouroboros auto`
+
+Run the full-quality auto pipeline from a single goal. This is the CLI equivalent of `ooo auto` in agent sessions.
+
+```bash
+ouroboros auto "Build a local-first habit tracker CLI"
+```
+
+**Options:**
+
+| Option | Description |
+|--------|-------------|
+| `--resume TEXT` | Resume an existing auto session id |
+| `--runtime claude|codex|opencode` | Runtime backend for execution handoff |
+| `--max-interview-rounds INTEGER` | Maximum automatic interview rounds; prevents unbounded interview loops |
+| `--max-repair-rounds INTEGER` | Maximum Seed repair rounds; prevents unbounded repair loops |
+| `--skip-run` | Stop after creating an A-grade Seed |
+| `--show-ledger` | Print assumptions and non-goals captured during auto convergence |
+
+Auto mode starts execution only after the generated Seed reaches A-grade. If a phase times out or hits a hard blocker, the command prints the auto session id and a resume command instead of hanging indefinitely.
 
 ---
 
@@ -787,6 +812,11 @@ The table below covers the most commonly used variables. For the full list — i
 | `OUROBOROS_CLI_PATH` | `orchestrator.cli_path` | Path to the Claude CLI binary |
 | `OUROBOROS_CODEX_CLI_PATH` | `orchestrator.codex_cli_path` | Path to the Codex CLI binary |
 | `OUROBOROS_OPENCODE_CLI_PATH` | `orchestrator.opencode_cli_path` | Path to the OpenCode CLI binary |
+| `OUROBOROS_MCP_TOOL_TIMEOUT_SECONDS` | `runtime_controls.mcp_tool_timeout_seconds` | Optional adapter-level MCP timeout; `0` disables the fixed wall-clock cap |
+| `OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS` | `runtime_controls.generation_idle_timeout_seconds` | Stop an evolve generation after no lineage/execution activity is observed |
+| `OUROBOROS_GENERATION_NO_PROGRESS_TIMEOUT_SECONDS` | `runtime_controls.generation_no_progress_timeout_seconds` | Stop an evolve generation after activity continues without material progress |
+| `OUROBOROS_GENERATION_SAFETY_TIMEOUT_SECONDS` | `runtime_controls.generation_safety_timeout_seconds` | Optional final hard cap for one generation; `0` disables it |
+| `OUROBOROS_WATCHDOG_POLL_SECONDS` | `runtime_controls.watchdog_poll_seconds` | EventStore polling interval for generation watchdog decisions |
 
 ---
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import structlog
 
@@ -20,6 +20,9 @@ from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
 from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
 from ouroboros.providers.gemini_cli_adapter import GeminiCLIAdapter
 from ouroboros.providers.opencode_adapter import OpenCodeLLMAdapter
+
+if TYPE_CHECKING:
+    from ouroboros.events.io_recorder import IOJournalRecorder
 
 log = structlog.get_logger(__name__)
 
@@ -114,6 +117,7 @@ def create_llm_adapter(
     api_base: str | None = None,
     timeout: float | None = None,
     max_retries: int = 3,
+    io_recorder: IOJournalRecorder | None = None,
 ) -> LLMAdapter:
     """Create an LLM adapter from config or explicit options."""
     resolved_backend = resolve_llm_backend(backend)
@@ -141,6 +145,12 @@ def create_llm_adapter(
         permission_mode=permission_mode,
         use_case=use_case,
     )
+    if io_recorder is not None and resolved_backend != "litellm":
+        log.warning(
+            "create_llm_adapter.io_recorder_unsupported_backend",
+            backend=resolved_backend,
+            hint="Only LiteLLM currently accepts adapter-level IOJournalRecorder wiring.",
+        )
     if resolved_backend == "claude_code":
         return ClaudeCodeAdapter(
             permission_mode=resolved_permission_mode,
@@ -199,6 +209,7 @@ def create_llm_adapter(
         api_base=api_base,
         timeout=timeout,
         max_retries=max_retries,
+        io_recorder=io_recorder,
     )
 
 

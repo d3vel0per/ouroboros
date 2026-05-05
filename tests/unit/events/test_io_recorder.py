@@ -30,7 +30,11 @@ from ouroboros.events.io import (
     PrivacyMode,
     content_hash,
 )
-from ouroboros.events.io_recorder import IOJournalRecorder
+from ouroboros.events.io_recorder import (
+    IOJournalRecorder,
+    get_current_io_journal_recorder,
+    use_io_journal_recorder,
+)
 
 
 class _FakeEventStore:
@@ -44,6 +48,40 @@ class _FakeEventStore:
 class _BrokenEventStore:
     async def append(self, event: BaseEvent) -> None:
         raise RuntimeError("simulated EventStore outage")
+
+
+def test_scoped_recorder_context_resets_after_exit() -> None:
+    recorder = IOJournalRecorder(
+        event_store=_FakeEventStore(),
+        target_type="execution",
+        target_id="exec_ctx",
+    )
+
+    assert get_current_io_journal_recorder() is None
+    with use_io_journal_recorder(recorder):
+        assert get_current_io_journal_recorder() is recorder
+    assert get_current_io_journal_recorder() is None
+
+
+@pytest.mark.asyncio
+async def test_scoped_recorder_context_is_inherited_by_child_tasks() -> None:
+    recorder = IOJournalRecorder(
+        event_store=_FakeEventStore(),
+        target_type="execution",
+        target_id="exec_child",
+    )
+    release = asyncio.Event()
+
+    async def child() -> IOJournalRecorder | None:
+        await release.wait()
+        return get_current_io_journal_recorder()
+
+    with use_io_journal_recorder(recorder):
+        task = asyncio.create_task(child())
+
+    assert get_current_io_journal_recorder() is None
+    release.set()
+    assert await task is recorder
 
 
 @pytest.mark.asyncio

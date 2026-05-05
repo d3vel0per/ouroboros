@@ -12,6 +12,8 @@ from ouroboros.config.models import (
     EvaluationConfig,
     ExecutionConfig,
     LLMConfig,
+    LLMProviderProfileConfig,
+    LLMTaskProfileConfig,
     LoggingConfig,
     ModelConfig,
     OrchestratorConfig,
@@ -19,6 +21,7 @@ from ouroboros.config.models import (
     PersistenceConfig,
     ProviderCredentials,
     ResilienceConfig,
+    RuntimeControlsConfig,
     RuntimeProfileConfig,
     TierConfig,
     get_config_dir,
@@ -214,6 +217,37 @@ class TestLLMConfig:
         assert config.backend == "opencode"
 
 
+class TestLLMTaskProfileConfig:
+    """Test provider-neutral LLM task profile configuration."""
+
+    def test_llm_task_profile_config_creation(self) -> None:
+        """Task profiles store portable defaults and provider overrides."""
+        profile = LLMTaskProfileConfig(
+            temperature=0.2,
+            max_tokens=2048,
+            max_turns=1,
+            providers={
+                "codex": LLMProviderProfileConfig(
+                    profile="ouroboros-fast",
+                    model="gpt-5.3-codex-spark",
+                ),
+            },
+        )
+
+        assert profile.temperature == 0.2
+        assert profile.max_tokens == 2048
+        assert profile.max_turns == 1
+        assert profile.providers["codex"].profile == "ouroboros-fast"
+        assert profile.providers["codex"].model == "gpt-5.3-codex-spark"
+
+    def test_llm_task_profile_bounds(self) -> None:
+        """Task profile numeric fields are validated."""
+        with pytest.raises(ValidationError):
+            LLMTaskProfileConfig(temperature=3.0)
+        with pytest.raises(ValidationError):
+            LLMProviderProfileConfig(max_turns=0)
+
+
 class TestExecutionConfig:
     """Test ExecutionConfig for Phase 2 settings."""
 
@@ -268,6 +302,41 @@ class TestResilienceConfig:
             ResilienceConfig(lateral_temperature=-0.1)
         with pytest.raises(ValidationError):
             ResilienceConfig(lateral_temperature=2.5)
+
+
+class TestRuntimeControlsConfig:
+    """Test RuntimeControlsConfig for long-running workflow controls."""
+
+    def test_runtime_controls_defaults_are_progress_aware(self) -> None:
+        """Defaults avoid fixed MCP wall-clock timeout for evolve_step."""
+        config = RuntimeControlsConfig()
+        assert config.mcp_tool_timeout_seconds == 0
+        assert config.generation_idle_timeout_seconds == 7200
+        assert config.generation_no_progress_timeout_seconds == 14400
+        assert config.generation_safety_timeout_seconds == 0
+        assert config.watchdog_poll_seconds == 15.0
+
+    def test_runtime_controls_allow_simple_tuning(self) -> None:
+        """Runtime controls are obvious non-negative second values."""
+        config = RuntimeControlsConfig(
+            mcp_tool_timeout_seconds=30,
+            generation_idle_timeout_seconds=120,
+            generation_no_progress_timeout_seconds=600,
+            generation_safety_timeout_seconds=3600,
+            watchdog_poll_seconds=2.5,
+        )
+        assert config.mcp_tool_timeout_seconds == 30
+        assert config.generation_idle_timeout_seconds == 120
+        assert config.generation_no_progress_timeout_seconds == 600
+        assert config.generation_safety_timeout_seconds == 3600
+        assert config.watchdog_poll_seconds == 2.5
+
+    def test_runtime_controls_reject_invalid_values(self) -> None:
+        """Invalid runtime-control values fail validation clearly."""
+        with pytest.raises(ValidationError):
+            RuntimeControlsConfig(generation_idle_timeout_seconds=-1)
+        with pytest.raises(ValidationError):
+            RuntimeControlsConfig(watchdog_poll_seconds=0)
 
 
 class TestEvaluationConfig:
@@ -425,9 +494,28 @@ class TestOuroborosConfig:
         assert config.resilience is not None
         assert config.evaluation is not None
         assert config.consensus is not None
+        assert config.llm_profiles == {}
+        assert config.llm_role_profiles == {}
         assert config.persistence is not None
         assert config.drift is not None
+        assert config.runtime_controls is not None
         assert config.logging is not None
+
+    def test_ouroboros_config_accepts_llm_profiles(self) -> None:
+        """OuroborosConfig stores task profiles and role mappings."""
+        config = OuroborosConfig(
+            llm_profiles={
+                "fast": {
+                    "temperature": 0.2,
+                    "providers": {"codex": {"profile": "ouroboros-fast"}},
+                },
+            },
+            llm_role_profiles={"qa": "fast"},
+        )
+
+        assert config.llm_role_profiles["qa"] == "fast"
+        assert config.llm_profiles["fast"].temperature == 0.2
+        assert config.llm_profiles["fast"].providers["codex"].profile == "ouroboros-fast"
 
     def test_ouroboros_config_is_frozen(self) -> None:
         """OuroborosConfig is immutable."""
@@ -447,6 +535,12 @@ class TestOrchestratorConfig:
         assert config.opencode_permission_mode == "bypassPermissions"
         assert config.codex_cli_path is None
         assert config.opencode_cli_path is None
+        assert config.usage_limit_pause_hours == 5.0
+
+    def test_orchestrator_config_rejects_nonpositive_usage_limit_pause(self) -> None:
+        """Usage-limit pause duration must be positive."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(usage_limit_pause_hours=0)
 
     def test_orchestrator_config_expands_codex_cli_path(self) -> None:
         """Expands ~ in codex_cli_path."""
@@ -478,25 +572,6 @@ class TestOrchestratorConfig:
         assert config.runtime_backend == "gemini"
         assert config.gemini_cli_path is not None
         assert "~" not in config.gemini_cli_path
-
-    def test_runtime_profile_backend_profile_accepts_future_values(self) -> None:
-        """Shared config allows backend-local resolvers to handle unknown names."""
-        profile = RuntimeProfileConfig(backend_profile="future-worker")
-
-        assert profile.backend_profile == "future-worker"
-
-    def test_runtime_profile_backend_profile_strips_whitespace(self) -> None:
-        """Backend-native profile names are normalized before resolver lookup."""
-        profile = RuntimeProfileConfig(backend_profile=" worker ")
-
-        assert profile.backend_profile == "worker"
-
-    def test_runtime_profile_backend_profile_rejects_empty_string(self) -> None:
-        """Empty profile names are invalid even though vocabulary is backend-local."""
-        with pytest.raises(ValidationError) as exc_info:
-            RuntimeProfileConfig(backend_profile=" ")
-
-        assert "runtime_profile.backend_profile" in str(exc_info.value)
 
 
 class TestGetDefaultConfig:
@@ -582,3 +657,23 @@ class TestGetConfigDir:
         config_dir = get_config_dir()
         assert config_dir.parent == Path.home()
         assert config_dir.name == ".ouroboros"
+
+class TestRuntimeProfileConfig:
+    def test_runtime_profile_backend_profile_accepts_future_values(self) -> None:
+        profile = RuntimeProfileConfig(backend_profile="future-worker")
+        assert profile.backend_profile == "future-worker"
+
+    def test_runtime_profile_backend_profile_strips_whitespace(self) -> None:
+        profile = RuntimeProfileConfig(backend_profile=" worker ")
+        assert profile.backend_profile == "worker"
+
+    def test_runtime_profile_backend_profile_rejects_empty_string(self) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            RuntimeProfileConfig(backend_profile="   ")
+        assert "runtime_profile.backend_profile" in str(exc_info.value)
+
+    def test_orchestrator_runtime_profile_string_shorthand(self) -> None:
+        config = OrchestratorConfig(runtime_profile="worker")
+        assert config.runtime_profile is not None
+        assert config.runtime_profile.backend_profile == "worker"
+
