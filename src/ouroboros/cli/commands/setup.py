@@ -610,14 +610,23 @@ def _register_codex_worker_profile() -> None:
     if codex_config.exists():
         raw = codex_config.read_text(encoding="utf-8")
         try:
-            tomllib.loads(raw)
-        except tomllib.TOMLDecodeError:
+            _existing_codex_profile_names(raw)
+        except (tomllib.TOMLDecodeError, ValueError) as exc:
             print_error(f"Could not parse {codex_config} — skipping worker-profile registration.")
+            print_info(str(exc))
             return
     else:
         raw = ""
 
     updated_raw, existed_before = _upsert_codex_worker_profile_section(raw)
+    try:
+        tomllib.loads(updated_raw)
+    except tomllib.TOMLDecodeError as exc:
+        print_error(
+            f"Could not update {codex_config} — worker-profile registration would create invalid TOML."
+        )
+        print_info(str(exc))
+        return
     if updated_raw == raw:
         print_info("Codex worker profile already up to date.")
         return

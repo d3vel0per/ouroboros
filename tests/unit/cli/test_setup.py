@@ -352,6 +352,24 @@ class TestCodexSetup:
             assert snapshot.count("[profiles.ouroboros-worker]") == 1
         assert after_second == after_first
 
+    def test_register_codex_worker_profile_skips_non_table_profiles_value(
+        self, tmp_path: Path
+    ) -> None:
+        """Valid TOML with scalar profiles must not be corrupted by worker setup."""
+        codex_config = tmp_path / ".codex" / "config.toml"
+        codex_config.parent.mkdir(parents=True)
+        original = 'profiles = "oops"\n'
+        codex_config.write_text(original, encoding="utf-8")
+
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("ouroboros.cli.commands.setup.print_error") as mock_error,
+        ):
+            setup_cmd._register_codex_worker_profile()
+
+        mock_error.assert_called_once()
+        assert codex_config.read_text(encoding="utf-8") == original
+
     def test_register_codex_worker_profile_skips_invalid_toml(self, tmp_path: Path) -> None:
         """Malformed TOML should produce an error message and leave the file alone."""
         codex_config = tmp_path / ".codex" / "config.toml"
