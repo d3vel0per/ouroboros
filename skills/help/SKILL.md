@@ -37,10 +37,17 @@ Ouroboros is a **requirement crystallization engine** for AI workflows. It trans
 | `ooo evaluate` | 3-stage verification | MCP |
 | `ooo unstuck` | 5 lateral thinking personas | Plugin |
 | `ooo status` | Session status + drift check | MCP |
+| `ooo resume-session` | List in-flight sessions and re-attach commands | CLI |
 | `ooo setup` | Installation wizard | Plugin |
 | `ooo welcome` | First-touch welcome guide | Plugin |
 | `ooo tutorial` | Interactive hands-on learning | Plugin |
 | `ooo help` | This reference guide | Plugin |
+| `ooo pm` | PM-focused interview + PRD generation | MCP |
+| `ooo qa` | General-purpose QA verdict for any artifact | Plugin |
+| `ooo cancel` | Cancel stuck or orphaned executions | CLI |
+| `ooo update` | Check for updates + upgrade to latest | Plugin |
+| `ooo brownfield` | Scan and manage brownfield repo defaults | MCP |
+| `ooo publish` | Publish Seed as GitHub Issues for teams | Plugin |
 
 ### Evolutionary Loop
 
@@ -50,7 +57,7 @@ Ouroboros is a **requirement crystallization engine** for AI workflows. It trans
 | `ooo ralph` | Self-referential loop until verified ("don't stop") | Plugin + MCP |
 
 **Plugin** = Works immediately after `ooo setup`.
-**MCP** = Requires `ooo setup` (Python 3.14+ auto-detected). Run setup once to unlock all features.
+**MCP** = Requires `ooo setup` (Python >= 3.12 auto-detected). Run setup once to unlock all features.
 
 ## Natural Language Triggers
 
@@ -62,6 +69,18 @@ Ouroboros is a **requirement crystallization engine** for AI workflows. It trans
 | "evaluate this", "3-stage check", "verify execution" | `ooo evaluate` |
 | "think sideways", "i'm stuck", "break through", "lateral thinking" | `ooo unstuck` |
 | "am I drifting?", "drift check", "session status" | `ooo status` |
+
+### Utility Triggers
+
+| Phrase | Triggers |
+|--------|----------|
+| "write prd", "pm interview", "product requirements", "create prd" | `ooo pm` |
+| "qa check", "quality check" | `ooo qa` |
+| "cancel execution", "stop job", "kill stuck", "abort execution" | `ooo cancel` |
+| "in-flight sessions", "mcp disconnected", "lost Ouroboros execution" | `ooo resume-session` |
+| "update ouroboros", "upgrade ouroboros" | `ooo update` |
+| "brownfield defaults", "brownfield scan" | `ooo brownfield` |
+| "publish to github", "create issues from seed", "seed to issues" | `ooo publish` |
 
 ### Loop Triggers
 
@@ -83,9 +102,16 @@ Ouroboros is a **requirement crystallization engine** for AI workflows. It trans
 | `/ouroboros:evaluate` | 3-stage verification | MCP |
 | `/ouroboros:unstuck` | 5 lateral thinking personas | Plugin |
 | `/ouroboros:status` | Session status + drift check | MCP |
+| `/ouroboros:resume-session` | List in-flight sessions and re-attach commands | CLI |
 | `/ouroboros:setup` | Installation wizard | Plugin |
 | `/ouroboros:tutorial` | Interactive hands-on learning | Plugin |
 | `/ouroboros:help` | This guide | Plugin |
+| `/ouroboros:pm` | PM-focused interview + PRD generation | MCP |
+| `/ouroboros:qa` | General-purpose QA verdict for any artifact | Plugin |
+| `/ouroboros:cancel` | Cancel stuck or orphaned executions | CLI |
+| `/ouroboros:update` | Check for updates + upgrade to latest | Plugin |
+| `/ouroboros:brownfield` | Scan and manage brownfield repo defaults | MCP |
+| `/ouroboros:publish` | Publish Seed as GitHub Issues for teams | Plugin |
 
 ### Loop Skills
 
@@ -110,8 +136,8 @@ Ouroboros is a **requirement crystallization engine** for AI workflows. It trans
 
 ## Setup
 
-After installing the plugin, run `ooo setup` once to register the MCP server.
-This connects Claude Code to the Ouroboros Python core and unlocks all features.
+After installing Ouroboros, run `ooo setup` once to register the MCP server.
+This connects your runtime backend to the Ouroboros Python core and unlocks all features.
 
 ```
 ooo setup    # One-time setup (~1 minute)

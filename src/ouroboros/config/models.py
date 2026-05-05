@@ -8,6 +8,7 @@ Classes:
     TierConfig: Tier configuration with cost factor and models
     ProviderCredentials: API credentials for a single provider
     CredentialsConfig: All provider credentials
+    LLMConfig: Shared LLM backend/model defaults
     EconomicsConfig: Economic model with tier definitions
     ClarificationConfig: Phase 0 configuration
     ExecutionConfig: Phase 2 configuration
@@ -15,14 +16,17 @@ Classes:
     EvaluationConfig: Phase 4 configuration
     ConsensusConfig: Phase 5 configuration
     PersistenceConfig: Storage configuration
+    RuntimeControlsConfig: Long-running workflow timeout/progress controls
     LoggingConfig: Logging configuration
     OuroborosConfig: Top-level configuration combining all sections
 """
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+from ouroboros.orchestrator_stage import VALID_STAGE_KEYS
 
 
 class ModelConfig(BaseModel, frozen=True):
@@ -100,6 +104,57 @@ class EconomicsConfig(BaseModel, frozen=True):
     downgrade_success_streak: int = Field(default=5, ge=1)
 
 
+class LLMConfig(BaseModel, frozen=True):
+    """Shared LLM backend and model defaults.
+
+    Attributes:
+        backend: Default backend for LLM-only flows
+        permission_mode: Default permission mode for local CLI-backed LLM flows
+        opencode_permission_mode: Default permission mode for OpenCode-backed LLM flows
+        qa_model: Default model for QA verdict generation
+        dependency_analysis_model: Default model for AC dependency analysis
+        ontology_analysis_model: Default model for ontological analysis
+        context_compression_model: Default model for workflow context compression
+    """
+
+    backend: Literal["claude", "claude_code", "litellm", "codex", "gemini", "opencode"] = (
+        "claude_code"
+    )
+    permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "default"
+    opencode_permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "acceptEdits"
+    qa_model: str = "claude-sonnet-4-20250514"
+    dependency_analysis_model: str = "claude-opus-4-6"
+    ontology_analysis_model: str = "claude-opus-4-6"
+    context_compression_model: str = "gpt-4"
+
+
+class LLMProviderProfileConfig(BaseModel, frozen=True):
+    """Backend-specific overrides for an Ouroboros LLM task profile.
+
+    ``profile`` is intentionally generic here: for Codex it maps to a
+    ``codex exec --profile`` name, while other backends can ignore it and use
+    portable fields such as ``model`` or ``temperature``.
+    """
+
+    profile: str | None = None
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+
+
+class LLMTaskProfileConfig(BaseModel, frozen=True):
+    """Provider-neutral LLM task profile with optional backend overrides."""
+
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+    providers: dict[str, LLMProviderProfileConfig] = Field(default_factory=dict)
+
+
 class ClarificationConfig(BaseModel, frozen=True):
     """Phase 0 (Big Bang) configuration.
 
@@ -122,10 +177,16 @@ class ExecutionConfig(BaseModel, frozen=True):
     Attributes:
         max_iterations_per_ac: Maximum iterations per acceptance criteria
         retrospective_interval: Iterations between retrospectives
+        atomicity_model: Default model for atomicity analysis
+        decomposition_model: Default model for AC decomposition
+        double_diamond_model: Default model for Double Diamond phases
     """
 
     max_iterations_per_ac: int = Field(default=10, ge=1)
     retrospective_interval: int = Field(default=3, ge=1)
+    atomicity_model: str = "claude-opus-4-6"
+    decomposition_model: str = "claude-opus-4-6"
+    double_diamond_model: str = "claude-opus-4-6"
 
 
 class ResilienceConfig(BaseModel, frozen=True):
@@ -136,12 +197,16 @@ class ResilienceConfig(BaseModel, frozen=True):
         lateral_thinking_enabled: Whether lateral thinking is enabled
         lateral_model_tier: Tier for lateral thinking
         lateral_temperature: Temperature for lateral thinking LLM calls
+        wonder_model: Default model for Wonder phase
+        reflect_model: Default model for Reflect phase
     """
 
     stagnation_enabled: bool = True
     lateral_thinking_enabled: bool = True
     lateral_model_tier: Literal["frugal", "standard", "frontier"] = "frontier"
     lateral_temperature: float = Field(default=0.8, ge=0.0, le=2.0)
+    wonder_model: str = "claude-opus-4-6"
+    reflect_model: str = "claude-opus-4-6"
 
 
 class EvaluationConfig(BaseModel, frozen=True):
@@ -153,6 +218,8 @@ class EvaluationConfig(BaseModel, frozen=True):
         stage3_enabled: Whether consensus evaluation is enabled
         satisfaction_threshold: Minimum satisfaction score
         uncertainty_threshold: Threshold above which to trigger consensus
+        semantic_model: Default model for semantic evaluation
+        assertion_extraction_model: Default model for verification assertion extraction
     """
 
     stage1_enabled: bool = True
@@ -160,6 +227,8 @@ class EvaluationConfig(BaseModel, frozen=True):
     stage3_enabled: bool = True
     satisfaction_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     uncertainty_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    semantic_model: str = "claude-opus-4-6"
+    assertion_extraction_model: str = "claude-sonnet-4-6"
 
 
 class ConsensusConfig(BaseModel, frozen=True):
@@ -169,11 +238,23 @@ class ConsensusConfig(BaseModel, frozen=True):
         min_models: Minimum number of models for consensus
         threshold: Agreement threshold for consensus
         diversity_required: Whether different providers are required
+        models: Default model roster for stage 3 voting
+        advocate_model: Default model for deliberative advocate role
+        devil_model: Default model for deliberative devil role
+        judge_model: Default model for deliberative judge role
     """
 
     min_models: int = Field(default=3, ge=2)
     threshold: float = Field(default=0.67, ge=0.0, le=1.0)
     diversity_required: bool = True
+    models: tuple[str, ...] = (
+        "openrouter/openai/gpt-4o",
+        "openrouter/anthropic/claude-opus-4-6",
+        "openrouter/google/gemini-2.5-pro",
+    )
+    advocate_model: str = "openrouter/anthropic/claude-opus-4-6"
+    devil_model: str = "openrouter/openai/gpt-4o"
+    judge_model: str = "openrouter/google/gemini-2.5-pro"
 
 
 class PersistenceConfig(BaseModel, frozen=True):
@@ -211,6 +292,32 @@ class DriftConfig(BaseModel, frozen=True):
         return v
 
 
+class RuntimeControlsConfig(BaseModel, frozen=True):
+    """Runtime liveness and progress controls for long-running work.
+
+    Attributes:
+        mcp_tool_timeout_seconds: Server-side MCP tool timeout. ``0`` disables
+            the adapter-level wall-clock timeout so progress-aware tools can
+            enforce their own liveness policy.
+        generation_idle_timeout_seconds: Seconds without any generation or
+            execution activity before the generation is considered idle.
+            ``0`` disables this guard.
+        generation_no_progress_timeout_seconds: Seconds with activity but no
+            material progress before the generation is considered stuck.
+            ``0`` disables this guard.
+        generation_safety_timeout_seconds: Optional final wall-clock safety
+            cap for a generation. ``0`` disables this guard.
+        watchdog_poll_seconds: How often the generation watchdog polls
+            EventStore for new progress.
+    """
+
+    mcp_tool_timeout_seconds: float = Field(default=0, ge=0)
+    generation_idle_timeout_seconds: float = Field(default=7200, ge=0)
+    generation_no_progress_timeout_seconds: float = Field(default=14400, ge=0)
+    generation_safety_timeout_seconds: float = Field(default=0, ge=0)
+    watchdog_poll_seconds: float = Field(default=15.0, gt=0.0)
+
+
 class LoggingConfig(BaseModel, frozen=True):
     """Logging configuration.
 
@@ -225,26 +332,191 @@ class LoggingConfig(BaseModel, frozen=True):
     include_reasoning: bool = True
 
 
-class OrchestratorConfig(BaseModel, frozen=True):
-    """Orchestrator configuration for Claude Agent SDK.
+VALID_RUNTIME_BACKENDS = frozenset(
+    {
+        "claude",
+        "claude_code",
+        "codex",
+        "codex_cli",
+        "opencode",
+        "opencode_cli",
+        "hermes",
+        "hermes_cli",
+        "gemini",
+        "gemini_cli",
+    }
+)
+
+
+class RuntimeProfileConfig(BaseModel, frozen=True):
+    """Runtime profile configuration (issue #519 / M4 / S3).
+
+    The Agent OS architecture diagram agreed in #476 lets each pipeline
+    stage (``interview`` / ``execute`` / ``evaluate`` / ``reflect``) be
+    served by a different harness. This block exposes that decision as
+    a configuration surface; the resolution helper in
+    ``ouroboros.orchestrator.stage`` reads it.
+
+    This object also reserves ``backend_profile`` for backend-native
+    profile selection (for example PR #505's Codex ``worker`` profile),
+    so the public ``orchestrator.runtime_profile`` key has one stable
+    object shape instead of conflicting string-vs-table meanings.
 
     Attributes:
+        backend_profile: Optional backend-native profile name. Stage
+            routing does not interpret it; backend adapters may map it
+            to their own profile mechanism.
+        default: Optional runtime backend that serves any stage missing
+            from ``stages``. ``None`` means "fall through to the
+            orchestrator's top-level ``runtime_backend``".
+        stages: Explicit per-stage mapping. Keys must be members of the
+            closed stage vocabulary; unknown keys raise ``ValueError``
+            during Pydantic validation at startup.
+    """
+
+    backend_profile: str | None = None
+    default: str | None = None
+    stages: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("backend_profile")
+    @classmethod
+    def _validate_backend_profile(cls, value: str | None) -> str | None:
+        """Normalize optional backend-native profile names."""
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("runtime_profile.backend_profile must not be empty")
+        return candidate
+
+    @field_validator("default")
+    @classmethod
+    def _validate_default_backend(cls, value: str | None) -> str | None:
+        """Reject invalid runtime_profile.default backend names at startup."""
+        if value is None:
+            return None
+        return _validate_runtime_backend(value, field_name="runtime_profile.default")
+
+    @field_validator("stages")
+    @classmethod
+    def _validate_stage_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject unknown stage names and invalid backend names at startup."""
+        validated: dict[str, str] = {}
+        for key, backend in value.items():
+            if key not in VALID_STAGE_KEYS:
+                valid_list = ", ".join(sorted(VALID_STAGE_KEYS))
+                raise ValueError(
+                    f"Unknown runtime_profile.stages key: {key!r}. Valid keys are: {valid_list}.",
+                )
+            validated[key] = _validate_runtime_backend(
+                backend,
+                field_name=f"runtime_profile.stages[{key!r}]",
+            )
+        return validated
+
+
+def _validate_runtime_backend(value: str, *, field_name: str) -> str:
+    """Validate runtime_profile backend names against orchestrator backends."""
+    candidate = value.strip().lower()
+    if candidate not in VALID_RUNTIME_BACKENDS:
+        valid_list = ", ".join(sorted(VALID_RUNTIME_BACKENDS))
+        raise ValueError(f"{field_name} must be one of: {valid_list}")
+    return candidate
+
+
+class OrchestratorConfig(BaseModel, frozen=True):
+    """Orchestrator runtime configuration.
+
+    Attributes:
+        runtime_backend: Agent runtime backend to use for orchestrator execution.
+        runtime_profile: Optional Agent OS runtime profile object.
+            ``runtime_profile.backend_profile`` selects backend-native profiles
+            such as Codex ``--profile ouroboros-worker``. Default ``None``
+            preserves the backend's normal user-config behavior. The ``default``
+            and ``stages`` fields reserve the same object contract used by the
+            stage-routing stack so this public key does not split into
+            incompatible string-vs-table meanings.
+        permission_mode: Default permission mode for local agent runtimes.
+        opencode_permission_mode: Default permission mode for OpenCode agent runtimes.
         cli_path: Path to Claude CLI binary. Supports:
             - Absolute path: /path/to/my-claude-wrapper
             - ~ expansion: ~/.my-claude-wrapper/bin/my-claude-wrapper
             - None: Use SDK bundled CLI
+        codex_cli_path: Path to Codex CLI binary. Supports:
+            - Absolute path: /path/to/codex
+            - ~ expansion: ~/.local/bin/codex
+            - None: Resolve from PATH at runtime
+        opencode_cli_path: Path to OpenCode CLI binary. Supports:
+            - Absolute path: /path/to/opencode
+            - ~ expansion: ~/.local/bin/opencode
+            - None: Resolve from PATH at runtime
+        hermes_cli_path: Path to Hermes CLI binary. Supports:
+            - Absolute path: /path/to/hermes
+            - ~ expansion: ~/.local/bin/hermes
+            - None: Resolve from PATH at runtime
+        gemini_cli_path: Path to Gemini CLI binary. Supports:
+            - Absolute path: /path/to/gemini
+            - ~ expansion: ~/.local/bin/gemini
+            - None: Resolve from PATH at runtime (or OUROBOROS_GEMINI_CLI_PATH)
         default_max_turns: Default max turns for agent execution
+        max_parallel_workers: Default maximum concurrent AC workers
+        usage_limit_pause_hours: Default pause window for provider usage/quota limits
+        use_worktrees: Whether mutating workflows run in dedicated git worktrees
+        worktree_root: Root directory for managed task worktrees
+        worktree_cleanup: Cleanup policy for managed task worktrees
+        worktree_lock_stale_after_minutes: Staleness threshold for task lock recovery
     """
 
-    cli_path: str | None = None
-    default_max_turns: int = Field(default=10, ge=1)
+    runtime_backend: Literal["claude", "codex", "opencode", "hermes", "gemini"] = "claude"
+    runtime_profile: RuntimeProfileConfig | None = None
 
-    @field_validator("cli_path")
+    @field_validator("runtime_profile", mode="before")
+    @classmethod
+    def _coerce_runtime_profile(cls, value: Any) -> Any:
+        """Accept the legacy PR #505 string shorthand as backend_profile."""
+        if isinstance(value, str):
+            return {"backend_profile": value}
+        return value
+
+    permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "acceptEdits"
+    opencode_permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = (
+        "bypassPermissions"
+    )
+    # OpenCode integration mode. Written by `ouroboros setup --opencode-mode`.
+    # None = unset (legacy installs); gate treats None as NOT plugin (safe
+    # default — require explicit opt-in via setup --opencode-mode=plugin).
+    opencode_mode: Literal["plugin", "subprocess"] | None = None
+    cli_path: str | None = None
+    codex_cli_path: str | None = None
+    opencode_cli_path: str | None = None
+    hermes_cli_path: str | None = None
+    gemini_cli_path: str | None = None
+    default_max_turns: int = Field(default=10, ge=1)
+    max_parallel_workers: int = Field(default=3, ge=1)
+    usage_limit_pause_hours: float = Field(default=5.0, gt=0.0)
+    use_worktrees: bool = True
+    worktree_root: str = "~/.ouroboros/worktrees"
+    worktree_cleanup: Literal["keep"] = "keep"
+    worktree_lock_stale_after_minutes: int = Field(default=60, ge=1)
+
+    @field_validator(
+        "cli_path",
+        "codex_cli_path",
+        "opencode_cli_path",
+        "hermes_cli_path",
+        "gemini_cli_path",
+    )
     @classmethod
     def expand_cli_path(cls, v: str | None) -> str | None:
         """Expand ~ in cli_path."""
         if v is None:
             return None
+        return str(Path(v).expanduser())
+
+    @field_validator("worktree_root")
+    @classmethod
+    def expand_worktree_root(cls, v: str) -> str:
+        """Expand ~ in worktree_root."""
         return str(Path(v).expanduser())
 
 
@@ -256,24 +528,32 @@ class OuroborosConfig(BaseModel, frozen=True):
 
     Attributes:
         economics: Economic model and tier configuration
+        llm: Shared LLM backend and model configuration
         clarification: Phase 0 (Big Bang) configuration
         execution: Phase 2 configuration
         resilience: Phase 3 configuration
         evaluation: Phase 4 configuration
         consensus: Phase 5 configuration
+        llm_profiles: Named provider-neutral profiles for LLM-only tasks
+        llm_role_profiles: Mapping from logical task roles to profile names
         persistence: Storage configuration
         drift: Drift monitoring configuration
+        runtime_controls: Long-running workflow timeout/progress controls
         logging: Logging configuration
     """
 
     economics: EconomicsConfig = Field(default_factory=EconomicsConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     clarification: ClarificationConfig = Field(default_factory=ClarificationConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     consensus: ConsensusConfig = Field(default_factory=ConsensusConfig)
+    llm_profiles: dict[str, LLMTaskProfileConfig] = Field(default_factory=dict)
+    llm_role_profiles: dict[str, str] = Field(default_factory=dict)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
+    runtime_controls: RuntimeControlsConfig = Field(default_factory=RuntimeControlsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
 

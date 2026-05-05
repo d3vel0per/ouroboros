@@ -19,9 +19,14 @@ Usage:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+import asyncio
+from collections.abc import Mapping
+from contextlib import aclosing
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+import math
+import re
+from typing import TYPE_CHECKING, Any, NamedTuple
 from uuid import uuid4
 
 from rich.console import Console
@@ -29,27 +34,81 @@ from rich.panel import Panel
 from rich.text import Text
 
 from ouroboros.core.errors import OuroborosError
+from ouroboros.core.seed_contract import SeedContract
+from ouroboros.core.seed_contract_prompt import render_seed_contract_for_execution
 from ouroboros.core.types import Result
+from ouroboros.core.worktree import TaskWorkspace, heartbeat_lock, release_lock
 from ouroboros.observability.drift import DriftMeasurement
 from ouroboros.observability.logging import get_logger
-from ouroboros.orchestrator.adapter import DEFAULT_TOOLS, ClaudeAgentAdapter
+from ouroboros.orchestrator.adapter import (
+    DEFAULT_TOOLS,
+    AgentMessage,
+    AgentRuntime,
+    RuntimeHandle,
+)
+from ouroboros.orchestrator.capabilities import (
+    CapabilityGraph,
+    build_capability_graph,
+    serialize_capability_graph,
+)
+from ouroboros.orchestrator.control_plane import (
+    build_control_plane_state,
+    serialize_control_plane_state,
+)
 from ouroboros.orchestrator.events import (
     create_drift_measured_event,
+    create_execution_terminal_event,
     create_mcp_tools_loaded_event,
+    create_policy_capabilities_evaluated_event,
     create_progress_event,
     create_session_completed_event,
     create_session_failed_event,
-    create_session_started_event,
     create_tool_called_event,
     create_workflow_progress_event,
 )
+from ouroboros.orchestrator.execution_runtime_scope import (
+    ExecutionNodeIdentity,
+    build_ac_runtime_scope,
+)
 from ouroboros.orchestrator.execution_strategy import ExecutionStrategy, get_strategy
-from ouroboros.orchestrator.mcp_tools import MCPToolProvider
-from ouroboros.orchestrator.session import SessionRepository, SessionStatus
+from ouroboros.orchestrator.mcp_tools import (
+    MCPToolProvider,
+    SessionToolCatalog,
+    assemble_session_tool_catalog,
+    enumerate_runtime_builtin_tool_definitions,
+    serialize_tool_catalog,
+)
+from ouroboros.orchestrator.parallel_executor import DEFAULT_MAX_DECOMPOSITION_DEPTH
+from ouroboros.orchestrator.policy import (
+    PolicyContext,
+    PolicyDecision,
+    PolicyExecutionPhase,
+    PolicySessionRole,
+    evaluate_capability_policy,
+)
+from ouroboros.orchestrator.runtime_message_projection import (
+    message_tool_input,
+    message_tool_name,
+    normalized_message_type,
+    project_runtime_message,
+)
+from ouroboros.orchestrator.session import SessionRepository, SessionStatus, SessionTracker
+from ouroboros.orchestrator.workflow_state import coerce_ac_marker_update
+from ouroboros.persistence.checkpoint import CheckpointStore
+from ouroboros.providers import create_llm_adapter
+from ouroboros.resilience.lateral import ThinkingPersona
+from ouroboros.resilience.recovery import (
+    RecoveryActionKind,
+    RecoveryPlanner,
+    RecoverySnapshot,
+    create_recovery_applied_event,
+    get_run_recovery_protocol_prompt,
+)
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
     from ouroboros.mcp.client.manager import MCPClientManager
+    from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
     from ouroboros.persistence.event_store import EventStore
 
 log = get_logger(__name__)
@@ -58,6 +117,20 @@ log = get_logger(__name__)
 # =============================================================================
 # Result Types
 # =============================================================================
+
+
+class ToolCatalogPolicyResult(NamedTuple):
+    """Bundle returned by ``_evaluate_tool_catalog_policy``.
+
+    Using a named tuple instead of a positional 4-tuple lets callers read
+    fields by name and removes the refactor fragility that would come from
+    re-ordering a positional unpack.
+    """
+
+    allowed_tools: list[str]
+    capability_graph: CapabilityGraph
+    policy_decisions: tuple[PolicyDecision, ...]
+    policy_context: PolicyContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +156,17 @@ class OrchestratorResult:
     duration_seconds: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class RecoverableFailurePause:
+    """Structured pause decision for recoverable final runtime failures."""
+
+    pause_kind: str
+    reason: str
+    resume_hint: str
+    pause_seconds: int | None = None
+    resume_after: datetime | None = None
+
+
 # =============================================================================
 # Errors
 # =============================================================================
@@ -92,6 +176,76 @@ class OrchestratorError(OuroborosError):
     """Error during orchestrator execution."""
 
     pass
+
+
+class ExecutionCancelledError(OuroborosError):
+    """Raised when an execution is cancelled via the cancellation set."""
+
+    def __init__(self, session_id: str, reason: str = "Cancelled by user") -> None:
+        self.session_id = session_id
+        self.reason = reason
+        super().__init__(f"Execution cancelled for session {session_id}: {reason}")
+
+
+# =============================================================================
+# In-memory Cancellation Registry
+# =============================================================================
+
+# Module-level set of session IDs marked for cancellation.
+# The MCP cancel tool adds IDs here; the runner's execution loop checks it.
+# Guarded by _cancellation_lock to prevent races between MCP cancel calls
+# and the runner's message loop reading the set concurrently.
+_cancellation_registry: set[str] = set()
+_cancellation_lock: asyncio.Lock = asyncio.Lock()
+
+
+async def request_cancellation(session_id: str) -> None:
+    """Mark a session for cancellation.
+
+    Called by the MCP cancel tool to signal that the runner should
+    stop processing the given session at its next checkpoint.
+
+    Args:
+        session_id: Session to cancel.
+    """
+    async with _cancellation_lock:
+        _cancellation_registry.add(session_id)
+
+
+async def is_cancellation_requested(session_id: str) -> bool:
+    """Check whether cancellation has been requested for a session.
+
+    Args:
+        session_id: Session to check.
+
+    Returns:
+        True if cancellation was requested.
+    """
+    async with _cancellation_lock:
+        return session_id in _cancellation_registry
+
+
+async def clear_cancellation(session_id: str) -> None:
+    """Remove a session from the cancellation registry.
+
+    Called after the runner has acknowledged the cancellation and
+    emitted the appropriate event, so the ID doesn't linger.
+
+    Args:
+        session_id: Session to clear.
+    """
+    async with _cancellation_lock:
+        _cancellation_registry.discard(session_id)
+
+
+async def get_pending_cancellations() -> frozenset[str]:
+    """Return a snapshot of all pending cancellation session IDs.
+
+    Returns:
+        Frozen set of session IDs awaiting cancellation.
+    """
+    async with _cancellation_lock:
+        return frozenset(_cancellation_registry)
 
 
 # =============================================================================
@@ -118,52 +272,18 @@ def build_system_prompt(
     if strategy is None:
         strategy = get_strategy(seed.task_type)
 
-    constraints_text = "\n".join(f"- {c}" for c in seed.constraints) if seed.constraints else "None"
-
-    principles_text = (
-        "\n".join(f"- {p.name}: {p.description}" for p in seed.evaluation_principles)
-        if seed.evaluation_principles
-        else "None"
-    )
-
-    # Build brownfield context section
-    brownfield_section = ""
-    if seed.brownfield_context.project_type == "brownfield":
-        refs = "\n".join(
-            f"- [{r.role.upper()}] {r.path}: {r.summary}"
-            for r in seed.brownfield_context.context_references
-        )
-        patterns = "\n".join(f"- {p}" for p in seed.brownfield_context.existing_patterns)
-        deps = ", ".join(seed.brownfield_context.existing_dependencies)
-        brownfield_section = f"""
-## Existing Codebase Context (BROWNFIELD)
-IMPORTANT: You are extending existing code, NOT creating a new project.
-
-### Referenced Codebases
-{refs or "None specified"}
-
-### Existing Patterns to Follow
-{patterns or "None specified"}
-
-### Existing Dependencies to Reuse
-{deps or "None specified"}
-"""
-
     ac_tracking = get_ac_tracking_prompt()
     strategy_fragment = strategy.get_system_prompt_fragment()
+    recovery_protocol = get_run_recovery_protocol_prompt()
+    seed_contract = render_seed_contract_for_execution(SeedContract.from_seed(seed))
 
     return f"""{strategy_fragment}
 
-## Goal
-{seed.goal}
+{seed_contract}
 
-## Constraints
-{constraints_text}
-{brownfield_section}
-## Evaluation Principles
-{principles_text}
+{ac_tracking}
 
-{ac_tracking}"""
+{recovery_protocol}"""
 
 
 def build_task_prompt(
@@ -206,6 +326,54 @@ def build_task_prompt(
 # Progress event emission interval (every N messages)
 PROGRESS_EMIT_INTERVAL = 10
 
+# Session progress persistence interval (every N messages)
+SESSION_PROGRESS_PERSIST_INTERVAL = 10
+
+# Cancellation check interval (every N messages)
+CANCELLATION_CHECK_INTERVAL = 5
+
+_LONG_RETRY_AFTER_SECONDS = 60 * 60
+_DURATION_PATTERN = re.compile(
+    r"\b(?P<value>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b",
+    re.IGNORECASE,
+)
+_USAGE_LIMIT_RECOVERY_KINDS = frozenset(
+    {
+        "usage_limit",
+        "usage_quota",
+        "quota_limit",
+        "quota_window",
+        "quota_exceeded",
+        "quota_exhausted",
+        "usage_limit_pause",
+    }
+)
+_RESUME_RETRY_RECOVERY_KIND = "resume_retry"
+_USAGE_LIMIT_TEXT_PATTERNS = (
+    re.compile(
+        r"\b(?:usage|quota|credit|request)\s+"
+        r"(?:limit|quota|cap|window|allowance)\b.{0,80}"
+        r"\b(?:hit|reached|exceeded|exhausted|depleted)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:hit|reached|exceeded|exhausted|depleted)\b.{0,80}"
+        r"\b(?:usage|quota|credit|request)\s+"
+        r"(?:limit|quota|cap|window|allowance)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:quota|allowance)\s+(?:exceeded|exhausted|depleted)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:usage\s+limit|quota\s+window|rate\s+limit\s+window)"
+        r"\s+(?:hit|reached|exceeded|exhausted|depleted)\b",
+        re.IGNORECASE,
+    ),
+)
+
 
 class OrchestratorRunner:
     """Main orchestration runner for executing seeds via Claude Agent.
@@ -219,18 +387,25 @@ class OrchestratorRunner:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         event_store: EventStore,
         console: Console | None = None,
         mcp_manager: MCPClientManager | None = None,
         mcp_tool_prefix: str = "",
         debug: bool = False,
         enable_decomposition: bool = True,
+        inherited_runtime_handle: RuntimeHandle | None = None,
+        inherited_tools: list[str] | None = None,
+        task_cwd: str | None = None,
+        task_workspace: TaskWorkspace | None = None,
+        checkpoint_store: CheckpointStore | None = None,
+        max_decomposition_depth: int = DEFAULT_MAX_DECOMPOSITION_DEPTH,
+        max_parallel_workers: int = 3,
     ) -> None:
         """Initialize orchestrator runner.
 
         Args:
-            adapter: Claude Agent adapter for task execution.
+            adapter: Agent runtime for task execution.
             event_store: Event store for persistence.
             console: Rich console for output. Uses default if not provided.
             mcp_manager: Optional MCP client manager for external tool integration.
@@ -240,15 +415,34 @@ class OrchestratorRunner:
                            conflicts (e.g., "mcp_" makes "read" become "mcp_read").
             debug: Enable verbose logging output. When False, only Live display shown.
             enable_decomposition: Enable AC decomposition into Sub-ACs.
+            inherited_runtime_handle: Optional parent Claude runtime handle for
+                        delegated child executions that should fork a session.
+            inherited_tools: Optional effective tool set inherited from a
+                        delegating parent session.
+            task_cwd: Explicit working directory override for task execution metadata.
+            task_workspace: Managed task workspace metadata for persistence and cleanup.
+            checkpoint_store: Optional checkpoint store for execution state persistence
+                        and recovery. When provided, enables per-level state snapshots.
+            max_decomposition_depth: Maximum recursive AC decomposition depth.
+            max_parallel_workers: Maximum concurrent AC workers for parallel execution.
         """
         self._adapter = adapter
         self._event_store = event_store
+        self._checkpoint_store = checkpoint_store
         self._console = console or Console()
         self._session_repo = SessionRepository(event_store)
         self._mcp_manager: MCPClientManager | None = mcp_manager
         self._mcp_tool_prefix = mcp_tool_prefix
         self._debug = debug
         self._enable_decomposition = enable_decomposition
+        self._inherited_runtime_handle = inherited_runtime_handle
+        self._inherited_tools = list(inherited_tools) if inherited_tools else None
+        self._task_cwd = task_cwd
+        self._task_workspace = task_workspace
+        self._max_decomposition_depth = max(0, max_decomposition_depth)
+        self._max_parallel_workers = max(1, max_parallel_workers)
+        # Track active session for external cancellation by execution_id
+        self._active_sessions: dict[str, str] = {}  # execution_id -> session_id
 
     @property
     def mcp_manager(self) -> MCPClientManager | None:
@@ -259,12 +453,1156 @@ class OrchestratorRunner:
         """
         return self._mcp_manager
 
+    @property
+    def session_repo(self) -> SessionRepository:
+        """Return the session repository.
+
+        Returns:
+            The SessionRepository instance for session management.
+        """
+        return self._session_repo
+
+    @property
+    def active_sessions(self) -> dict[str, str]:
+        """Return a copy of currently active execution_id -> session_id mappings.
+
+        Returns:
+            Dict mapping execution IDs to session IDs for in-flight executions.
+        """
+        return dict(self._active_sessions)
+
+    def _register_session(self, execution_id: str, session_id: str) -> None:
+        """Register an active session for cancellation tracking.
+
+        Called at the start of execution to enable in-flight cancellation.
+        Also writes a heartbeat file so the orphan detector knows this
+        session is alive (runtime-agnostic mechanism).
+
+        Args:
+            execution_id: Execution ID for external lookup.
+            session_id: Session ID for internal tracking.
+        """
+        from ouroboros.orchestrator.heartbeat import acquire as acquire_lock
+
+        self._active_sessions[execution_id] = session_id
+        acquire_lock(session_id)
+
+    def _unregister_session(self, execution_id: str, session_id: str) -> None:
+        """Unregister a session after execution completes.
+
+        Called at the end of execution (success, failure, or cancellation)
+        to clean up tracking state and remove the heartbeat file.
+
+        Args:
+            execution_id: Execution ID to remove.
+            session_id: Session ID to remove.
+        """
+        from ouroboros.orchestrator.heartbeat import (
+            release_if_owned_by_current_process as release_lock,
+        )
+
+        self._active_sessions.pop(execution_id, None)
+        release_lock(session_id)
+
+    def _cleanup_pre_execution_state(
+        self,
+        execution_id: str | None,
+        session_id: str | None,
+        *,
+        session_registered: bool,
+    ) -> None:
+        """Release pre-loop runner state after setup fails."""
+        if session_registered and execution_id is not None and session_id is not None:
+            self._unregister_session(execution_id, session_id)
+        if self._task_workspace is not None:
+            release_lock(self._task_workspace.lock_path)
+
+    def _deserialize_runtime_handle(self, progress: dict[str, Any]) -> RuntimeHandle | None:
+        """Deserialize runtime resume state from session progress."""
+        runtime_payload = progress.get("runtime")
+        try:
+            runtime_handle = RuntimeHandle.from_dict(runtime_payload)
+        except ValueError as exc:
+            log.warning(
+                "orchestrator.runner.runtime_handle_deserialize_failed",
+                error=str(exc),
+                runtime_keys=sorted(runtime_payload) if isinstance(runtime_payload, dict) else None,
+            )
+            runtime_handle = None
+        if runtime_handle is not None:
+            return runtime_handle
+
+        legacy_session_id = progress.get("agent_session_id")
+        if isinstance(legacy_session_id, str) and legacy_session_id:
+            # Legacy sessions predate multi-runtime; infer backend from context
+            legacy_backend = progress.get("runtime_backend", "claude")
+            if not isinstance(legacy_backend, str):
+                legacy_backend = "claude"
+            return RuntimeHandle(backend=legacy_backend, native_session_id=legacy_session_id)
+
+        return None
+
+    def _implementation_policy_context(
+        self,
+        *,
+        runtime_backend: str | None = None,
+    ) -> PolicyContext:
+        """Return the policy context used for implementation tool catalogs."""
+        return PolicyContext(
+            runtime_backend=runtime_backend or self._adapter.runtime_backend,
+            session_role=PolicySessionRole.IMPLEMENTATION,
+            execution_phase=PolicyExecutionPhase.IMPLEMENTATION,
+        )
+
+    def _evaluate_tool_catalog_policy(
+        self,
+        tool_catalog: SessionToolCatalog,
+        *,
+        runtime_backend: str | None = None,
+    ) -> ToolCatalogPolicyResult:
+        """Evaluate the implementation policy for a normalized tool catalog."""
+        capability_graph = build_capability_graph(tool_catalog)
+        policy_context = self._implementation_policy_context(runtime_backend=runtime_backend)
+        policy_decisions = evaluate_capability_policy(capability_graph, policy_context)
+        allowed_tools = [
+            decision.name
+            for decision in policy_decisions
+            if decision.visible and decision.executable
+        ]
+        return ToolCatalogPolicyResult(
+            allowed_tools=allowed_tools,
+            capability_graph=capability_graph,
+            policy_decisions=policy_decisions,
+            policy_context=policy_context,
+        )
+
+    async def _emit_policy_capabilities_evaluated_event(
+        self,
+        session_id: str,
+        capability_graph: CapabilityGraph,
+        policy_decisions: tuple[PolicyDecision, ...],
+        policy_context: PolicyContext,
+    ) -> None:
+        """Persist capability policy decisions for audit/debuggability.
+
+        Best-effort: the audit record is auxiliary to the orchestration
+        path, not a prerequisite for it.  An event-store failure here
+        must never take down interview/evaluation/execution — we log
+        the failure and continue, so that observability degradation
+        never becomes an availability incident.
+        """
+        try:
+            await self._event_store.append(
+                create_policy_capabilities_evaluated_event(
+                    session_id=session_id,
+                    graph=capability_graph,
+                    decisions=policy_decisions,
+                    context=policy_context,
+                )
+            )
+        except Exception as exc:
+            log.warning(
+                "orchestrator.runner.policy_audit_emit_failed",
+                session_id=session_id,
+                capability_count=len(capability_graph.capabilities),
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
+    def _seed_runtime_handle(
+        self,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        tool_catalog: SessionToolCatalog | None = None,
+    ) -> RuntimeHandle | None:
+        """Seed a runtime handle with startup metadata before execution begins."""
+        backend = (
+            runtime_handle.backend if runtime_handle is not None else None
+        ) or self._adapter.runtime_backend
+        if not backend:
+            return runtime_handle
+
+        metadata = dict(runtime_handle.metadata) if runtime_handle is not None else {}
+        if tool_catalog is not None:
+            metadata["tool_catalog"] = serialize_tool_catalog(tool_catalog)
+            policy_result = self._evaluate_tool_catalog_policy(
+                tool_catalog,
+                runtime_backend=backend,
+            )
+            metadata["capability_graph"] = serialize_capability_graph(
+                policy_result.capability_graph
+            )
+            metadata["control_plane"] = serialize_control_plane_state(
+                build_control_plane_state(
+                    policy_result.capability_graph,
+                    policy_result.policy_decisions,
+                )
+            )
+
+        cwd = self._effective_cwd(runtime_handle)
+        approval_mode = self._adapter.permission_mode
+
+        if runtime_handle is not None:
+            return replace(
+                runtime_handle,
+                backend=backend,
+                kind=runtime_handle.kind or "agent_runtime",
+                cwd=(
+                    runtime_handle.cwd
+                    if runtime_handle.cwd
+                    else cwd
+                    if isinstance(cwd, str) and cwd
+                    else None
+                ),
+                approval_mode=(
+                    runtime_handle.approval_mode
+                    if runtime_handle.approval_mode
+                    else approval_mode
+                    if isinstance(approval_mode, str) and approval_mode
+                    else None
+                ),
+                updated_at=datetime.now(UTC).isoformat(),
+                metadata=metadata,
+            )
+
+        return RuntimeHandle(
+            backend=backend,
+            kind="agent_runtime",
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            approval_mode=approval_mode
+            if isinstance(approval_mode, str) and approval_mode
+            else None,
+            updated_at=datetime.now(UTC).isoformat(),
+            metadata=metadata,
+        )
+
+    def _task_summary(self) -> dict[str, Any]:
+        """Return summary metadata for the active task workspace."""
+        if self._task_workspace is None:
+            return {}
+        return {
+            "worktree_path": self._task_workspace.worktree_path,
+            "worktree_branch": self._task_workspace.branch,
+            "task_cwd": self._task_workspace.effective_cwd,
+        }
+
+    def _effective_cwd(self, runtime_handle: RuntimeHandle | None = None) -> str | None:
+        """Resolve the effective cwd for persisted runtime metadata."""
+        if self._task_cwd:
+            return self._task_cwd
+        if self._task_workspace is not None:
+            return self._task_workspace.effective_cwd
+        if runtime_handle is not None and runtime_handle.cwd:
+            return runtime_handle.cwd
+        cwd = self._adapter.working_directory
+        return cwd if isinstance(cwd, str) and cwd else None
+
+    def _build_dependency_analyzer(self) -> DependencyAnalyzer:
+        """Create a dependency analyzer wired to the active LLM backend when available.
+
+        Legacy ``AgentRuntime`` implementations (custom runtimes, test mocks)
+        predating the ``llm_backend`` Protocol addition in v0.28.6 may not
+        define the property. We probe it via ``getattr`` and degrade to a
+        structured-only ``DependencyAnalyzer`` when the attribute is absent,
+        preserving pre-v0.28.6 behavior for downstream Protocol implementers.
+        """
+        from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
+
+        # Legacy-compat: adapters predating the llm_backend Protocol addition
+        # (v0.28.6) lack this attribute. Fall back to structured-only analysis
+        # rather than raising AttributeError.
+        _llm_backend_sentinel = object()
+        llm_backend = getattr(self._adapter, "llm_backend", _llm_backend_sentinel)
+        if llm_backend is _llm_backend_sentinel:
+            log.info(
+                "orchestrator.runner.dependency_analyzer.legacy_adapter_without_llm_backend",
+                adapter_type=type(self._adapter).__name__,
+            )
+            return DependencyAnalyzer()
+
+        backend = (
+            llm_backend
+            if isinstance(llm_backend, str) and llm_backend
+            else (self._adapter.runtime_backend)
+        )
+        cli_path = getattr(self._adapter, "cli_path", None)
+        resolved_cli_path = cli_path if isinstance(cli_path, str) and cli_path else None
+        try:
+            llm_adapter = create_llm_adapter(
+                backend=backend,
+                permission_mode=self._adapter.permission_mode,
+                cli_path=resolved_cli_path,
+                cwd=self._effective_cwd(),
+                max_turns=1,
+            )
+        except (RuntimeError, ImportError, ConnectionError, OSError, ValueError) as exc:
+            log.warning(
+                "orchestrator.runner.dependency_analysis_llm_unavailable",
+                backend=backend,
+                error=str(exc),
+            )
+            return DependencyAnalyzer()
+
+        return DependencyAnalyzer(llm_adapter=llm_adapter)
+
+    def _normalized_message_type(self, message: AgentMessage) -> str:
+        """Collapse runtime-specific message details into shared progress categories."""
+        return normalized_message_type(message)
+
+    def _message_tool_name(self, message: AgentMessage) -> str | None:
+        """Resolve the tool name from either the message envelope or message data."""
+        return message_tool_name(message)
+
+    def _message_tool_input(self, message: AgentMessage) -> dict[str, Any]:
+        """Return structured tool input when present."""
+        return message_tool_input(message)
+
+    def _message_tool_input_preview(self, message: AgentMessage) -> str | None:
+        """Build a compact preview string for persisted tool-call events."""
+        tool_input = self._message_tool_input(message)
+        if not tool_input:
+            return None
+
+        parts: list[str] = []
+        for key, value in tool_input.items():
+            rendered = str(value).strip()
+            if rendered:
+                parts.append(f"{key}: {rendered}")
+        preview = ", ".join(parts)
+        return preview[:100] if preview else None
+
+    def _serialize_runtime_message_metadata(self, message: AgentMessage) -> dict[str, Any]:
+        """Serialize shared runtime metadata for persisted progress/audit events."""
+        projected = project_runtime_message(message)
+        return dict(projected.runtime_metadata)
+
+    def _build_progress_update(
+        self,
+        message: AgentMessage,
+        messages_processed: int,
+    ) -> dict[str, Any]:
+        """Build a normalized progress payload for session persistence."""
+        projected = project_runtime_message(message)
+        message_type = projected.message_type
+        progress: dict[str, Any] = {
+            "last_message_type": message_type,
+            "messages_processed": messages_processed,
+            "content_preview": projected.content[:200],
+        }
+
+        runtime_handle = message.resume_handle
+        progress.update(projected.runtime_metadata)
+
+        if runtime_handle is not None:
+            progress["runtime"] = runtime_handle.to_session_state_dict()
+            progress["runtime_backend"] = runtime_handle.backend
+            runtime_event_type = runtime_handle.metadata.get("runtime_event_type")
+            if isinstance(runtime_event_type, str) and runtime_event_type:
+                progress["runtime_event_type"] = runtime_event_type
+            if runtime_handle.backend == "claude" and runtime_handle.native_session_id:
+                progress["agent_session_id"] = runtime_handle.native_session_id
+        if self._task_workspace is not None:
+            progress["workspace"] = self._task_workspace.to_progress_dict()
+
+        return progress
+
+    def _build_progress_event(
+        self,
+        session_id: str,
+        message: AgentMessage,
+        *,
+        step: int | None = None,
+    ):
+        """Create an enriched progress event from a normalized runtime message."""
+        projected = project_runtime_message(message)
+        message_type = projected.message_type
+        tool_name = projected.tool_name
+        event = create_progress_event(
+            session_id=session_id,
+            message_type=message_type,
+            content_preview=projected.content,
+            step=step,
+            tool_name=tool_name if message_type in {"tool", "tool_result"} else None,
+        )
+        event_data = {
+            **event.data,
+            **projected.runtime_metadata,
+            "progress": {
+                "last_message_type": message_type,
+                "last_content_preview": projected.content[:200],
+            },
+        }
+        runtime = event_data.get("runtime")
+        if isinstance(runtime, dict):
+            event_data["progress"]["runtime"] = runtime
+        runtime_event_type = event_data.get("runtime_event_type")
+        if isinstance(runtime_event_type, str) and runtime_event_type:
+            event_data["progress"]["runtime_event_type"] = runtime_event_type
+        thinking = event_data.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            event_data["progress"]["thinking"] = thinking
+        ac_tracking = coerce_ac_marker_update(event_data.get("ac_tracking"))
+        if not ac_tracking.is_empty:
+            event_data["progress"]["ac_tracking"] = ac_tracking.to_dict()
+        return event.model_copy(update={"data": event_data})
+
+    def _build_tool_called_event(
+        self,
+        session_id: str,
+        message: AgentMessage,
+    ):
+        """Create an enriched tool-called event from a normalized runtime message."""
+        projected = project_runtime_message(message)
+        tool_name = projected.tool_name
+        if tool_name is None:
+            return None
+        event = create_tool_called_event(
+            session_id=session_id,
+            tool_name=tool_name,
+            tool_input_preview=self._message_tool_input_preview(message),
+        )
+        event_data = {
+            **event.data,
+            **projected.runtime_metadata,
+        }
+        return event.model_copy(update={"data": event_data})
+
+    @staticmethod
+    def _with_execution_node_identity(
+        acceptance_criteria: list[dict[str, Any]],
+        *,
+        execution_id: str,
+    ) -> list[dict[str, Any]]:
+        """Attach canonical node identity to top-level workflow progress items."""
+        enriched: list[dict[str, Any]] = []
+        for order, raw_ac in enumerate(acceptance_criteria):
+            ac = dict(raw_ac)
+            raw_index = ac.get("index")
+            ac_index = raw_index - 1 if isinstance(raw_index, int) and raw_index > 0 else order
+            node_identity = ExecutionNodeIdentity.root(
+                execution_context_id=execution_id,
+                ac_index=ac_index,
+            )
+            runtime_scope = build_ac_runtime_scope(
+                ac_index,
+                execution_context_id=execution_id,
+                node_id=node_identity.node_id,
+                node_path=node_identity.path,
+            )
+            enriched.append(
+                {
+                    **node_identity.to_event_metadata(),
+                    **ac,
+                    "ac_id": ac.get("ac_id") or runtime_scope.aggregate_id,
+                }
+            )
+        return enriched
+
+    @staticmethod
+    def _metadata_candidates(message: AgentMessage) -> tuple[Mapping[str, Any], ...]:
+        """Return structured metadata maps attached to a runtime message."""
+        candidates: list[Mapping[str, Any]] = []
+        seen: set[int] = set()
+
+        def add(value: object) -> None:
+            if not isinstance(value, Mapping):
+                return
+            identity = id(value)
+            if identity in seen:
+                return
+            seen.add(identity)
+            candidates.append(value)
+            for key in ("meta", "mcp_meta", "metadata", "error", "details", "response"):
+                nested = value.get(key)
+                if isinstance(nested, Mapping):
+                    add(nested)
+
+        add(message.data)
+        return tuple(candidates)
+
+    @staticmethod
+    def _parse_datetime(value: object) -> datetime | None:
+        """Parse an ISO timestamp defensively."""
+        if isinstance(value, datetime):
+            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+    @staticmethod
+    def _duration_text_to_seconds(text: str) -> int | None:
+        """Parse retry-window duration tokens from text into total seconds."""
+        total_seconds = 0.0
+        for match in _DURATION_PATTERN.finditer(text):
+            value = float(match.group("value"))
+            unit = match.group("unit").lower()
+            if unit.startswith("d"):
+                seconds = value * 24 * 60 * 60
+            elif unit.startswith("h"):
+                seconds = value * 60 * 60
+            elif unit.startswith("m"):
+                seconds = value * 60
+            else:
+                seconds = value
+            total_seconds += seconds
+        if total_seconds <= 0:
+            return None
+        return max(1, math.ceil(total_seconds))
+
+    @classmethod
+    def _duration_value_to_seconds(cls, value: object) -> int | None:
+        """Parse a numeric or textual retry duration into seconds."""
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, int | float):
+            if value <= 0:
+                return None
+            return max(1, math.ceil(value))
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                numeric = float(stripped)
+            except ValueError:
+                return cls._duration_text_to_seconds(stripped)
+            if numeric <= 0:
+                return None
+            return max(1, math.ceil(numeric))
+        return None
+
+    @classmethod
+    def _duration_from_metadata(
+        cls,
+        metadata: Mapping[str, Any],
+        *,
+        now: datetime,
+    ) -> int | None:
+        """Extract retry/pause duration from structured runtime metadata."""
+        for key in (
+            "pause_seconds",
+            "retry_after_seconds",
+            "retryAfterSeconds",
+            "reset_after_seconds",
+            "resetAfterSeconds",
+        ):
+            parsed = cls._duration_value_to_seconds(metadata.get(key))
+            if parsed is not None:
+                return parsed
+
+        for key in ("retry_after_ms", "retryAfterMs", "reset_after_ms", "resetAfterMs"):
+            parsed = cls._duration_value_to_seconds(metadata.get(key))
+            if parsed is not None:
+                return max(1, math.ceil(parsed / 1000))
+
+        for key in ("retry_after", "retryAfter", "reset_after", "resetAfter"):
+            value = metadata.get(key)
+            parsed_datetime = cls._parse_datetime(value)
+            if parsed_datetime is not None:
+                seconds = math.ceil((parsed_datetime - now).total_seconds())
+                if seconds > 0:
+                    return seconds
+            parsed_duration = cls._duration_value_to_seconds(value)
+            if parsed_duration is not None:
+                return parsed_duration
+
+        for key in ("resume_after", "resumeAfter", "reset_at", "resetAt"):
+            parsed_datetime = cls._parse_datetime(metadata.get(key))
+            if parsed_datetime is not None:
+                seconds = math.ceil((parsed_datetime - now).total_seconds())
+                if seconds > 0:
+                    return seconds
+
+        return None
+
+    @classmethod
+    def _duration_from_message(cls, message: AgentMessage, *, now: datetime) -> int | None:
+        """Extract a retry/pause duration from metadata, then final error text."""
+        for metadata in cls._metadata_candidates(message):
+            duration = cls._duration_from_metadata(metadata, now=now)
+            if duration is not None:
+                return duration
+
+        return cls._duration_text_to_seconds(message.content)
+
+    @staticmethod
+    def _metadata_has_runtime_error_shape(metadata: Mapping[str, Any]) -> bool:
+        """Return True when metadata looks like provider/runtime error data."""
+        runtime_keys = {
+            "error_type",
+            "error_code",
+            "code",
+            "status",
+            "status_code",
+            "http_status",
+            "provider",
+            "recoverable",
+            "is_retriable",
+            "retriable",
+            "retry_after",
+            "retry_after_seconds",
+            "retryAfter",
+            "retryAfterSeconds",
+            "resume_after",
+            "reset_at",
+            "reset_after",
+        }
+        return any(key in metadata for key in runtime_keys)
+
+    @classmethod
+    def _message_has_runtime_error_shape(cls, message: AgentMessage) -> bool:
+        """Return True when any attached metadata looks runtime-owned."""
+        return any(
+            cls._metadata_has_runtime_error_shape(metadata)
+            for metadata in cls._metadata_candidates(message)
+        )
+
+    @staticmethod
+    def _metadata_text(metadata: Mapping[str, Any]) -> str:
+        """Flatten common structured error fields for quota classification."""
+        values: list[str] = []
+        for key in (
+            "error_type",
+            "error_code",
+            "code",
+            "type",
+            "reason",
+            "message",
+            "status",
+            "provider",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                values.append(value)
+        return " ".join(values).lower()
+
+    @staticmethod
+    def _is_usage_limit_text(text: str, *, has_runtime_error_shape: bool) -> bool:
+        """Classify provider usage/quota window messages with conservative text rules."""
+        normalized = " ".join(text.lower().split())
+        if not normalized:
+            return False
+        if not has_runtime_error_shape:
+            return False
+
+        has_quota_phrase = any(
+            pattern.search(normalized) is not None for pattern in _USAGE_LIMIT_TEXT_PATTERNS
+        )
+        duration_seconds = OrchestratorRunner._duration_text_to_seconds(normalized)
+        has_long_retry_window = (
+            duration_seconds is not None
+            and duration_seconds >= _LONG_RETRY_AFTER_SECONDS
+            and re.search(
+                r"\b(?:try again|retry|come back|available|reset|resets|window)\b",
+                normalized,
+            )
+            is not None
+        )
+        mentions_limit_window = (
+            re.search(
+                r"\b(?:usage|quota|allowance|rate|request)\s+"
+                r"(?:limit|quota|cap|window|allowance)\b",
+                normalized,
+            )
+            is not None
+        )
+
+        if has_quota_phrase and (has_runtime_error_shape or duration_seconds is not None):
+            return True
+        return bool(has_long_retry_window and mentions_limit_window)
+
+    @classmethod
+    def _usage_limit_failure_from_metadata(
+        cls,
+        message: AgentMessage,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Return True when structured metadata identifies a quota-window failure."""
+        for metadata in cls._metadata_candidates(message):
+            recovery = metadata.get("recovery")
+            if isinstance(recovery, Mapping):
+                kind = str(recovery.get("kind", "")).strip().lower()
+                if kind in _USAGE_LIMIT_RECOVERY_KINDS:
+                    return True
+
+            if metadata.get("usage_limit") is True or metadata.get("quota_exhausted") is True:
+                return True
+
+            metadata_text = cls._metadata_text(metadata)
+            duration = cls._duration_from_metadata(metadata, now=now)
+            if duration is not None and duration >= _LONG_RETRY_AFTER_SECONDS:
+                if re.search(r"\b(?:usage|quota|allowance|limit|window)\b", metadata_text):
+                    return True
+
+            if metadata_text and cls._is_usage_limit_text(
+                metadata_text,
+                has_runtime_error_shape=True,
+            ):
+                return True
+
+        return False
+
+    @staticmethod
+    def _format_pause_duration(seconds: int) -> str:
+        """Return a compact human-readable duration for pause hints."""
+        if seconds % (24 * 60 * 60) == 0:
+            days = seconds // (24 * 60 * 60)
+            return f"{days} day{'s' if days != 1 else ''}"
+        if seconds % (60 * 60) == 0:
+            hours = seconds // (60 * 60)
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+    def _usage_limit_pause(
+        self,
+        message: AgentMessage,
+        *,
+        now: datetime,
+    ) -> RecoverableFailurePause | None:
+        """Return a pause decision for provider usage/quota window failures."""
+        has_runtime_error_shape = self._message_has_runtime_error_shape(message)
+        is_usage_limit = self._usage_limit_failure_from_metadata(
+            message,
+            now=now,
+        ) or self._is_usage_limit_text(
+            message.content,
+            has_runtime_error_shape=has_runtime_error_shape,
+        )
+        if not is_usage_limit:
+            return None
+
+        from ouroboros.config import get_usage_limit_pause_seconds
+
+        default_pause_seconds = get_usage_limit_pause_seconds()
+
+        pause_seconds = self._duration_from_message(message, now=now) or default_pause_seconds
+        pause_seconds = max(1, pause_seconds)
+        resume_after = now + timedelta(seconds=pause_seconds)
+        duration_display = self._format_pause_duration(pause_seconds)
+        return RecoverableFailurePause(
+            pause_kind="usage_limit",
+            reason=message.content,
+            pause_seconds=pause_seconds,
+            resume_after=resume_after,
+            resume_hint=(
+                "Provider usage/quota window reached. "
+                f"Resume after {resume_after.isoformat()} "
+                f"(wait at least {duration_display})."
+            ),
+        )
+
+    @classmethod
+    def _resume_retry_pause(cls, message: AgentMessage) -> RecoverableFailurePause | None:
+        """Return a pause decision for recoverable resume-bootstrap failures."""
+        for metadata in cls._metadata_candidates(message):
+            recovery = metadata.get("recovery")
+            if not isinstance(recovery, Mapping):
+                continue
+            kind = str(recovery.get("kind", "")).strip().lower()
+            if kind == _RESUME_RETRY_RECOVERY_KIND:
+                return RecoverableFailurePause(
+                    pause_kind=_RESUME_RETRY_RECOVERY_KIND,
+                    reason=message.content,
+                    resume_hint=(
+                        "Retry the same --resume session after fixing the runtime/tooling issue."
+                    ),
+                )
+        return None
+
+    def _recoverable_failure_pause(
+        self,
+        message: AgentMessage,
+        *,
+        now: datetime | None = None,
+    ) -> RecoverableFailurePause | None:
+        """Return pause metadata when a final runtime error should stay resumable."""
+        if not (message.is_final and message.is_error):
+            return None
+
+        resume_retry = self._resume_retry_pause(message)
+        if resume_retry is not None:
+            return resume_retry
+
+        return self._usage_limit_pause(message, now=now or datetime.now(UTC))
+
+    def _is_recoverable_resume_failure(self, message: AgentMessage) -> bool:
+        """Return True when a final error should leave the session resumable."""
+        return self._recoverable_failure_pause(message) is not None
+
+    def _recoverable_failure_pause_from_parallel_result(
+        self,
+        parallel_result: Any,
+        *,
+        now: datetime | None = None,
+    ) -> RecoverableFailurePause | None:
+        """Return a pause only when every executed failure is recoverable."""
+
+        def iter_leaf_ac_results(results: tuple[Any, ...]) -> Any:
+            for result in results:
+                sub_results = getattr(result, "sub_results", ())
+                if isinstance(sub_results, tuple) and sub_results:
+                    yield from iter_leaf_ac_results(sub_results)
+                else:
+                    yield result
+
+        def latest_pause(
+            current: RecoverableFailurePause,
+            candidate: RecoverableFailurePause,
+        ) -> RecoverableFailurePause:
+            current_resume_after = current.resume_after or datetime.min.replace(tzinfo=UTC)
+            candidate_resume_after = candidate.resume_after or datetime.min.replace(tzinfo=UTC)
+            if candidate_resume_after > current_resume_after:
+                return candidate
+            if candidate_resume_after == current_resume_after and (candidate.pause_seconds or 0) > (
+                current.pause_seconds or 0
+            ):
+                return candidate
+            return current
+
+        resolved_now = now or datetime.now(UTC)
+        results = getattr(parallel_result, "results", ())
+        if not isinstance(results, tuple):
+            return None
+
+        selected_pause: RecoverableFailurePause | None = None
+        found_failure = False
+
+        for ac_result in iter_leaf_ac_results(results):
+            if bool(getattr(ac_result, "is_invalid", False)):
+                return None
+            if not bool(getattr(ac_result, "is_failure", False)):
+                continue
+
+            found_failure = True
+            messages = getattr(ac_result, "messages", ())
+            if not isinstance(messages, tuple):
+                return None
+
+            failure_pause = None
+            for message in reversed(messages):
+                pause = self._recoverable_failure_pause(message, now=resolved_now)
+                if pause is not None:
+                    failure_pause = pause
+                    break
+
+            if failure_pause is None:
+                return None
+
+            selected_pause = (
+                failure_pause
+                if selected_pause is None
+                else latest_pause(selected_pause, failure_pause)
+            )
+
+        if not found_failure:
+            return None
+
+        return selected_pause
+
+    async def _terminate_runtime_handle(
+        self,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        session_id: str,
+        context: str,
+    ) -> None:
+        """Best-effort live runtime termination for handles that remain controllable."""
+        if runtime_handle is None or not runtime_handle.can_terminate:
+            return
+
+        try:
+            terminated = await runtime_handle.terminate()
+        except Exception as exc:
+            log.warning(
+                "orchestrator.runner.runtime_handle_terminate_failed",
+                session_id=session_id,
+                context=context,
+                backend=runtime_handle.backend,
+                error=str(exc),
+            )
+            return
+
+        if terminated:
+            log.info(
+                "orchestrator.runner.runtime_handle_terminated",
+                session_id=session_id,
+                context=context,
+                backend=runtime_handle.backend,
+            )
+
+    def _should_emit_progress_event(
+        self,
+        message: AgentMessage,
+        messages_processed: int,
+    ) -> bool:
+        """Determine whether a message should emit a persisted progress event."""
+        projected = project_runtime_message(message)
+        runtime_backend = message.resume_handle.backend if message.resume_handle else None
+        return (
+            message.is_final
+            or messages_processed % PROGRESS_EMIT_INTERVAL == 0
+            or projected.is_tool_call
+            or projected.thinking is not None
+            or message.type == "system"
+            or runtime_backend == "opencode"
+            or projected.is_tool_result
+        )
+
+    async def _update_and_persist_progress(
+        self,
+        tracker: SessionTracker,
+        message: AgentMessage,
+        messages_processed: int,
+        session_id: str,
+    ) -> SessionTracker:
+        """Update tracker progress and persist when needed.
+
+        Persists on: final message, every N messages, or runtime handle change.
+        Returns updated tracker.
+        """
+        previous_runtime = tracker.progress.get("runtime")
+        progress_update = self._build_progress_update(message, messages_processed)
+        tracker = tracker.with_progress(progress_update)
+
+        # Compare runtime dicts ignoring the volatile updated_at field
+        def _stable_runtime(rt: Any) -> Any:
+            if isinstance(rt, dict):
+                return {k: v for k, v in rt.items() if k != "updated_at"}
+            return rt
+
+        should_persist = (
+            message.is_final
+            or messages_processed % SESSION_PROGRESS_PERSIST_INTERVAL == 0
+            or _stable_runtime(progress_update.get("runtime")) != _stable_runtime(previous_runtime)
+        )
+        if should_persist:
+            await self._persist_session_progress(session_id, progress_update)
+        return tracker
+
+    async def _persist_session_progress(
+        self,
+        session_id: str,
+        progress: dict[str, Any],
+    ) -> None:
+        """Persist session progress without interrupting execution on failure."""
+        if self._task_workspace is not None:
+            heartbeat_lock(self._task_workspace.lock_path)
+        result = await self._session_repo.track_progress(session_id, progress)
+        if result.is_err:
+            log.warning(
+                "orchestrator.runner.progress_persist_failed",
+                session_id=session_id,
+                error=str(result.error),
+            )
+
+    async def _replay_workflow_state(
+        self,
+        session_id: str,
+        state_tracker: Any,
+    ) -> None:
+        """Replay persisted session progress events into workflow state."""
+        try:
+            events = await self._event_store.replay("session", session_id)
+        except Exception as e:
+            log.warning(
+                "orchestrator.runner.workflow_state_replay_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return
+
+        state_tracker.replay_progress_events(events)
+
+    async def cancel_execution(
+        self,
+        execution_id: str,
+        reason: str = "Cancelled by user",
+        cancelled_by: str = "user",
+    ) -> Result[dict[str, Any], OrchestratorError]:
+        """Cancel a running execution gracefully.
+
+        This is the shared cancellation entry point used by both the MCP tool
+        and CLI command. It signals the in-flight execution to stop at the
+        next message boundary and updates the session status to CANCELLED.
+
+        If the execution is actively running in this runner instance, adds
+        the session to the cancellation registry so the message loop exits
+        gracefully. If the execution is not found in-flight (e.g., orphaned
+        or stuck), marks the session as cancelled directly via the repository.
+
+        Args:
+            execution_id: Execution ID to cancel.
+            reason: Human-readable cancellation reason.
+            cancelled_by: Who/what initiated cancellation ("user", "auto_cleanup").
+
+        Returns:
+            Result with cancellation details on success, or error.
+        """
+        session_id = self._active_sessions.get(execution_id)
+
+        if session_id is not None:
+            # In-flight cancellation: signal via the cancellation registry
+            await request_cancellation(session_id)
+            log.info(
+                "orchestrator.runner.cancellation_requested",
+                execution_id=execution_id,
+                session_id=session_id,
+                reason=reason,
+                cancelled_by=cancelled_by,
+                in_flight=True,
+            )
+            # The message loop will detect this and call _handle_cancellation
+            return Result.ok(
+                {
+                    "execution_id": execution_id,
+                    "session_id": session_id,
+                    "status": "cancellation_requested",
+                    "in_flight": True,
+                    "reason": reason,
+                }
+            )
+
+        # Not in-flight: cancel directly via session repository
+        return await self._cancel_session_directly(
+            execution_id=execution_id,
+            reason=reason,
+            cancelled_by=cancelled_by,
+        )
+
+    async def _cancel_session_directly(
+        self,
+        execution_id: str,
+        reason: str,
+        cancelled_by: str,
+    ) -> Result[dict[str, Any], OrchestratorError]:
+        """Cancel a session directly via the repository (not in-flight).
+
+        Used for orphaned/stuck executions that are no longer actively
+        running in this process. Looks up the session_id from the event
+        store and marks it as cancelled.
+
+        Args:
+            execution_id: Execution ID being cancelled.
+            reason: Human-readable cancellation reason.
+            cancelled_by: Who/what initiated cancellation.
+
+        Returns:
+            Result with cancellation details on success, or error.
+        """
+        session_id: str | None = None
+        # Try to find session_id from event store
+        try:
+            events = await self._event_store.get_all_sessions()
+            for event in events:
+                if (
+                    event.type == "orchestrator.session.started"
+                    and event.data.get("execution_id") == execution_id
+                ):
+                    session_id = event.aggregate_id
+                    break
+        except Exception as e:
+            log.warning(
+                "orchestrator.runner.session_lookup_failed",
+                execution_id=execution_id,
+                error=str(e),
+            )
+
+        if session_id is None:
+            return Result.err(
+                OrchestratorError(
+                    message=f"No session found for execution {execution_id}",
+                    details={"execution_id": execution_id},
+                )
+            )
+
+        # Guard: do not overwrite a terminal state (completed/failed/cancelled)
+        _terminal_event_types = frozenset(
+            {
+                "orchestrator.session.completed",
+                "orchestrator.session.failed",
+                "orchestrator.session.cancelled",
+            }
+        )
+        try:
+            session_events = await self._event_store.query_events(
+                aggregate_id=session_id,
+                limit=100,
+            )
+            for ev in session_events:
+                if ev.type in _terminal_event_types:
+                    log.info(
+                        "orchestrator.runner.cancel_skipped_terminal",
+                        execution_id=execution_id,
+                        session_id=session_id,
+                        terminal_event=ev.type,
+                    )
+                    return Result.ok(
+                        {
+                            "execution_id": execution_id,
+                            "session_id": session_id,
+                            "status": "already_terminal",
+                            "terminal_event": ev.type,
+                            "reason": reason,
+                        }
+                    )
+        except Exception as e:
+            log.warning(
+                "orchestrator.runner.terminal_check_failed",
+                execution_id=execution_id,
+                session_id=session_id,
+                error=str(e),
+            )
+
+        # Mark as cancelled via repository
+        cancel_result = await self._session_repo.mark_cancelled(
+            session_id=session_id,
+            reason=reason,
+            cancelled_by=cancelled_by,
+        )
+
+        if cancel_result.is_err:
+            return Result.err(
+                OrchestratorError(
+                    message=f"Failed to cancel session: {cancel_result.error}",
+                    details={
+                        "execution_id": execution_id,
+                        "session_id": session_id,
+                    },
+                )
+            )
+
+        log.info(
+            "orchestrator.runner.session_cancelled_directly",
+            execution_id=execution_id,
+            session_id=session_id,
+            reason=reason,
+            cancelled_by=cancelled_by,
+        )
+
+        return Result.ok(
+            {
+                "execution_id": execution_id,
+                "session_id": session_id,
+                "status": "cancelled",
+                "in_flight": False,
+                "reason": reason,
+            }
+        )
+
     async def _get_merged_tools(
         self,
         session_id: str,
         tool_prefix: str = "",
         strategy: ExecutionStrategy | None = None,
-    ) -> tuple[list[str], MCPToolProvider | None]:
+    ) -> tuple[list[str], MCPToolProvider | None, SessionToolCatalog]:
         """Get merged tool list from strategy tools and MCP tools.
 
         Uses strategy.get_tools() as the base tool set (falls back to
@@ -277,14 +1615,56 @@ class OrchestratorRunner:
             strategy: Execution strategy providing base tool set.
 
         Returns:
-            Tuple of (merged tool names list, MCPToolProvider or None).
+            Tuple of (merged tool names list, MCPToolProvider or None, session catalog).
         """
         # Start with strategy tools (or DEFAULT_TOOLS as fallback)
         base_tools = strategy.get_tools() if strategy else list(DEFAULT_TOOLS)
-        merged_tools = list(base_tools)
+        inherited_mcp: set[str] = set()
+        if self._inherited_tools:
+            # Separate inherited tools into two buckets:
+            #
+            # 1. **Builtins** (Read, Edit, Bash, …) → added to ``base_tools``
+            #    so they receive real catalog entries with handlers.
+            #
+            # 2. **Bridge / MCP tools** → stored as ``inherited_capabilities``
+            #    on the session catalog.  They are *not* added to
+            #    ``base_tools`` because that would synthesize phantom catalog
+            #    entries (definitions with no backing handler).  When
+            #    ``self._mcp_manager`` is set, ``MCPToolProvider.get_tools()``
+            #    below discovers them with real server connections.  When the
+            #    manager is absent the names are still preserved so the
+            #    delegated-session capability contract is not silently lost.
+            known_builtins = {d.name for d in enumerate_runtime_builtin_tool_definitions()}
+            for tool_name in self._inherited_tools:
+                if tool_name in known_builtins and tool_name not in base_tools:
+                    base_tools.append(tool_name)
+                elif tool_name not in known_builtins:
+                    inherited_mcp.add(tool_name)
+                    log.info(
+                        "orchestrator.runner.inherited_mcp_capability_preserved",
+                        tool=tool_name,
+                        has_mcp_manager=self._mcp_manager is not None,
+                    )
+        session_catalog = assemble_session_tool_catalog(base_tools)
+        if inherited_mcp:
+            session_catalog = replace(
+                session_catalog,
+                inherited_capabilities=frozenset(inherited_mcp),
+            )
 
+        # Defer the pre-discovery policy evaluation.  Previously we computed
+        # it unconditionally and threw it away whenever MCP discovery
+        # succeeded.  Now we only evaluate once per path, so the
+        # post-discovery success case does not double-compute.
         if self._mcp_manager is None:
-            return merged_tools, None
+            policy_result = self._evaluate_tool_catalog_policy(session_catalog)
+            await self._emit_policy_capabilities_evaluated_event(
+                session_id,
+                policy_result.capability_graph,
+                policy_result.policy_decisions,
+                policy_result.policy_context,
+            )
+            return policy_result.allowed_tools, None, session_catalog
 
         # Create provider and get MCP tools
         provider = MCPToolProvider(
@@ -293,25 +1673,54 @@ class OrchestratorRunner:
         )
 
         try:
-            mcp_tools = await provider.get_tools(builtin_tools=DEFAULT_TOOLS)
+            mcp_tools = await provider.get_tools(builtin_tools=base_tools)
         except Exception as e:
             log.warning(
                 "orchestrator.runner.mcp_tools_load_failed",
                 session_id=session_id,
                 error=str(e),
             )
-            return merged_tools, None
+            policy_result = self._evaluate_tool_catalog_policy(session_catalog)
+            await self._emit_policy_capabilities_evaluated_event(
+                session_id,
+                policy_result.capability_graph,
+                policy_result.policy_decisions,
+                policy_result.policy_context,
+            )
+            return policy_result.allowed_tools, None, session_catalog
 
         if not mcp_tools:
             log.info(
                 "orchestrator.runner.no_mcp_tools_available",
                 session_id=session_id,
             )
-            return merged_tools, provider
+            policy_result = self._evaluate_tool_catalog_policy(session_catalog)
+            await self._emit_policy_capabilities_evaluated_event(
+                session_id,
+                policy_result.capability_graph,
+                policy_result.policy_decisions,
+                policy_result.policy_context,
+            )
+            return policy_result.allowed_tools, provider, session_catalog
 
-        # Add MCP tool names to merged list
+        session_catalog = provider.session_catalog
+        # Preserve inherited MCP capabilities after discovery replaces the
+        # catalog.  The provider builds a fresh catalog from live connections
+        # which does not know about the parent's capability grant.
+        if inherited_mcp:
+            session_catalog = replace(
+                session_catalog,
+                inherited_capabilities=frozenset(inherited_mcp),
+            )
+        policy_result = self._evaluate_tool_catalog_policy(session_catalog)
+        merged_tools = policy_result.allowed_tools
+        await self._emit_policy_capabilities_evaluated_event(
+            session_id,
+            policy_result.capability_graph,
+            policy_result.policy_decisions,
+            policy_result.policy_context,
+        )
         mcp_tool_names = [t.name for t in mcp_tools]
-        merged_tools.extend(mcp_tool_names)
 
         # Log conflicts
         for conflict in provider.conflicts:
@@ -342,13 +1751,192 @@ class OrchestratorRunner:
             servers=server_names,
         )
 
-        return merged_tools, provider
+        return merged_tools, provider, session_catalog
+
+    async def _check_cancellation(self, session_id: str) -> bool:
+        """Check for cancellation via in-memory registry and event store.
+
+        First checks the in-memory cancellation registry (fast path) which is
+        populated by the MCP cancel tool. Falls back to querying the event store
+        for ``orchestrator.session.cancelled`` events so that cancellations
+        persisted by the CLI or other processes are also detected.
+
+        Args:
+            session_id: Session ID to check for cancellation.
+
+        Returns:
+            True if cancellation was requested, False otherwise.
+        """
+        # Fast path: check the in-memory cancellation set first.
+        # This is O(1) and requires no I/O.
+        if await is_cancellation_requested(session_id):
+            return True
+
+        # Slow path: check event store for externally-persisted cancellation
+        try:
+            events = await self._event_store.query_events(
+                aggregate_id=session_id,
+                event_type="orchestrator.session.cancelled",
+                limit=1,
+            )
+            return len(events) > 0
+        except Exception:
+            # Graceful degradation: if event store query fails,
+            # don't interrupt execution — just log and continue
+            log.warning(
+                "orchestrator.runner.cancellation_check_failed",
+                session_id=session_id,
+            )
+            return False
+
+    async def _check_startup_cancellation(self, session_id: str) -> bool:
+        """Check cancellation before normal message-loop checkpoints exist."""
+        if await is_cancellation_requested(session_id):
+            return True
+        try:
+            events = await self._event_store.query_events(
+                aggregate_id=session_id,
+                event_type="orchestrator.session.cancelled",
+                limit=1,
+            )
+            return len(events) > 0
+        except Exception:
+            log.warning(
+                "orchestrator.runner.startup_cancellation_check_failed",
+                session_id=session_id,
+            )
+            return False
+
+    async def _handle_cancellation(
+        self,
+        session_id: str,
+        execution_id: str,
+        messages_processed: int,
+        start_time: datetime,
+    ) -> Result[OrchestratorResult, OrchestratorError]:
+        """Handle a detected cancellation by marking the session and returning a result.
+
+        Args:
+            session_id: Session that was cancelled.
+            execution_id: Execution ID for the result.
+            messages_processed: Number of messages processed before cancellation.
+            start_time: When execution started.
+
+        Returns:
+            Result containing OrchestratorResult with success=False and cancellation info.
+        """
+        duration = (datetime.now(UTC) - start_time).total_seconds()
+
+        log.info(
+            "orchestrator.runner.execution_cancelled",
+            session_id=session_id,
+            execution_id=execution_id,
+            messages_processed=messages_processed,
+            duration_seconds=duration,
+        )
+
+        # Clear the in-memory cancellation flag so it doesn't linger
+        await clear_cancellation(session_id)
+
+        # Clean up session tracking
+        self._unregister_session(execution_id, session_id)
+        if self._task_workspace is not None:
+            release_lock(self._task_workspace.lock_path)
+
+        # Only mark cancelled if not already in a terminal state
+        session_result = await self._session_repo.reconstruct_session(session_id)
+        _terminal = {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED}
+        session_already_terminal = session_result.is_ok and session_result.value.status in _terminal
+        if session_already_terminal:
+            terminal_status = session_result.value.status
+            final_message = f"Execution already {terminal_status.value}"
+            summary = {"terminal_status": terminal_status.value, **self._task_summary()}
+            if terminal_status == SessionStatus.CANCELLED:
+                summary["cancelled"] = True
+            try:
+                execution_terminal_events = await self._event_store.query_events(
+                    aggregate_id=execution_id,
+                    event_type="execution.terminal",
+                    limit=1,
+                )
+            except Exception:
+                execution_terminal_events = []
+            if not execution_terminal_events:
+                await self._event_store.append(
+                    create_execution_terminal_event(
+                        execution_id=execution_id,
+                        session_id=session_id,
+                        status=terminal_status.value,
+                        summary=summary if terminal_status == SessionStatus.COMPLETED else None,
+                        error_message=(
+                            final_message if terminal_status != SessionStatus.COMPLETED else None
+                        ),
+                        messages_processed=messages_processed,
+                    )
+                )
+            return Result.ok(
+                OrchestratorResult(
+                    success=terminal_status == SessionStatus.COMPLETED,
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    summary=summary,
+                    messages_processed=messages_processed,
+                    final_message=final_message,
+                    duration_seconds=duration,
+                )
+            )
+
+        cancel_result = await self._session_repo.mark_cancelled(
+            session_id,
+            reason="Cancellation detected during execution",
+            cancelled_by="runner",
+        )
+        if cancel_result is not None and cancel_result.is_err:
+            log.warning(
+                "orchestrator.runner.mark_cancelled_failed",
+                session_id=session_id,
+                error=str(cancel_result.error),
+            )
+
+        # Mirror cancellation into execution stream for TUI.
+        await self._event_store.append(
+            create_execution_terminal_event(
+                execution_id=execution_id,
+                session_id=session_id,
+                status="cancelled",
+                error_message="Execution cancelled by external request",
+                messages_processed=messages_processed,
+            )
+        )
+
+        # Display cancellation notice
+        self._console.print(
+            Panel(
+                Text("Execution cancelled by external request", style="yellow"),
+                title="[yellow]Execution Cancelled[/yellow]",
+                border_style="yellow",
+            )
+        )
+
+        return Result.ok(
+            OrchestratorResult(
+                success=False,
+                session_id=session_id,
+                execution_id=execution_id,
+                summary={"cancelled": True, **self._task_summary()},
+                messages_processed=messages_processed,
+                final_message="Execution cancelled by external request",
+                duration_seconds=duration,
+            )
+        )
 
     async def execute_seed(
         self,
         seed: Seed,
         execution_id: str | None = None,
+        session_id: str | None = None,
         parallel: bool = True,
+        externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed via Claude Agent.
 
@@ -359,13 +1947,82 @@ class OrchestratorRunner:
         Args:
             seed: Seed specification to execute.
             execution_id: Optional execution ID. Generated if not provided.
+            session_id: Optional session ID to preallocate for external tracking.
             parallel: Enable parallel AC execution. When True, independent ACs
                      run concurrently. Default: True (parallel execution).
+            externally_satisfied_acs: Top-level ACs already satisfied by the
+                current working tree and therefore skipped for re-execution.
 
         Returns:
             Result containing OrchestratorResult on success.
         """
+        session_result = await self.prepare_session(seed, execution_id=execution_id)
+        if session_result.is_err:
+            return Result.err(session_result.error)
+
+        execute_kwargs: dict[str, Any] = {
+            "seed": seed,
+            "tracker": session_result.value,
+            "parallel": parallel,
+        }
+        if externally_satisfied_acs:
+            execute_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
+
+        return await self.execute_precreated_session(**execute_kwargs)
+
+    async def prepare_session(
+        self,
+        seed: Seed,
+        execution_id: str | None = None,
+        session_id: str | None = None,
+    ) -> Result[SessionTracker, OrchestratorError]:
+        """Create and persist the orchestration session before execution begins.
+
+        This allows callers such as MCP handlers to return stable tracking IDs
+        immediately and then start the actual runtime work asynchronously.
+        """
         exec_id = execution_id or f"exec_{uuid4().hex[:12]}"
+        session_result = await self._session_repo.create_session(
+            execution_id=exec_id,
+            seed_id=seed.metadata.seed_id,
+            session_id=session_id,
+            seed_goal=seed.goal,
+        )
+
+        if session_result.is_err:
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+            return Result.err(
+                OrchestratorError(
+                    message=f"Failed to create session: {session_result.error}",
+                    details={"execution_id": exec_id, "session_id": session_id},
+                )
+            )
+
+        tracker = session_result.value
+        if self._task_workspace is not None:
+            progress_result = await self._session_repo.track_progress(
+                tracker.session_id,
+                {"workspace": self._task_workspace.to_progress_dict()},
+            )
+            if progress_result.is_err:
+                log.warning(
+                    "orchestrator.runner.workspace_progress_seed_failed",
+                    session_id=tracker.session_id,
+                    error=str(progress_result.error),
+                )
+
+        return Result.ok(tracker)
+
+    async def execute_precreated_session(
+        self,
+        seed: Seed,
+        tracker: SessionTracker,
+        parallel: bool = True,
+        externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
+    ) -> Result[OrchestratorResult, OrchestratorError]:
+        """Execute a seed using an already-persisted orchestrator session."""
+        exec_id = tracker.execution_id
         start_time = datetime.now(UTC)
 
         # Control console logging based on debug mode
@@ -376,71 +2033,96 @@ class OrchestratorRunner:
         log.info(
             "orchestrator.runner.execute_started",
             execution_id=exec_id,
+            session_id=tracker.session_id,
             seed_id=seed.metadata.seed_id,
             goal=seed.goal[:100],
         )
+        session_registered = False
 
-        # Create session
-        session_result = await self._session_repo.create_session(
-            execution_id=exec_id,
-            seed_id=seed.metadata.seed_id,
-        )
-
-        if session_result.is_err:
-            return Result.err(
-                OrchestratorError(
-                    message=f"Failed to create session: {session_result.error}",
-                    details={"execution_id": exec_id},
+        try:
+            # Register session for cancellation tracking
+            self._register_session(exec_id, tracker.session_id)
+            session_registered = True
+            if await self._check_startup_cancellation(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=0,
+                    start_time=start_time,
                 )
+
+            # Build prompts with strategy
+            strategy = get_strategy(seed.task_type)
+            system_prompt = build_system_prompt(seed, strategy=strategy)
+            task_prompt = build_task_prompt(seed, strategy=strategy)
+
+            # Get merged tools (strategy tools + MCP tools if configured)
+            merged_tools, mcp_provider, tool_catalog = await self._get_merged_tools(
+                session_id=tracker.session_id,
+                tool_prefix=self._mcp_tool_prefix,
+                strategy=strategy,
             )
 
-        tracker = session_result.value
+            # Execute with progress display
+            messages_processed = 0
+            final_message = ""
+            success = False
 
-        # Emit session started event
-        start_event = create_session_started_event(
-            session_id=tracker.session_id,
-            execution_id=exec_id,
-            seed_id=seed.metadata.seed_id,
-            seed_goal=seed.goal,
-        )
-        await self._event_store.append(start_event)
+            # Create workflow state tracker for progress display
+            from ouroboros.orchestrator.workflow_state import WorkflowStateTracker
 
-        # Build prompts with strategy
-        strategy = get_strategy(seed.task_type)
-        system_prompt = build_system_prompt(seed, strategy=strategy)
-        task_prompt = build_task_prompt(seed, strategy=strategy)
+            state_tracker = WorkflowStateTracker(
+                acceptance_criteria=seed.acceptance_criteria,
+                goal=seed.goal,
+                session_id=tracker.session_id,
+                activity_map=strategy.get_activity_map(),
+            )
 
-        # Get merged tools (strategy tools + MCP tools if configured)
-        merged_tools, mcp_provider = await self._get_merged_tools(
-            session_id=tracker.session_id,
-            tool_prefix=self._mcp_tool_prefix,
-            strategy=strategy,
-        )
+            # Check for parallel execution mode
+            if parallel and len(seed.acceptance_criteria) > 1:
+                parallel_kwargs: dict[str, Any] = {
+                    "seed": seed,
+                    "exec_id": exec_id,
+                    "tracker": tracker,
+                    "merged_tools": merged_tools,
+                    "tool_catalog": tool_catalog,
+                    "system_prompt": system_prompt,
+                    "start_time": start_time,
+                }
+                if externally_satisfied_acs:
+                    parallel_kwargs["externally_satisfied_acs"] = externally_satisfied_acs
 
-        # Execute with progress display
-        messages_processed = 0
-        final_message = ""
-        success = False
-
-        # Create workflow state tracker for progress display
-        from ouroboros.orchestrator.workflow_state import WorkflowStateTracker
-
-        state_tracker = WorkflowStateTracker(
-            acceptance_criteria=seed.acceptance_criteria,
-            goal=seed.goal,
-            session_id=tracker.session_id,
-            activity_map=strategy.get_activity_map(),
-        )
-
-        # Check for parallel execution mode
-        if parallel and len(seed.acceptance_criteria) > 1:
-            return await self._execute_parallel(
-                seed=seed,
-                exec_id=exec_id,
-                tracker=tracker,
-                merged_tools=merged_tools,
-                system_prompt=system_prompt,
-                start_time=start_time,
+                return await self._execute_parallel(**parallel_kwargs)
+        except asyncio.CancelledError:
+            if session_registered and await is_cancellation_requested(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=0,
+                    start_time=start_time,
+                )
+            self._cleanup_pre_execution_state(
+                exec_id,
+                tracker.session_id,
+                session_registered=session_registered,
+            )
+            raise
+        except Exception as e:
+            self._cleanup_pre_execution_state(
+                exec_id,
+                tracker.session_id,
+                session_registered=session_registered,
+            )
+            log.exception(
+                "orchestrator.runner.execute_setup_failed",
+                execution_id=exec_id,
+                error=str(e),
+            )
+            return Result.err(
+                OrchestratorError(
+                    message=f"Orchestrator execution failed: {e}",
+                    details={"execution_id": exec_id},
+                )
             )
 
         try:
@@ -449,141 +2131,277 @@ class OrchestratorRunner:
 
             last_tool: str | None = None
             last_completed_count = 0
+            runtime_handle: RuntimeHandle | None = None
+            recovery_interventions_used = 0
+            recovery_personas: list[str] = []
+            recoverable_failure_pause: RecoverableFailurePause | None = None
+
+            cancelled_result: Result[OrchestratorResult, OrchestratorError] | None = None
+
+            async def _consume_task_stream(
+                *,
+                prompt: str,
+                resume_handle: RuntimeHandle | None,
+                status: Any,
+            ) -> RuntimeHandle | None:
+                nonlocal cancelled_result
+                nonlocal final_message
+                nonlocal last_completed_count
+                nonlocal last_tool
+                nonlocal messages_processed
+                nonlocal recoverable_failure_pause
+                nonlocal success
+                nonlocal tracker
+
+                active_runtime_handle = resume_handle
+                async with aclosing(
+                    self._adapter.execute_task(  # type: ignore[type-var]
+                        prompt=prompt,
+                        tools=merged_tools,
+                        system_prompt=system_prompt,
+                        resume_handle=active_runtime_handle,
+                    )
+                ) as message_stream:
+                    async for message in message_stream:
+                        messages_processed += 1
+                        projected = project_runtime_message(message)
+
+                        # Check for cancellation periodically
+                        if messages_processed % CANCELLATION_CHECK_INTERVAL == 0:
+                            if await self._check_cancellation(tracker.session_id):
+                                cancelled_result = await self._handle_cancellation(
+                                    session_id=tracker.session_id,
+                                    execution_id=exec_id,
+                                    messages_processed=messages_processed,
+                                    start_time=start_time,
+                                )
+                                break
+
+                        tracker = await self._update_and_persist_progress(
+                            tracker,
+                            message,
+                            messages_processed,
+                            tracker.session_id,
+                        )
+                        if message.resume_handle is not None:
+                            active_runtime_handle = message.resume_handle
+
+                        # Update workflow state tracker
+                        state_tracker.process_runtime_message(message)
+
+                        # Print log-style output for tool calls and agent messages
+                        if projected.tool_name and projected.tool_name != last_tool:
+                            status.stop()
+                            self._console.print(f"  [yellow]🔧 {projected.tool_name}[/yellow]")
+                            status.start()
+                            last_tool = projected.tool_name
+                        elif (
+                            projected.message_type == "assistant"
+                            and projected.content
+                            and not projected.tool_name
+                        ):
+                            # Show agent thinking/reasoning
+                            content = projected.content.strip()
+                            status.stop()
+                            self._console.print(f"  [dim]💭 {content}[/dim]")
+                            status.start()
+
+                        # Print when AC is completed
+                        current_completed = state_tracker.state.completed_count
+                        if current_completed > last_completed_count:
+                            status.stop()
+                            self._console.print(
+                                f"  [green]✓ AC {current_completed} completed[/green]"
+                            )
+                            status.start()
+                            last_completed_count = current_completed
+
+                        # Update status with current activity
+                        ac_progress = f"{state_tracker.state.completed_count}/{state_tracker.state.total_count}"
+                        tool_info = f" | {projected.tool_name}" if projected.tool_name else ""
+                        status.update(
+                            f"[bold cyan]AC {ac_progress}{tool_info} | {messages_processed} msgs[/]"
+                        )
+
+                        # Emit workflow progress event for TUI
+                        # Use exec_id defined at start of function (not execution_id param)
+                        progress_data = state_tracker.state.to_tui_message_data(
+                            execution_id=exec_id
+                        )
+                        workflow_event = create_workflow_progress_event(
+                            execution_id=exec_id,
+                            session_id=tracker.session_id,
+                            acceptance_criteria=self._with_execution_node_identity(
+                                progress_data["acceptance_criteria"],
+                                execution_id=exec_id,
+                            ),
+                            completed_count=progress_data["completed_count"],
+                            total_count=progress_data["total_count"],
+                            current_ac_index=progress_data["current_ac_index"],
+                            current_phase=progress_data["current_phase"],
+                            activity=progress_data["activity"],
+                            activity_detail=progress_data["activity_detail"],
+                            elapsed_display=progress_data["elapsed_display"],
+                            estimated_remaining=progress_data["estimated_remaining"],
+                            messages_count=progress_data["messages_count"],
+                            tool_calls_count=progress_data["tool_calls_count"],
+                            estimated_tokens=progress_data["estimated_tokens"],
+                            estimated_cost_usd=progress_data["estimated_cost_usd"],
+                            last_update=progress_data.get("last_update"),
+                        )
+                        await self._event_store.append(workflow_event)
+
+                        tool_event = self._build_tool_called_event(tracker.session_id, message)
+                        if tool_event is not None:
+                            await self._event_store.append(tool_event)
+
+                        if self._should_emit_progress_event(message, messages_processed):
+                            progress_event = self._build_progress_event(
+                                tracker.session_id,
+                                message,
+                                step=messages_processed,
+                            )
+                            await self._event_store.append(progress_event)
+
+                        # Measure and emit drift periodically
+                        if messages_processed % PROGRESS_EMIT_INTERVAL == 0:
+                            # Measure and emit drift
+                            drift_measurement = DriftMeasurement()
+                            drift_metrics = drift_measurement.measure(
+                                current_output=message.content,
+                                constraint_violations=[],  # TODO: track violations
+                                current_concepts=[],  # TODO: extract concepts
+                                seed=seed,
+                            )
+                            drift_event = create_drift_measured_event(
+                                execution_id=exec_id,
+                                goal_drift=drift_metrics.goal_drift,
+                                constraint_drift=drift_metrics.constraint_drift,
+                                ontology_drift=drift_metrics.ontology_drift,
+                                combined_drift=drift_metrics.combined_drift,
+                                is_acceptable=drift_metrics.is_acceptable,
+                            )
+                            await self._event_store.append(drift_event)
+
+                        # Handle final message
+                        if message.is_final:
+                            final_message = message.content
+                            success = not message.is_error
+                            recoverable_failure_pause = self._recoverable_failure_pause(
+                                message,
+                                now=datetime.now(UTC),
+                            )
+
+                return active_runtime_handle
+
+            def _build_recovery_snapshot() -> RecoverySnapshot:
+                unfinished = [
+                    f"{ac.index}. {ac.content}"
+                    for ac in state_tracker.state.acceptance_criteria
+                    if ac.status.value != "completed"
+                ]
+                unfinished_text = "\n".join(unfinished[:5]) or "None"
+                problem_context = (
+                    f"Goal: {seed.goal}\n"
+                    f"Unfinished acceptance criteria:\n{unfinished_text}\n\n"
+                    f"Previous final message:\n{final_message[:1000]}"
+                )
+                current_approach = (
+                    "The first run attempted the seed normally and ended without "
+                    "satisfying the workflow. Continue from the current repository "
+                    "state, but avoid repeating the same failed path."
+                )
+                return RecoverySnapshot(
+                    problem_context=problem_context,
+                    current_approach=current_approach,
+                    messages_processed=messages_processed,
+                    completed_count=state_tracker.state.completed_count,
+                    total_count=state_tracker.state.total_count,
+                    final_error=final_message,
+                    used_personas=tuple(ThinkingPersona(persona) for persona in recovery_personas),
+                    interventions_used=recovery_interventions_used,
+                )
 
             with Status(
                 f"[bold cyan]Executing: {seed.goal[:50]}...[/]",
                 console=self._console,
                 spinner="dots",
             ) as status:
-                async for message in self._adapter.execute_task(
+                runtime_handle = self._seed_runtime_handle(
+                    self._inherited_runtime_handle, tool_catalog=tool_catalog
+                )
+                runtime_handle = await _consume_task_stream(
                     prompt=task_prompt,
-                    tools=merged_tools,
-                    system_prompt=system_prompt,
+                    resume_handle=runtime_handle,
+                    status=status,
+                )
+
+                # Same-session recovery is limited to the sequential runner.
+                # Parallel execution owns per-AC retry semantics, and resume_session
+                # is already a recovery workflow.
+                if (
+                    cancelled_result is None
+                    and not success
+                    and recoverable_failure_pause is None
+                    and runtime_handle is not None
                 ):
-                    messages_processed += 1
-                    tracker = tracker.with_progress(
-                        {
-                            "last_message_type": message.type,
-                            "messages_processed": messages_processed,
-                        }
-                    )
-
-                    # Update workflow state tracker
-                    state_tracker.process_message(
-                        content=message.content,
-                        message_type=message.type,
-                        tool_name=message.tool_name,
-                        is_input=message.type == "user",
-                    )
-
-                    # Print log-style output for tool calls and agent messages
-                    if message.tool_name and message.tool_name != last_tool:
+                    planner = RecoveryPlanner()
+                    recovery_action = planner.plan(_build_recovery_snapshot())
+                    if (
+                        recovery_action.kind == RecoveryActionKind.INJECT_LATERAL_DIRECTIVE
+                        and recovery_action.directive
+                        and recovery_action.persona is not None
+                    ):
+                        recovery_interventions_used += 1
+                        recovery_personas.append(recovery_action.persona.value)
+                        await self._event_store.append(
+                            create_recovery_applied_event(
+                                execution_id=exec_id,
+                                session_id=tracker.session_id,
+                                seed_id=seed.metadata.seed_id,
+                                action=recovery_action,
+                                messages_processed=messages_processed,
+                                completed_count=state_tracker.state.completed_count,
+                                total_count=state_tracker.state.total_count,
+                            )
+                        )
                         status.stop()
-                        self._console.print(f"  [yellow]🔧 {message.tool_name}[/yellow]")
+                        self._console.print(
+                            "[yellow]Recovery: "
+                            f"{recovery_action.pattern.value if recovery_action.pattern else 'unknown'} "
+                            f"-> {recovery_action.persona.value}[/yellow]"
+                        )
                         status.start()
-                        last_tool = message.tool_name
-                    elif message.type == "assistant" and message.content and not message.tool_name:
-                        # Show agent thinking/reasoning
-                        content = message.content.strip()
-                        status.stop()
-                        self._console.print(f"  [dim]💭 {content}[/dim]")
-                        status.start()
-
-                    # Print when AC is completed
-                    current_completed = state_tracker.state.completed_count
-                    if current_completed > last_completed_count:
-                        status.stop()
-                        self._console.print(f"  [green]✓ AC {current_completed} completed[/green]")
-                        status.start()
-                        last_completed_count = current_completed
-
-                    # Update status with current activity
-                    ac_progress = (
-                        f"{state_tracker.state.completed_count}/{state_tracker.state.total_count}"
-                    )
-                    tool_info = f" | {message.tool_name}" if message.tool_name else ""
-                    status.update(
-                        f"[bold cyan]AC {ac_progress}{tool_info} | {messages_processed} msgs[/]"
-                    )
-
-                    # Emit workflow progress event for TUI
-                    # Use exec_id defined at start of function (not execution_id param)
-                    progress_data = state_tracker.state.to_tui_message_data(execution_id=exec_id)
-                    workflow_event = create_workflow_progress_event(
-                        execution_id=exec_id,
-                        session_id=tracker.session_id,
-                        acceptance_criteria=progress_data["acceptance_criteria"],
-                        completed_count=progress_data["completed_count"],
-                        total_count=progress_data["total_count"],
-                        current_ac_index=progress_data["current_ac_index"],
-                        current_phase=progress_data["current_phase"],
-                        activity=progress_data["activity"],
-                        activity_detail=progress_data["activity_detail"],
-                        elapsed_display=progress_data["elapsed_display"],
-                        estimated_remaining=progress_data["estimated_remaining"],
-                        messages_count=progress_data["messages_count"],
-                        tool_calls_count=progress_data["tool_calls_count"],
-                        estimated_tokens=progress_data["estimated_tokens"],
-                        estimated_cost_usd=progress_data["estimated_cost_usd"],
-                    )
-                    await self._event_store.append(workflow_event)
-
-                    # Emit tool called event
-                    if message.tool_name:
-                        tool_event = create_tool_called_event(
-                            session_id=tracker.session_id,
-                            tool_name=message.tool_name,
+                        runtime_handle = await _consume_task_stream(
+                            prompt=recovery_action.directive,
+                            resume_handle=runtime_handle,
+                            status=status,
                         )
-                        await self._event_store.append(tool_event)
 
-                    # Emit progress event periodically
-                    if messages_processed % PROGRESS_EMIT_INTERVAL == 0:
-                        progress_event = create_progress_event(
-                            session_id=tracker.session_id,
-                            message_type=message.type,
-                            content_preview=message.content,
-                            step=messages_processed,
-                            tool_name=message.tool_name,
-                        )
-                        await self._event_store.append(progress_event)
-
-                        # Measure and emit drift
-                        drift_measurement = DriftMeasurement()
-                        drift_metrics = drift_measurement.measure(
-                            current_output=message.content,
-                            constraint_violations=[],  # TODO: track violations
-                            current_concepts=[],  # TODO: extract concepts
-                            seed=seed,
-                        )
-                        drift_event = create_drift_measured_event(
-                            execution_id=exec_id,
-                            goal_drift=drift_metrics.goal_drift,
-                            constraint_drift=drift_metrics.constraint_drift,
-                            ontology_drift=drift_metrics.ontology_drift,
-                            combined_drift=drift_metrics.combined_drift,
-                            is_acceptable=drift_metrics.is_acceptable,
-                        )
-                        await self._event_store.append(drift_event)
-
-                    # Handle final message
-                    if message.is_final:
-                        final_message = message.content
-                        success = not message.is_error
+            # If cancelled, return the cancellation result now that the
+            # generator has been properly closed via aclosing.
+            if cancelled_result is not None:
+                return cancelled_result
 
             # Calculate duration
             duration = (datetime.now(UTC) - start_time).total_seconds()
 
             # Emit completion event
             if success:
+                completion_summary = {
+                    "final_message": final_message[:500],
+                    "messages_processed": messages_processed,
+                    **self._task_summary(),
+                }
                 completed_event = create_session_completed_event(
                     session_id=tracker.session_id,
-                    summary={"final_message": final_message[:500]},
+                    summary=completion_summary,
                     messages_processed=messages_processed,
                 )
                 await self._event_store.append(completed_event)
                 await self._session_repo.mark_completed(
                     tracker.session_id,
-                    {"messages_processed": messages_processed},
+                    completion_summary,
                 )
 
                 # Display success
@@ -592,6 +2410,23 @@ class OrchestratorRunner:
                         Text(final_message[:1000], style="green"),
                         title="[green]Execution Completed[/green]",
                         border_style="green",
+                    )
+                )
+            elif recoverable_failure_pause is not None:
+                await self._session_repo.mark_paused(
+                    tracker.session_id,
+                    reason=recoverable_failure_pause.reason,
+                    resume_hint=recoverable_failure_pause.resume_hint,
+                    pause_seconds=recoverable_failure_pause.pause_seconds,
+                    resume_after=recoverable_failure_pause.resume_after,
+                    pause_kind=recoverable_failure_pause.pause_kind,
+                )
+
+                self._console.print(
+                    Panel(
+                        Text(final_message[:1000], style="yellow"),
+                        title="[yellow]Execution Paused[/yellow]",
+                        border_style="yellow",
                     )
                 )
             else:
@@ -615,6 +2450,42 @@ class OrchestratorRunner:
                     )
                 )
 
+            # Mirror terminal state into the execution event stream so
+            # single-stream consumers (TUI) detect completion without
+            # polling the separate session aggregate.
+            terminal_status = (
+                "completed" if success else ("paused" if recoverable_failure_pause else "failed")
+            )
+            terminal_event = create_execution_terminal_event(
+                execution_id=exec_id,
+                session_id=tracker.session_id,
+                status=terminal_status,
+                summary=completion_summary if success else None,
+                error_message=final_message if not success else None,
+                messages_processed=messages_processed,
+                pause_seconds=(
+                    recoverable_failure_pause.pause_seconds
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                resume_after=(
+                    recoverable_failure_pause.resume_after
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                pause_kind=(
+                    recoverable_failure_pause.pause_kind
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                resume_hint=(
+                    recoverable_failure_pause.resume_hint
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+            )
+            await self._event_store.append(terminal_event)
+
             log.info(
                 "orchestrator.runner.execute_completed",
                 execution_id=exec_id,
@@ -624,6 +2495,11 @@ class OrchestratorRunner:
                 duration_seconds=duration,
             )
 
+            # Clean up session tracking
+            self._unregister_session(exec_id, tracker.session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+
             return Result.ok(
                 OrchestratorResult(
                     success=success,
@@ -632,6 +2508,7 @@ class OrchestratorRunner:
                     summary={
                         "goal": seed.goal,
                         "acceptance_criteria_count": len(seed.acceptance_criteria),
+                        **self._task_summary(),
                     },
                     messages_processed=messages_processed,
                     final_message=final_message,
@@ -639,12 +2516,29 @@ class OrchestratorRunner:
                 )
             )
 
+        except asyncio.CancelledError:
+            if await is_cancellation_requested(tracker.session_id):
+                return await self._handle_cancellation(
+                    session_id=tracker.session_id,
+                    execution_id=exec_id,
+                    messages_processed=messages_processed,
+                    start_time=start_time,
+                )
+            self._unregister_session(exec_id, tracker.session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+            raise
         except Exception as e:
             log.exception(
                 "orchestrator.runner.execute_failed",
                 execution_id=exec_id,
                 error=str(e),
             )
+
+            # Clean up session tracking
+            self._unregister_session(exec_id, tracker.session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
 
             # Emit failure event
             failed_event = create_session_failed_event(
@@ -654,6 +2548,19 @@ class OrchestratorRunner:
                 messages_processed=messages_processed,
             )
             await self._event_store.append(failed_event)
+            await self._session_repo.mark_failed(
+                tracker.session_id,
+                str(e),
+            )
+            await self._event_store.append(
+                create_execution_terminal_event(
+                    execution_id=exec_id,
+                    session_id=tracker.session_id,
+                    status="failed",
+                    error_message=str(e),
+                    messages_processed=messages_processed,
+                )
+            )
 
             return Result.err(
                 OrchestratorError(
@@ -665,6 +2572,12 @@ class OrchestratorRunner:
                     },
                 )
             )
+        finally:
+            await self._terminate_runtime_handle(
+                runtime_handle,
+                session_id=tracker.session_id,
+                context="execute",
+            )
 
     async def _execute_parallel(
         self,
@@ -672,8 +2585,10 @@ class OrchestratorRunner:
         exec_id: str,
         tracker: Any,
         merged_tools: list[str],
+        tool_catalog: SessionToolCatalog,
         system_prompt: str,
         start_time: datetime,
+        externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
     ) -> Result[OrchestratorResult, OrchestratorError]:
         """Execute seed with parallel AC execution.
 
@@ -687,12 +2602,18 @@ class OrchestratorRunner:
             merged_tools: Available tools.
             system_prompt: System prompt for agents.
             start_time: Execution start time.
+            externally_satisfied_acs: Top-level ACs already satisfied by the
+                current working tree and therefore skipped for re-execution.
 
         Returns:
             Result containing OrchestratorResult on success.
         """
-        from ouroboros.orchestrator.dependency_analyzer import DependencyAnalyzer
-        from ouroboros.orchestrator.parallel_executor import ParallelACExecutor
+        from ouroboros.orchestrator.dependency_analyzer import ACNode
+        from ouroboros.orchestrator.parallel_executor import (
+            ParallelACExecutor,
+            render_parallel_completion_message,
+            render_parallel_verification_report,
+        )
 
         log.info(
             "orchestrator.runner.parallel_mode_enabled",
@@ -704,7 +2625,7 @@ class OrchestratorRunner:
         # Analyze dependencies
         self._console.print("\n[cyan]Analyzing AC dependencies...[/cyan]")
 
-        analyzer = DependencyAnalyzer()
+        analyzer = self._build_dependency_analyzer()
         dep_result = await analyzer.analyze(seed.acceptance_criteria)
 
         if dep_result.is_err:
@@ -718,27 +2639,34 @@ class OrchestratorRunner:
 
             all_indices = tuple(range(len(seed.acceptance_criteria)))
             dependency_graph = DependencyGraph(
-                nodes=(),
+                nodes=tuple(
+                    ACNode(index=i, content=ac, depends_on=())
+                    for i, ac in enumerate(seed.acceptance_criteria)
+                ),
                 execution_levels=(all_indices,) if all_indices else (),
             )
         else:
             dependency_graph = dep_result.value
 
+        execution_plan = dependency_graph.to_execution_plan()
+
         # Log execution plan
         log.info(
             "orchestrator.runner.execution_plan",
             execution_id=exec_id,
-            total_levels=dependency_graph.total_levels,
-            levels=dependency_graph.execution_levels,
-            parallelizable=dependency_graph.is_parallelizable,
+            total_levels=execution_plan.total_stages,
+            levels=execution_plan.execution_levels,
+            parallelizable=execution_plan.is_parallelizable,
         )
 
         self._console.print(
-            f"[green]Execution plan: {dependency_graph.total_levels} levels, "
-            f"parallelizable: {dependency_graph.is_parallelizable}[/green]"
+            f"[green]Execution plan: {execution_plan.total_stages} stages, "
+            f"parallelizable: {execution_plan.is_parallelizable}[/green]"
         )
-        for i, level in enumerate(dependency_graph.execution_levels):
-            self._console.print(f"  Level {i + 1}: ACs {[idx + 1 for idx in level]}")
+        for stage in execution_plan.stages:
+            self._console.print(
+                f"  Stage {stage.stage_number}: ACs {[idx + 1 for idx in stage.ac_indices]}"
+            )
 
         # Execute in parallel
         parallel_executor = ParallelACExecutor(
@@ -746,66 +2674,94 @@ class OrchestratorRunner:
             event_store=self._event_store,
             console=self._console,
             enable_decomposition=self._enable_decomposition,
+            max_concurrent=self._max_parallel_workers,
+            max_decomposition_depth=self._max_decomposition_depth,
+            inherited_runtime_handle=self._inherited_runtime_handle,
+            task_cwd=self._effective_cwd(),
+            checkpoint_store=self._checkpoint_store,
         )
+
+        # Check for cancellation before starting parallel execution
+        if await self._check_cancellation(tracker.session_id):
+            return await self._handle_cancellation(
+                session_id=tracker.session_id,
+                execution_id=exec_id,
+                messages_processed=0,
+                start_time=start_time,
+            )
 
         parallel_result = await parallel_executor.execute_parallel(
             seed=seed,
-            dependency_graph=dependency_graph,
+            execution_plan=execution_plan,
             session_id=tracker.session_id,
             execution_id=exec_id,
             tools=merged_tools,
+            tool_catalog=tool_catalog.tools,
             system_prompt=system_prompt,
+            externally_satisfied_acs=externally_satisfied_acs,
         )
+
+        # Check for cancellation after parallel execution
+        if await self._check_cancellation(tracker.session_id):
+            return await self._handle_cancellation(
+                session_id=tracker.session_id,
+                execution_id=exec_id,
+                messages_processed=parallel_result.total_messages,
+                start_time=start_time,
+            )
 
         # Calculate duration
         duration = (datetime.now(UTC) - start_time).total_seconds()
 
         # Determine overall success
         success = parallel_result.all_succeeded
+        recoverable_failure_pause = None
+        if not success:
+            recoverable_failure_pause = self._recoverable_failure_pause_from_parallel_result(
+                parallel_result,
+                now=datetime.now(UTC),
+            )
 
-        # Build summary message with per-AC results for downstream evaluation.
-        # The evaluator uses final_message as the artifact to judge compliance,
-        # so a bare "Success: 6/6" gives it no evidence to work with.
-        summary_parts = [
-            "Parallel Execution Complete",
-            f"Success: {parallel_result.success_count}/{len(seed.acceptance_criteria)}",
-        ]
-        if parallel_result.failure_count > 0:
-            summary_parts.append(f"Failed: {parallel_result.failure_count}")
-        if parallel_result.skipped_count > 0:
-            summary_parts.append(f"Skipped: {parallel_result.skipped_count}")
-
-        summary_parts.append("\n## AC Results")
-        for r in parallel_result.results:
-            status = "PASS" if r.success else "FAIL"
-            ac_label = f"AC {r.ac_index + 1}"
-            summary_parts.append(f"\n### {ac_label}: [{status}] {r.ac_content}")
-            if r.final_message:
-                # Include last 500 chars of agent output as evidence
-                evidence = r.final_message[-500:] if len(r.final_message) > 500 else r.final_message
-                summary_parts.append(evidence)
-            elif r.error:
-                summary_parts.append(f"Error: {r.error}")
-
-        final_message = "\n".join(summary_parts)
+        final_message = render_parallel_completion_message(
+            parallel_result,
+            len(seed.acceptance_criteria),
+        )
+        verification_report = render_parallel_verification_report(
+            parallel_result,
+            len(seed.acceptance_criteria),
+            max_decomposition_depth=self._max_decomposition_depth,
+        )
+        execution_summary = {
+            "goal": seed.goal,
+            "acceptance_criteria_count": len(seed.acceptance_criteria),
+            "parallel_execution": True,
+            "success_count": parallel_result.success_count,
+            "externally_satisfied_count": parallel_result.externally_satisfied_count,
+            "satisfied_count": (
+                parallel_result.success_count + parallel_result.externally_satisfied_count
+            ),
+            "failure_count": parallel_result.failure_count,
+            "blocked_count": parallel_result.blocked_count,
+            "invalid_count": parallel_result.invalid_count,
+            "skipped_count": parallel_result.skipped_count,
+            "total_levels": execution_plan.total_stages,
+            "max_decomposition_depth": self._max_decomposition_depth,
+            "max_parallel_workers": self._max_parallel_workers,
+            "verification_report": verification_report,
+            **self._task_summary(),
+        }
 
         # Emit completion event
         if success:
             completed_event = create_session_completed_event(
                 session_id=tracker.session_id,
-                summary={
-                    "parallel_execution": True,
-                    "success_count": parallel_result.success_count,
-                    "failure_count": parallel_result.failure_count,
-                    "skipped_count": parallel_result.skipped_count,
-                    "total_levels": dependency_graph.total_levels,
-                },
+                summary=execution_summary,
                 messages_processed=parallel_result.total_messages,
             )
             await self._event_store.append(completed_event)
             await self._session_repo.mark_completed(
                 tracker.session_id,
-                {"messages_processed": parallel_result.total_messages},
+                execution_summary,
             )
 
             self._console.print(
@@ -815,10 +2771,32 @@ class OrchestratorRunner:
                     border_style="green",
                 )
             )
+        elif recoverable_failure_pause is not None:
+            await self._session_repo.mark_paused(
+                tracker.session_id,
+                reason=recoverable_failure_pause.reason,
+                resume_hint=recoverable_failure_pause.resume_hint,
+                pause_seconds=recoverable_failure_pause.pause_seconds,
+                resume_after=recoverable_failure_pause.resume_after,
+                pause_kind=recoverable_failure_pause.pause_kind,
+            )
+
+            self._console.print(
+                Panel(
+                    Text(final_message, style="yellow"),
+                    title="[yellow]Parallel Execution Paused[/yellow]",
+                    border_style="yellow",
+                )
+            )
         else:
             failed_event = create_session_failed_event(
                 session_id=tracker.session_id,
-                error_message=f"Partial failure: {parallel_result.failure_count} failed, {parallel_result.skipped_count} skipped",
+                error_message=(
+                    "Partial failure: "
+                    f"{parallel_result.failure_count} failed, "
+                    f"{parallel_result.blocked_count} blocked, "
+                    f"{parallel_result.invalid_count} invalid"
+                ),
                 messages_processed=parallel_result.total_messages,
             )
             await self._event_store.append(failed_event)
@@ -835,6 +2813,40 @@ class OrchestratorRunner:
                 )
             )
 
+        terminal_status = (
+            "completed" if success else ("paused" if recoverable_failure_pause else "failed")
+        )
+        await self._event_store.append(
+            create_execution_terminal_event(
+                execution_id=exec_id,
+                session_id=tracker.session_id,
+                status=terminal_status,
+                summary=execution_summary if success else None,
+                error_message=final_message if not success else None,
+                messages_processed=parallel_result.total_messages,
+                pause_seconds=(
+                    recoverable_failure_pause.pause_seconds
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                resume_after=(
+                    recoverable_failure_pause.resume_after
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                pause_kind=(
+                    recoverable_failure_pause.pause_kind
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+                resume_hint=(
+                    recoverable_failure_pause.resume_hint
+                    if recoverable_failure_pause is not None
+                    else None
+                ),
+            )
+        )
+
         log.info(
             "orchestrator.runner.parallel_completed",
             execution_id=exec_id,
@@ -842,24 +2854,25 @@ class OrchestratorRunner:
             success=success,
             success_count=parallel_result.success_count,
             failure_count=parallel_result.failure_count,
+            blocked_count=parallel_result.blocked_count,
+            invalid_count=parallel_result.invalid_count,
             skipped_count=parallel_result.skipped_count,
             total_messages=parallel_result.total_messages,
             duration_seconds=duration,
         )
+
+        # Clean up session tracking
+        self._unregister_session(exec_id, tracker.session_id)
+        await clear_cancellation(tracker.session_id)
+        if self._task_workspace is not None:
+            release_lock(self._task_workspace.lock_path)
 
         return Result.ok(
             OrchestratorResult(
                 success=success,
                 session_id=tracker.session_id,
                 execution_id=exec_id,
-                summary={
-                    "goal": seed.goal,
-                    "acceptance_criteria_count": len(seed.acceptance_criteria),
-                    "parallel_execution": True,
-                    "success_count": parallel_result.success_count,
-                    "failure_count": parallel_result.failure_count,
-                    "skipped_count": parallel_result.skipped_count,
-                },
+                summary=execution_summary,
                 messages_processed=parallel_result.total_messages,
                 final_message=final_message,
                 duration_seconds=duration,
@@ -906,167 +2919,257 @@ class OrchestratorRunner:
         tracker = session_result.value
 
         # Check if session can be resumed
-        if tracker.status == SessionStatus.COMPLETED:
+        if tracker.status in (
+            SessionStatus.COMPLETED,
+            SessionStatus.CANCELLED,
+            SessionStatus.FAILED,
+        ):
+            self._cleanup_pre_execution_state(
+                tracker.execution_id,
+                session_id,
+                session_registered=False,
+            )
             return Result.err(
                 OrchestratorError(
-                    message="Session already completed, cannot resume",
+                    message=f"Session is in terminal state {tracker.status.value}, cannot resume",
                     details={"session_id": session_id, "status": tracker.status.value},
                 )
             )
 
-        self._console.print(
-            f"[cyan]Resuming session {session_id}[/cyan]\n"
-            f"[dim]Previously processed: {tracker.messages_processed} messages[/dim]"
-        )
+        session_registered = False
 
-        # Build resume prompt
-        system_prompt = build_system_prompt(seed)
-        resume_prompt = f"""Continue executing the task from where you left off.
+        try:
+            # Register session for cancellation tracking
+            self._register_session(tracker.execution_id, session_id)
+            session_registered = True
+
+            self._console.print(
+                f"[cyan]Resuming session {session_id}[/cyan]\n"
+                f"[dim]Previously processed: {tracker.messages_processed} messages[/dim]"
+            )
+
+            # Build resume prompt
+            system_prompt = build_system_prompt(seed)
+            resume_prompt = f"""Continue executing the task from where you left off.
 
 {build_task_prompt(seed)}
 
 Note: This is a resumed session. Please continue from where execution was interrupted.
 """
+            # Get runtime resume state if stored
+            runtime_handle = self._deserialize_runtime_handle(tracker.progress)
+            if self._task_workspace is not None and "workspace" not in tracker.progress:
+                await self._persist_session_progress(
+                    session_id,
+                    {"workspace": self._task_workspace.to_progress_dict()},
+                )
 
-        # Get Claude Agent session ID if stored
-        agent_session_id = tracker.progress.get("agent_session_id")
+            # Get merged tools (DEFAULT_TOOLS + MCP tools if configured)
+            merged_tools, mcp_provider, tool_catalog = await self._get_merged_tools(
+                session_id=session_id,
+                tool_prefix=self._mcp_tool_prefix,
+            )
+            runtime_handle = self._seed_runtime_handle(runtime_handle, tool_catalog=tool_catalog)
 
-        # Get merged tools (DEFAULT_TOOLS + MCP tools if configured)
-        merged_tools, mcp_provider = await self._get_merged_tools(
-            session_id=session_id,
-            tool_prefix=self._mcp_tool_prefix,
-        )
+            start_time = datetime.now(UTC)
+            messages_processed = tracker.messages_processed
+            final_message = ""
+            success = False
+            recoverable_resume_failure: RecoverableFailurePause | None = None
 
-        start_time = datetime.now(UTC)
-        messages_processed = tracker.messages_processed
-        final_message = ""
-        success = False
+            # Create workflow state tracker for progress display
+            from ouroboros.orchestrator.workflow_state import WorkflowStateTracker
 
-        # Create workflow state tracker for progress display
-        from ouroboros.orchestrator.workflow_state import WorkflowStateTracker
-
-        resume_strategy = get_strategy(seed.task_type)
-        state_tracker = WorkflowStateTracker(
-            acceptance_criteria=seed.acceptance_criteria,
-            goal=seed.goal,
-            session_id=session_id,
-            activity_map=resume_strategy.get_activity_map(),
-        )
+            resume_strategy = get_strategy(seed.task_type)
+            state_tracker = WorkflowStateTracker(
+                acceptance_criteria=seed.acceptance_criteria,
+                goal=seed.goal,
+                session_id=session_id,
+                activity_map=resume_strategy.get_activity_map(),
+            )
+            await self._replay_workflow_state(session_id, state_tracker)
+        except Exception as e:
+            self._cleanup_pre_execution_state(
+                tracker.execution_id,
+                session_id,
+                session_registered=session_registered,
+            )
+            log.exception(
+                "orchestrator.runner.resume_setup_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                OrchestratorError(
+                    message=f"Session resume failed: {e}",
+                    details={"session_id": session_id},
+                )
+            )
 
         try:
             # Use simple status spinner with log-style output for changes
             from rich.status import Status
 
             last_tool: str | None = None
-            last_completed_count = 0
+            last_completed_count = state_tracker.state.completed_count
+            live_runtime_handle = runtime_handle
+            cancelled_result: Result[OrchestratorResult, OrchestratorError] | None = None
 
             with Status(
                 f"[bold cyan]Resuming: {seed.goal[:50]}...[/]",
                 console=self._console,
                 spinner="dots",
             ) as status:
-                async for message in self._adapter.execute_task(
-                    prompt=resume_prompt,
-                    tools=merged_tools,
-                    system_prompt=system_prompt,
-                    resume_session_id=agent_session_id,
-                ):
-                    messages_processed += 1
-
-                    # Update workflow state tracker
-                    state_tracker.process_message(
-                        content=message.content,
-                        message_type=message.type,
-                        tool_name=message.tool_name,
-                        is_input=message.type == "user",
+                async with aclosing(
+                    self._adapter.execute_task(  # type: ignore[type-var]
+                        prompt=resume_prompt,
+                        tools=merged_tools,
+                        system_prompt=system_prompt,
+                        resume_handle=runtime_handle,
                     )
+                ) as message_stream:
+                    async for message in message_stream:
+                        messages_processed += 1
+                        projected = project_runtime_message(message)
 
-                    # Print log-style output for tool calls and agent messages
-                    if message.tool_name and message.tool_name != last_tool:
-                        status.stop()
-                        self._console.print(f"  [yellow]🔧 {message.tool_name}[/yellow]")
-                        status.start()
-                        last_tool = message.tool_name
-                    elif message.type == "assistant" and message.content and not message.tool_name:
-                        # Show agent thinking/reasoning
-                        content = message.content.strip()
-                        status.stop()
-                        self._console.print(f"  [dim]💭 {content}[/dim]")
-                        status.start()
+                        # Check for cancellation periodically
+                        if messages_processed % CANCELLATION_CHECK_INTERVAL == 0:
+                            if await self._check_cancellation(session_id):
+                                cancelled_result = await self._handle_cancellation(
+                                    session_id=session_id,
+                                    execution_id=tracker.execution_id,
+                                    messages_processed=messages_processed,
+                                    start_time=start_time,
+                                )
+                                break
 
-                    # Print when AC is completed
-                    current_completed = state_tracker.state.completed_count
-                    if current_completed > last_completed_count:
-                        status.stop()
-                        self._console.print(f"  [green]✓ AC {current_completed} completed[/green]")
-                        status.start()
-                        last_completed_count = current_completed
-
-                    # Update status with current activity
-                    ac_progress = (
-                        f"{state_tracker.state.completed_count}/{state_tracker.state.total_count}"
-                    )
-                    tool_info = f" | {message.tool_name}" if message.tool_name else ""
-                    status.update(
-                        f"[bold cyan]AC {ac_progress}{tool_info} | {messages_processed} msgs[/]"
-                    )
-
-                    # Emit workflow progress event for TUI
-                    progress_data = state_tracker.state.to_tui_message_data(
-                        execution_id=session_id  # Use session_id as execution_id for resume
-                    )
-                    workflow_event = create_workflow_progress_event(
-                        execution_id=session_id,
-                        session_id=session_id,
-                        acceptance_criteria=progress_data["acceptance_criteria"],
-                        completed_count=progress_data["completed_count"],
-                        total_count=progress_data["total_count"],
-                        current_ac_index=progress_data["current_ac_index"],
-                        current_phase=progress_data["current_phase"],
-                        activity=progress_data["activity"],
-                        activity_detail=progress_data["activity_detail"],
-                        elapsed_display=progress_data["elapsed_display"],
-                        estimated_remaining=progress_data["estimated_remaining"],
-                        messages_count=progress_data["messages_count"],
-                        tool_calls_count=progress_data["tool_calls_count"],
-                        estimated_tokens=progress_data["estimated_tokens"],
-                        estimated_cost_usd=progress_data["estimated_cost_usd"],
-                    )
-                    await self._event_store.append(workflow_event)
-
-                    if message.tool_name:
-                        tool_event = create_tool_called_event(
-                            session_id=session_id,
-                            tool_name=message.tool_name,
+                        tracker = await self._update_and_persist_progress(
+                            tracker,
+                            message,
+                            messages_processed,
+                            session_id,
                         )
-                        await self._event_store.append(tool_event)
+                        if message.resume_handle is not None:
+                            live_runtime_handle = message.resume_handle
 
-                    if messages_processed % PROGRESS_EMIT_INTERVAL == 0:
-                        progress_event = create_progress_event(
-                            session_id=session_id,
-                            message_type=message.type,
-                            content_preview=message.content,
-                            step=messages_processed,
-                            tool_name=message.tool_name,
+                        # Update workflow state tracker
+                        state_tracker.process_runtime_message(message)
+
+                        # Print log-style output for tool calls and agent messages
+                        if projected.tool_name and projected.tool_name != last_tool:
+                            status.stop()
+                            self._console.print(f"  [yellow]🔧 {projected.tool_name}[/yellow]")
+                            status.start()
+                            last_tool = projected.tool_name
+                        elif (
+                            projected.message_type == "assistant"
+                            and projected.content
+                            and not projected.tool_name
+                        ):
+                            # Show agent thinking/reasoning
+                            content = projected.content.strip()
+                            status.stop()
+                            self._console.print(f"  [dim]💭 {content}[/dim]")
+                            status.start()
+
+                        # Print when AC is completed
+                        current_completed = state_tracker.state.completed_count
+                        if current_completed > last_completed_count:
+                            status.stop()
+                            self._console.print(
+                                f"  [green]✓ AC {current_completed} completed[/green]"
+                            )
+                            status.start()
+                            last_completed_count = current_completed
+
+                        # Update status with current activity
+                        ac_progress = f"{state_tracker.state.completed_count}/{state_tracker.state.total_count}"
+                        tool_info = f" | {projected.tool_name}" if projected.tool_name else ""
+                        status.update(
+                            f"[bold cyan]AC {ac_progress}{tool_info} | {messages_processed} msgs[/]"
                         )
-                        await self._event_store.append(progress_event)
 
-                    if message.is_final:
-                        final_message = message.content
-                        success = not message.is_error
+                        # Emit workflow progress event for TUI
+                        progress_data = state_tracker.state.to_tui_message_data(
+                            execution_id=session_id  # Use session_id as execution_id for resume
+                        )
+                        workflow_event = create_workflow_progress_event(
+                            execution_id=session_id,
+                            session_id=session_id,
+                            acceptance_criteria=self._with_execution_node_identity(
+                                progress_data["acceptance_criteria"],
+                                execution_id=session_id,
+                            ),
+                            completed_count=progress_data["completed_count"],
+                            total_count=progress_data["total_count"],
+                            current_ac_index=progress_data["current_ac_index"],
+                            current_phase=progress_data["current_phase"],
+                            activity=progress_data["activity"],
+                            activity_detail=progress_data["activity_detail"],
+                            elapsed_display=progress_data["elapsed_display"],
+                            estimated_remaining=progress_data["estimated_remaining"],
+                            messages_count=progress_data["messages_count"],
+                            tool_calls_count=progress_data["tool_calls_count"],
+                            estimated_tokens=progress_data["estimated_tokens"],
+                            estimated_cost_usd=progress_data["estimated_cost_usd"],
+                            last_update=progress_data.get("last_update"),
+                        )
+                        await self._event_store.append(workflow_event)
+
+                        tool_event = self._build_tool_called_event(session_id, message)
+                        if tool_event is not None:
+                            await self._event_store.append(tool_event)
+
+                        if self._should_emit_progress_event(message, messages_processed):
+                            progress_event = self._build_progress_event(
+                                session_id,
+                                message,
+                                step=messages_processed,
+                            )
+                            await self._event_store.append(progress_event)
+
+                        if message.is_final:
+                            final_message = message.content
+                            success = not message.is_error
+                            recoverable_resume_failure = self._recoverable_failure_pause(
+                                message,
+                                now=datetime.now(UTC),
+                            )
+
+            if cancelled_result is not None:
+                return cancelled_result
 
             duration = (datetime.now(UTC) - start_time).total_seconds()
 
             if success:
                 await self._session_repo.mark_completed(
                     session_id,
-                    {"messages_processed": messages_processed},
+                    {
+                        "messages_processed": messages_processed,
+                        **self._task_summary(),
+                    },
                 )
                 self._console.print(
                     Panel(
                         Text(final_message[:1000], style="green"),
                         title="[green]Resumed Execution Completed[/green]",
                         border_style="green",
+                    )
+                )
+            elif recoverable_resume_failure is not None:
+                await self._session_repo.mark_paused(
+                    session_id,
+                    reason=recoverable_resume_failure.reason,
+                    resume_hint=recoverable_resume_failure.resume_hint,
+                    pause_seconds=recoverable_resume_failure.pause_seconds,
+                    resume_after=recoverable_resume_failure.resume_after,
+                    pause_kind=recoverable_resume_failure.pause_kind,
+                )
+                self._console.print(
+                    Panel(
+                        Text(final_message[:1000], style="yellow"),
+                        title="[yellow]Resumed Execution Paused[/yellow]",
+                        border_style="yellow",
                     )
                 )
             else:
@@ -1079,6 +3182,40 @@ Note: This is a resumed session. Please continue from where execution was interr
                     )
                 )
 
+            # Mirror terminal state into execution stream for TUI.
+            terminal_status = (
+                "completed" if success else ("paused" if recoverable_resume_failure else "failed")
+            )
+            await self._event_store.append(
+                create_execution_terminal_event(
+                    execution_id=tracker.execution_id,
+                    session_id=session_id,
+                    status=terminal_status,
+                    error_message=final_message if not success else None,
+                    messages_processed=messages_processed,
+                    pause_seconds=(
+                        recoverable_resume_failure.pause_seconds
+                        if recoverable_resume_failure is not None
+                        else None
+                    ),
+                    resume_after=(
+                        recoverable_resume_failure.resume_after
+                        if recoverable_resume_failure is not None
+                        else None
+                    ),
+                    pause_kind=(
+                        recoverable_resume_failure.pause_kind
+                        if recoverable_resume_failure is not None
+                        else None
+                    ),
+                    resume_hint=(
+                        recoverable_resume_failure.resume_hint
+                        if recoverable_resume_failure is not None
+                        else None
+                    ),
+                )
+            )
+
             log.info(
                 "orchestrator.runner.resume_completed",
                 session_id=session_id,
@@ -1087,12 +3224,20 @@ Note: This is a resumed session. Please continue from where execution was interr
                 duration_seconds=duration,
             )
 
+            # Clear the in-memory cancellation flag so it doesn't linger
+            await clear_cancellation(session_id)
+
+            # Clean up session tracking
+            self._unregister_session(tracker.execution_id, session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+
             return Result.ok(
                 OrchestratorResult(
                     success=success,
                     session_id=session_id,
                     execution_id=tracker.execution_id,
-                    summary={"resumed": True},
+                    summary={"resumed": True, **self._task_summary()},
                     messages_processed=messages_processed,
                     final_message=final_message,
                     duration_seconds=duration,
@@ -1105,18 +3250,43 @@ Note: This is a resumed session. Please continue from where execution was interr
                 session_id=session_id,
                 error=str(e),
             )
+
+            # Clean up session tracking
+            self._unregister_session(tracker.execution_id, session_id)
+            if self._task_workspace is not None:
+                release_lock(self._task_workspace.lock_path)
+            await self._event_store.append(
+                create_execution_terminal_event(
+                    execution_id=tracker.execution_id,
+                    session_id=session_id,
+                    status="failed",
+                    error_message=str(e),
+                )
+            )
+
             return Result.err(
                 OrchestratorError(
                     message=f"Session resume failed: {e}",
                     details={"session_id": session_id},
                 )
             )
+        finally:
+            await self._terminate_runtime_handle(
+                live_runtime_handle,
+                session_id=session_id,
+                context="resume",
+            )
 
 
 __all__ = [
+    "ExecutionCancelledError",
     "OrchestratorError",
     "OrchestratorResult",
     "OrchestratorRunner",
     "build_system_prompt",
     "build_task_prompt",
+    "clear_cancellation",
+    "get_pending_cancellations",
+    "is_cancellation_requested",
+    "request_cancellation",
 ]

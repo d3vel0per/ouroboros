@@ -1,7 +1,7 @@
 """Unit tests for CLI main module."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from typer.testing import CliRunner
 
@@ -79,12 +79,26 @@ class TestRunCommands:
         result = runner.invoke(app, ["run", "workflow", "--help"])
         assert result.exit_code == 0
         assert "seed" in result.output.lower()
+        assert "runtime" in result.output.lower()
+        assert "hermes" in result.output.lower()
 
     def test_run_resume_help(self) -> None:
         """Test run resume command help."""
         result = runner.invoke(app, ["run", "resume", "--help"])
         assert result.exit_code == 0
         assert "Resume" in result.output
+
+
+class TestInitCommands:
+    """Tests for init command group."""
+
+    def test_init_start_help(self) -> None:
+        """Test init start command help."""
+        result = runner.invoke(app, ["init", "start", "--help"])
+        assert result.exit_code == 0
+        assert "context" in result.output.lower()
+        assert "runtime" in result.output.lower()
+        assert "llm-backend" in result.output.lower()
 
 
 class TestConfigCommands:
@@ -158,6 +172,8 @@ class TestMCPCommands:
         assert result.exit_code == 0
         assert "transport" in result.output.lower()
         assert "port" in result.output.lower()
+        assert "runtime" in result.output.lower()
+        assert "llm-backend" in result.output.lower()
 
     def test_mcp_info(self) -> None:
         """Test mcp info command."""
@@ -195,13 +211,16 @@ class TestShorthandCommands:
         seed_file = tmp_path / "seed.yaml"
         seed_file.write_text("goal: test\nacceptance_criteria:\n  - criterion: test\n")
 
-        with patch("ouroboros.cli.commands.run.asyncio.run") as mock_run:
-            mock_run.return_value = None
+        mock_run_orchestrator = AsyncMock()
 
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=mock_run_orchestrator,
+        ):
             runner.invoke(app, ["run", str(seed_file)])
 
-            # Should invoke workflow command (orchestrator by default calls asyncio.run)
-            assert mock_run.called
+        # Should invoke workflow command (orchestrator by default calls _run_orchestrator)
+        mock_run_orchestrator.assert_awaited_once()
 
     def test_run_shorthand_with_no_orchestrator(self, tmp_path: Path) -> None:
         """Test that 'ouroboros run seed.yaml --no-orchestrator' uses placeholder mode."""
@@ -223,6 +242,19 @@ class TestShorthandCommands:
         assert result.exit_code == 0
         assert "Would execute" in result.output
 
+    def test_run_workflow_accepts_hermes_runtime_override(self, tmp_path: Path) -> None:
+        """Hermes should be accepted as a CLI runtime choice."""
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text("goal: test\nacceptance_criteria:\n  - criterion: test\n")
+
+        result = runner.invoke(
+            app,
+            ["run", "workflow", str(seed_file), "--runtime", "hermes", "--no-orchestrator"],
+        )
+
+        assert result.exit_code == 0
+        assert "Would execute" in result.output
+
     def test_run_resume_subcommand_still_works(self) -> None:
         """Test backward compat: 'ouroboros run resume' still works."""
         result = runner.invoke(app, ["run", "resume"])
@@ -240,10 +272,13 @@ class TestShorthandCommands:
 
     def test_init_list_subcommand_still_works(self) -> None:
         """Test backward compat: 'ouroboros init list' still routes to list."""
-        with patch("ouroboros.cli.commands.init.asyncio.run") as mock_run:
-            mock_run.return_value = []
-            result = runner.invoke(app, ["init", "list"])
-            assert result.exit_code == 0
+        with patch("ouroboros.cli.commands.init.create_llm_adapter"):
+            with patch(
+                "ouroboros.cli.commands.init.InterviewEngine.list_interviews",
+                new=AsyncMock(return_value=[]),
+            ):
+                result = runner.invoke(app, ["init", "list"])
+                assert result.exit_code == 0
 
     def test_monitor_top_level_alias(self) -> None:
         """Test that 'ouroboros monitor' is a shorthand for 'ouroboros tui monitor'."""
@@ -256,11 +291,14 @@ class TestShorthandCommands:
         seed_file = tmp_path / "seed.yaml"
         seed_file.write_text("goal: test\nacceptance_criteria:\n  - criterion: test\n")
 
-        with patch("ouroboros.cli.commands.run.asyncio.run") as mock_run:
-            mock_run.return_value = None
+        mock_run_orchestrator = AsyncMock()
 
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=mock_run_orchestrator,
+        ):
             # No --orchestrator flag needed
             runner.invoke(app, ["run", "workflow", str(seed_file)])
 
-            # asyncio.run should be called (orchestrator path)
-            assert mock_run.called
+        # _run_orchestrator should be awaited by the default orchestrator path
+        mock_run_orchestrator.assert_awaited_once()

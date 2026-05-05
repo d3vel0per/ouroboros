@@ -14,6 +14,8 @@ This module defines:
 - Supporting types for seed components
 """
 
+from __future__ import annotations
+
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -52,11 +54,11 @@ class EvaluationPrinciple(BaseModel, frozen=True):
 
 
 class OntologyField(BaseModel, frozen=True):
-    """A field in the ontology schema.
+    """A field in an ontology schema.
 
     Attributes:
         name: Field identifier.
-        field_type: Type of the field (string, number, boolean, array, object).
+        field_type: Field type (string, number, boolean, array, object).
         description: Purpose of this field.
         required: Whether this field is required.
     """
@@ -70,15 +72,16 @@ class OntologyField(BaseModel, frozen=True):
 
 
 class OntologySchema(BaseModel, frozen=True):
-    """Schema defining the structure of workflow outputs.
+    """Schema describing workflow domain structure.
 
-    The ontology schema defines what data structure the workflow should
-    produce and maintain throughout iterations.
+    The ontology schema names the domain fields and boundaries the workflow
+    should preserve throughout iterations. It is not, by itself, a mandatory
+    output shape.
 
     Attributes:
         name: Name of the ontology.
-        description: Purpose and scope of this ontology.
-        fields: List of fields in the ontology.
+        description: Purpose, scope, and perspective of this ontology.
+        fields: Fields in the ontology.
     """
 
     name: str = Field(..., min_length=1)
@@ -145,7 +148,7 @@ class SeedMetadata(BaseModel, frozen=True):
     seed_id: str = Field(default_factory=lambda: f"seed_{uuid4().hex[:12]}")
     version: str = Field(default="1.0.0")
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    ambiguity_score: float = Field(..., ge=0.0, le=1.0)
+    ambiguity_score: float = Field(default=0.15, ge=0.0, le=1.0)
     interview_id: str | None = Field(default=None)
     parent_seed_id: str | None = Field(default=None)
 
@@ -165,7 +168,7 @@ class Seed(BaseModel, frozen=True):
         goal: The primary objective of the workflow.
         constraints: Hard constraints that must be satisfied.
         acceptance_criteria: Specific criteria for success.
-        ontology_schema: Schema for workflow output structure.
+        ontology_schema: Conceptual lens for workflow coherence.
         evaluation_principles: Principles for evaluating outputs.
         exit_conditions: Conditions for terminating the workflow.
         metadata: Generation metadata (version, timestamp, etc.).
@@ -225,10 +228,10 @@ class Seed(BaseModel, frozen=True):
         description="Specific criteria for success evaluation",
     )
 
-    # Structure
+    # Conceptual lens
     ontology_schema: OntologySchema = Field(
         ...,
-        description="Schema defining the structure of workflow outputs",
+        description="Ontology defining the workflow's conceptual lens",
     )
 
     # Evaluation

@@ -1,6 +1,9 @@
 ---
 name: seed
 description: "Generate validated Seed specifications from interview results"
+mcp_tool: ouroboros_generate_seed
+mcp_args:
+  session_id: "$1"
 ---
 
 # /ouroboros:seed
@@ -18,11 +21,24 @@ ooo seed [session_id]
 
 ## Instructions
 
-When the user invokes this skill, choose the execution path:
+When the user invokes this skill:
+
+### Load MCP Tools (Required before Path A/B decision)
+
+The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before deciding between Path A and Path B.**
+
+1. Use the `ToolSearch` tool to find and load the seed generation MCP tool:
+   ```
+   ToolSearch query: "+ouroboros seed"
+   ```
+2. The tool will typically be named `mcp__plugin_ouroboros_ouroboros__ouroboros_generate_seed` (with a plugin prefix). After ToolSearch returns, the tool becomes callable.
+3. If ToolSearch finds the tool → proceed to **Path A**. If not → proceed to **Path B**.
+
+**IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
 
 ### Path A: MCP Mode (Preferred)
 
-If the `ouroboros_generate_seed` MCP tool is available:
+If the `ouroboros_generate_seed` MCP tool is available (loaded via ToolSearch above):
 
 1. Determine the interview session:
    - If `session_id` provided: Use it directly
@@ -46,7 +62,7 @@ If the `ouroboros_generate_seed` MCP tool is available:
 
 If the MCP tool is NOT available, fall back to agent-based generation:
 
-1. Read `agents/seed-architect.md` and adopt that role
+1. Read `src/ouroboros/agents/seed-architect.md` and adopt that role
 2. Extract structured requirements from the interview Q&A in conversation history
 3. Generate a Seed YAML specification
 4. Present the seed to the user
@@ -56,7 +72,7 @@ If the MCP tool is NOT available, fall back to agent-based generation:
 The seed contains:
 
 - **GOAL**: Clear primary objective
-- **CONSTRAINTS**: Hard limitations (e.g., Python 3.14+, no external DB)
+- **CONSTRAINTS**: Hard limitations (e.g., Python >= 3.12, no external DB)
 - **ACCEPTANCE_CRITERIA**: Measurable success criteria
 - **ONTOLOGY_SCHEMA**: Data structure definition (name, fields, types)
 - **EVALUATION_PRINCIPLES**: Quality principles with weights
@@ -68,7 +84,7 @@ The seed contains:
 ```yaml
 goal: Build a CLI task management tool
 constraints:
-  - Python 3.14+
+  - Python >= 3.12
   - No external database
   - SQLite for persistence
 acceptance_criteria:
@@ -85,6 +101,8 @@ ontology_schema:
     - name: title
       type: string
       description: Task title
+metadata:
+  ambiguity_score: 0.15
 ```
 
 ## After Seed Generation

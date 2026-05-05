@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual.app import App
@@ -34,7 +35,6 @@ from ouroboros.tui.events import (
     create_message_from_event,
 )
 from ouroboros.tui.screens import (
-    DashboardScreen,
     DashboardScreenV3,
     DebugScreen,
     ExecutionScreen,
@@ -47,6 +47,156 @@ from ouroboros.tui.screens.session_selector import SessionSelectorScreen
 if TYPE_CHECKING:
     from ouroboros.events.base import BaseEvent
     from ouroboros.persistence.event_store import EventStore
+
+
+@dataclass(frozen=True)
+class _EventSubscriptionContext:
+    """Immutable polling context for a single monitored execution/session."""
+
+    execution_id: str
+    session_id: str = ""
+    generation: int = 0
+
+
+def _coerce_non_empty_string(value: object) -> str | None:
+    """Return a stripped non-empty string when present."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            return stripped
+    return None
+
+
+def _coerce_int(value: object, default: int) -> int:
+    """Return an integer when possible, otherwise a default."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return default
+
+
+def _find_node_id_for_ac_index(nodes: dict[str, Any], ac_index: int) -> str | None:
+    """Resolve the top-level tree node associated with a 1-based AC index."""
+    if ac_index <= 0:
+        return None
+
+    conventional_id = f"ac_{ac_index}"
+    if conventional_id in nodes:
+        return conventional_id
+
+    for node_id, raw_node in nodes.items():
+        if not isinstance(raw_node, dict):
+            continue
+        if _coerce_int(raw_node.get("index"), 0) != ac_index:
+            continue
+        if _coerce_int(raw_node.get("depth"), 0) > 1:
+            continue
+        return node_id
+
+    return None
+
+
+def _legacy_ac_node_aliases(ac: dict[str, Any], canonical_id: str) -> list[str]:
+    """Return legacy top-level AC node IDs that may alias ``canonical_id``."""
+    aliases: list[str] = []
+    for value in (
+        ac.get("ac_id"),
+        f"ac_{ac.get('index', 0)}",
+        f"ac_{ac.get('root_ac_index') + 1}"
+        if isinstance(ac.get("root_ac_index"), int) and ac.get("root_ac_index") >= 0
+        else None,
+    ):
+        alias = _coerce_non_empty_string(value)
+        if alias is not None and alias != canonical_id and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def _merge_legacy_ac_node_alias(
+    nodes: dict[str, Any],
+    *,
+    canonical_id: str,
+    aliases: list[str],
+) -> None:
+    """Move mixed-history root AC state from legacy aliases to ``canonical_id``."""
+    canonical_node = nodes.get(canonical_id)
+    if not isinstance(canonical_node, dict):
+        canonical_node = {"id": canonical_id, "children_ids": []}
+        nodes[canonical_id] = canonical_node
+
+    canonical_children = list(canonical_node.get("children_ids", []))
+    for alias in aliases:
+        legacy_node = nodes.pop(alias, None)
+        if not isinstance(legacy_node, dict):
+            continue
+        for child_id in legacy_node.get("children_ids", []):
+            if child_id not in canonical_children:
+                canonical_children.append(child_id)
+            child = nodes.get(child_id)
+            if isinstance(child, dict) and child.get("parent_id") == alias:
+                child["parent_id"] = canonical_id
+        for key, value in legacy_node.items():
+            if key in {"id", "children_ids"}:
+                continue
+            canonical_node.setdefault(key, value)
+
+    canonical_node["id"] = canonical_id
+    canonical_node["children_ids"] = canonical_children
+
+
+def _subtask_message_may_fallback_to_ac_index(message: SubtaskUpdated) -> bool:
+    """Return whether AC-index fallback is safe for a subtask update."""
+    return message.node_depth is None or message.node_depth <= 1
+
+
+def _resolve_subtask_parent_id(
+    nodes: dict[str, Any],
+    message: SubtaskUpdated,
+) -> str | None:
+    """Resolve a Sub-AC parent from canonical, legacy, then index metadata."""
+    candidates: list[str] = []
+    for value in (
+        message.parent_node_id,
+        message.legacy_parent_node_id,
+    ):
+        candidate = _coerce_non_empty_string(value)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    for value in message.legacy_parent_node_aliases:
+        candidate = _coerce_non_empty_string(value)
+        if candidate is not None and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        if candidate in nodes:
+            return candidate
+
+    if not _subtask_message_may_fallback_to_ac_index(message):
+        return None
+
+    ac_indexes: list[int] = []
+    for value in (message.ac_index, message.root_ac_number):
+        ac_index = _coerce_int(value, 0)
+        if ac_index > 0 and ac_index not in ac_indexes:
+            ac_indexes.append(ac_index)
+
+    if message.root_ac_index is not None and message.root_ac_index >= 0:
+        root_ac_number = message.root_ac_index + 1
+        if root_ac_number not in ac_indexes:
+            ac_indexes.append(root_ac_number)
+
+    for ac_index in ac_indexes:
+        parent_id = _find_node_id_for_ac_index(nodes, ac_index)
+        if parent_id is not None:
+            return parent_id
+
+    return None
 
 
 class OuroborosTUI(App[None]):
@@ -123,6 +273,8 @@ class OuroborosTUI(App[None]):
         self._execution_id: str | None = execution_id
         self._state = TUIState()
         self._subscription_task: asyncio.Task[None] | None = None
+        self._subscription_generation = 0
+        self._poll_interval_seconds = 0.5
         self._is_paused = False
         self._pause_callback: Any | None = None
         self._resume_callback: Any | None = None
@@ -159,71 +311,113 @@ class OuroborosTUI(App[None]):
     def _start_event_subscription(self) -> None:
         """Start background task for event subscription."""
         # Skip if no event loop (e.g., during testing) or no event store
-        if self._event_store is None:
+        if self._event_store is None or not self._execution_id:
             return
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             return  # No event loop running
+        self._subscription_generation += 1
+        context = _EventSubscriptionContext(
+            execution_id=self._execution_id,
+            session_id=self._state.session_id,
+            generation=self._subscription_generation,
+        )
         if self._subscription_task is not None:
             self._subscription_task.cancel()
-        self._subscription_task = asyncio.create_task(self._subscribe_to_events())
+        self._subscription_task = asyncio.create_task(self._subscribe_to_events(context))
 
-    async def _subscribe_to_events(self) -> None:
-        """Subscribe to EventStore for live updates."""
-        if self._event_store is None or self._execution_id is None:
+    def _is_subscription_active(self, context: _EventSubscriptionContext) -> bool:
+        """Return True when the polling task still matches the active context."""
+        if self._subscription_generation != context.generation:
+            return False
+        if self._execution_id != context.execution_id:
+            return False
+        return not (context.session_id and self._state.session_id != context.session_id)
+
+    def _iter_subscription_sources(
+        self, context: _EventSubscriptionContext
+    ) -> tuple[tuple[str, str], ...]:
+        """Return the active aggregates that should feed the HUD."""
+        sources: list[tuple[str, str]] = [("execution", context.execution_id)]
+        if context.session_id:
+            sources.insert(0, ("session", context.session_id))
+        return tuple(sources)
+
+    def _process_subscription_event(self, event: BaseEvent) -> None:
+        """Forward a subscribed event into TUI state and installed screens."""
+        self._state.add_log(
+            "info",
+            "tui.events",
+            f"Received: {event.type}",
+            {"aggregate_id": event.aggregate_id},
+        )
+        # Also forward to logs screen
+        try:
+            logs_screen = self.get_screen("logs")
+            if logs_screen and hasattr(logs_screen, "add_log"):
+                logs_screen.add_log(
+                    "info",
+                    "tui.events",
+                    f"Received: {event.type}",
+                    {"aggregate_id": event.aggregate_id},
+                )
+        except Exception:
+            pass
+
+        message = create_message_from_event(event)
+        if message is not None:
+            self.post_message(message)
+            self._update_state_from_event(event)
+
+        # Forward raw event to debug screen
+        try:
+            debug_screen = self.get_screen("debug")
+            if debug_screen and hasattr(debug_screen, "add_raw_event"):
+                debug_screen.add_raw_event(
+                    {
+                        "type": event.type,
+                        "aggregate_type": event.aggregate_type,
+                        "aggregate_id": event.aggregate_id,
+                        "data": event.data,
+                        "timestamp": str(event.timestamp),
+                    }
+                )
+        except Exception:
+            pass  # Screen might not be installed yet
+
+    async def _subscribe_to_events(self, context: _EventSubscriptionContext) -> None:
+        """Subscribe to EventStore for live updates.
+
+        Uses incremental fetching via get_events_after() to avoid replaying
+        the full event history on every poll cycle. This keeps each poll at
+        O(new_events) instead of O(total_events).
+        """
+        if self._event_store is None or not context.execution_id:
             return
 
-        last_event_count = 0
-        poll_interval = 0.5
+        last_row_ids = dict.fromkeys(self._iter_subscription_sources(context), 0)
 
-        while True:
+        while self._is_subscription_active(context):
             try:
-                await asyncio.sleep(poll_interval)
-                events = await self._event_store.replay("execution", self._execution_id)
-                for event in events[last_event_count:]:
-                    # Log event reception
-                    self._state.add_log(
-                        "info",
-                        "tui.events",
-                        f"Received: {event.type}",
-                        {"aggregate_id": event.aggregate_id},
+                new_events: list[BaseEvent] = []
+                for source in self._iter_subscription_sources(context):
+                    aggregate_type, aggregate_id = source
+                    events, last_row_ids[source] = await self._event_store.get_events_after(
+                        aggregate_type,
+                        aggregate_id,
+                        last_row_ids[source],
                     )
-                    # Also forward to logs screen
-                    try:
-                        logs_screen = self.get_screen("logs")
-                        if logs_screen and hasattr(logs_screen, "add_log"):
-                            logs_screen.add_log(
-                                "info",
-                                "tui.events",
-                                f"Received: {event.type}",
-                                {"aggregate_id": event.aggregate_id},
-                            )
-                    except Exception:
-                        pass
+                    new_events.extend(events)
 
-                    message = create_message_from_event(event)
-                    if message is not None:
-                        self.post_message(message)
-                        self._update_state_from_event(event)
+                if new_events:
+                    for event in sorted(new_events, key=lambda item: (item.timestamp, item.id)):
+                        if not self._is_subscription_active(context):
+                            break
+                        self._process_subscription_event(event)
 
-                    # Forward raw event to debug screen
-                    try:
-                        debug_screen = self.get_screen("debug")
-                        if debug_screen and hasattr(debug_screen, "add_raw_event"):
-                            debug_screen.add_raw_event(
-                                {
-                                    "type": event.type,
-                                    "aggregate_type": event.aggregate_type,
-                                    "aggregate_id": event.aggregate_id,
-                                    "data": event.data,
-                                    "timestamp": str(event.timestamp),
-                                }
-                            )
-                    except Exception:
-                        pass  # Screen might not be installed yet
+                await asyncio.sleep(self._poll_interval_seconds)
 
-                last_event_count = len(events)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -236,6 +430,7 @@ class OuroborosTUI(App[None]):
                         )
                 except Exception:
                     pass
+                await asyncio.sleep(self._poll_interval_seconds)
 
     def _update_state_from_event(self, event: BaseEvent) -> None:
         """Update internal state from an event."""
@@ -248,8 +443,20 @@ class OuroborosTUI(App[None]):
             self._state.status = "running"
         elif event_type == "orchestrator.session.completed":
             self._state.status = "completed"
+            self._state.is_paused = False
         elif event_type == "orchestrator.session.failed":
             self._state.status = "failed"
+            self._state.is_paused = False
+        elif event_type == "orchestrator.session.cancelled":
+            self._state.status = "cancelled"
+            self._state.is_paused = False
+        elif event_type == "execution.terminal":
+            # Mirror event from the execution stream — ensures TUI sees
+            # terminal transitions even when only polling "execution".
+            terminal_status = data.get("status", "completed")
+            if terminal_status in {"completed", "failed", "cancelled", "paused"}:
+                self._state.status = terminal_status
+                self._state.is_paused = terminal_status == "paused"
         elif event_type == "orchestrator.session.paused":
             self._state.status = "paused"
             self._state.is_paused = True
@@ -312,6 +519,20 @@ class OuroborosTUI(App[None]):
         self._state.execution_id = execution_id
         self._state.session_id = session_id
         self._state.status = "running"
+        self._state.current_phase = ""
+        self._state.iteration = 0
+        self._state.goal_drift = 0.0
+        self._state.constraint_drift = 0.0
+        self._state.ontology_drift = 0.0
+        self._state.combined_drift = 0.0
+        self._state.total_tokens = 0
+        self._state.total_cost_usd = 0.0
+        self._state.is_paused = False
+        self._state.ac_tree = {}
+        self._state.logs = []
+        self._state.active_tools.clear()
+        self._state.tool_history.clear()
+        self._state.thinking.clear()
         self._state.add_log("info", "tui.main", f"Monitoring execution: {execution_id}")
         # Forward to logs screen
         try:
@@ -320,6 +541,7 @@ class OuroborosTUI(App[None]):
                 logs_screen.add_log("info", "tui.main", f"Monitoring execution: {execution_id}")
         except Exception:
             pass
+        self._notify_ac_tree_updated()
         self._start_event_subscription()
 
     def action_show_selector(self) -> None:
@@ -331,36 +553,24 @@ class OuroborosTUI(App[None]):
         self._state.session_id = message.session_id
         self._state.status = message.status
         self._state.is_paused = message.status == "paused"
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_execution_updated"):
-                screen.on_execution_updated(message)
+        self._forward_to_dashboard("on_execution_updated", message)
 
     def on_phase_changed(self, message: PhaseChanged) -> None:
         self._state.current_phase = message.current_phase
         self._state.iteration = message.iteration
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_phase_changed"):
-                screen.on_phase_changed(message)
+        self._forward_to_dashboard("on_phase_changed", message)
 
     def on_drift_updated(self, message: DriftUpdated) -> None:
         self._state.goal_drift = message.goal_drift
         self._state.constraint_drift = message.constraint_drift
         self._state.ontology_drift = message.ontology_drift
         self._state.combined_drift = message.combined_drift
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_drift_updated"):
-                screen.on_drift_updated(message)
+        self._forward_to_dashboard("on_drift_updated", message)
 
     def on_cost_updated(self, message: CostUpdated) -> None:
         self._state.total_tokens = message.total_tokens
         self._state.total_cost_usd = message.total_cost_usd
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_cost_updated"):
-                screen.on_cost_updated(message)
+        self._forward_to_dashboard("on_cost_updated", message)
 
     def on_ac_updated(self, message: ACUpdated) -> None:
         if message.ac_id:
@@ -368,29 +578,65 @@ class OuroborosTUI(App[None]):
             if message.ac_id in nodes:
                 nodes[message.ac_id]["status"] = message.status
                 nodes[message.ac_id]["is_atomic"] = message.is_atomic
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_ac_updated"):
-                screen.on_ac_updated(message)
+        self._forward_to_dashboard("on_ac_updated", message)
 
     def on_subtask_updated(self, message: SubtaskUpdated) -> None:
         """Handle sub-task updates and add to AC tree (SSOT)."""
         nodes = self._state.ac_tree.get("nodes", {})
-        parent_ac_id = f"ac_{message.ac_index}"
-        sub_task_id = message.sub_task_id
+        resolved_parent_id = _resolve_subtask_parent_id(nodes, message)
+        parent_ac_id = (
+            resolved_parent_id
+            or message.parent_node_id
+            or message.legacy_parent_node_id
+            or (f"ac_{message.ac_index}" if message.ac_index > 0 else "")
+        )
+        sub_task_id = message.node_id or message.sub_task_id
+        existing_node = nodes.get(sub_task_id, {})
 
         # Add or update subtask node
-        nodes[sub_task_id] = {
+        subtask_node = {
             "id": sub_task_id,
-            "content": message.content,
+            "content": message.content or existing_node.get("content", ""),
             "status": message.status,
-            "depth": 2,
+            "depth": message.node_depth
+            if message.node_depth is not None
+            else existing_node.get("depth", 2),
+            "parent_id": parent_ac_id,
             "is_atomic": True,
-            "children_ids": [],
+            "children_ids": existing_node.get("children_ids", []),
+            "node_id": message.node_id,
+            "path": message.path,
+            "display_path": message.display_path,
+            "ordinal": message.ordinal,
+            "root_ac_index": message.root_ac_index,
+            "identity_model": message.identity_model,
         }
+        if message.current_tool_activity:
+            subtask_node["current_tool_activity"] = dict(message.current_tool_activity)
+        elif existing_node.get("current_tool_activity") is not None:
+            subtask_node["current_tool_activity"] = existing_node["current_tool_activity"]
+
+        if message.last_update:
+            subtask_node["last_update"] = dict(message.last_update)
+        elif existing_node.get("last_update") is not None:
+            subtask_node["last_update"] = existing_node["last_update"]
+
+        nodes[sub_task_id] = subtask_node
 
         # Update parent's children_ids (add if not present)
-        if parent_ac_id in nodes:
+        previous_parent_id = existing_node.get("parent_id")
+        if (
+            isinstance(previous_parent_id, str)
+            and previous_parent_id != parent_ac_id
+            and previous_parent_id in nodes
+        ):
+            nodes[previous_parent_id]["children_ids"] = [
+                child_id
+                for child_id in nodes[previous_parent_id].get("children_ids", [])
+                if child_id != sub_task_id
+            ]
+        if resolved_parent_id is not None and resolved_parent_id in nodes:
+            parent_ac_id = resolved_parent_id
             parent = nodes[parent_ac_id]
             children = parent.get("children_ids", [])
             if sub_task_id not in children:
@@ -400,12 +646,7 @@ class OuroborosTUI(App[None]):
 
         self._state.ac_tree["nodes"] = nodes
         self._notify_ac_tree_updated()
-
-        # Forward to current screen
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_subtask_updated"):
-                screen.on_subtask_updated(message)
+        self._forward_to_dashboard("on_subtask_updated", message)
 
     def on_tool_call_started(self, message: ToolCallStarted) -> None:
         """Handle tool call started - track active tools."""
@@ -415,10 +656,7 @@ class OuroborosTUI(App[None]):
             "call_index": str(message.call_index),
         }
         self._notify_ac_tree_updated()
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_tool_call_started"):
-                screen.on_tool_call_started(message)
+        self._forward_to_dashboard("on_tool_call_started", message)
 
     def on_tool_call_completed(self, message: ToolCallCompleted) -> None:
         """Handle tool call completed - move to history."""
@@ -436,18 +674,12 @@ class OuroborosTUI(App[None]):
         # Keep last 20 entries per AC
         if len(history) > 20:
             self._state.tool_history[message.ac_id] = history[-20:]
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_tool_call_completed"):
-                screen.on_tool_call_completed(message)
+        self._forward_to_dashboard("on_tool_call_completed", message)
 
     def on_agent_thinking_updated(self, message: AgentThinkingUpdated) -> None:
         """Handle agent thinking update."""
         self._state.thinking[message.ac_id] = message.thinking_text
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_agent_thinking_updated"):
-                screen.on_agent_thinking_updated(message)
+        self._forward_to_dashboard("on_agent_thinking_updated", message)
 
     def on_workflow_progress_updated(self, message: WorkflowProgressUpdated) -> None:
         # Update state with AC tree from workflow progress (smart merge)
@@ -465,27 +697,20 @@ class OuroborosTUI(App[None]):
         if message.current_phase:
             self._state.current_phase = message.current_phase.lower()
 
-        # Forward to current screen
-        if self._screen_stack:
-            screen = self.screen
-            if hasattr(screen, "on_workflow_progress_updated"):
-                screen.on_workflow_progress_updated(message)
+        # Forward to dashboard, execution, and debug screens
+        self._forward_to_dashboard("on_workflow_progress_updated", message)
 
-        # Also forward to execution screen for event timeline
-        try:
-            execution_screen = self.get_screen("execution")
-            if execution_screen and hasattr(execution_screen, "on_workflow_progress_updated"):
-                execution_screen.on_workflow_progress_updated(message)
-        except Exception:
-            pass  # Screen might not be installed yet
-
-        # Update debug screen with new state
-        try:
-            debug_screen = self.get_screen("debug")
-            if debug_screen and hasattr(debug_screen, "update_state"):
-                debug_screen.update_state(self._state)
-        except Exception:
-            pass  # Screen might not be installed yet
+        for screen_name, method in (
+            ("execution", "on_workflow_progress_updated"),
+            ("debug", "update_state"),
+        ):
+            try:
+                s = self.get_screen(screen_name)
+                if s and hasattr(s, method):
+                    arg = self._state if method == "update_state" else message
+                    getattr(s, method)(arg)
+            except Exception:
+                pass
 
     def _convert_ac_list_to_tree(
         self,
@@ -512,7 +737,7 @@ class OuroborosTUI(App[None]):
         # Create child nodes for each AC
         for ac in acceptance_criteria:
             ac_index = ac.get("index", 0)
-            ac_id = f"ac_{ac_index}"
+            ac_id = ac.get("node_id") or ac.get("ac_id") or f"ac_{ac_index}"
             child_ids.append(ac_id)
 
             # Map status from workflow to tree status
@@ -531,6 +756,12 @@ class OuroborosTUI(App[None]):
                 "depth": 1,
                 "is_atomic": True,  # Flat list = all atomic
                 "children_ids": [],
+                "node_id": ac.get("node_id"),
+                "path": ac.get("path", []),
+                "display_path": ac.get("display_path"),
+                "ordinal": ac.get("ordinal"),
+                "root_ac_index": ac.get("root_ac_index"),
+                "identity_model": ac.get("identity_model"),
             }
 
         # Create root node
@@ -577,7 +808,14 @@ class OuroborosTUI(App[None]):
         # Smart merge: update status/content but preserve children
         for ac in acceptance_criteria:
             ac_index = ac.get("index", 0)
-            ac_id = f"ac_{ac_index}"
+            ac_id = ac.get("node_id") or ac.get("ac_id") or f"ac_{ac_index}"
+            legacy_aliases = _legacy_ac_node_aliases(ac, ac_id)
+            if legacy_aliases:
+                _merge_legacy_ac_node_alias(
+                    existing_nodes,
+                    canonical_id=ac_id,
+                    aliases=legacy_aliases,
+                )
 
             status = ac.get("status", "pending")
             if status == "in_progress":
@@ -589,6 +827,12 @@ class OuroborosTUI(App[None]):
                 # Update existing node - preserve children_ids and is_atomic
                 existing_nodes[ac_id]["status"] = status
                 existing_nodes[ac_id]["content"] = ac.get("content", "")
+                existing_nodes[ac_id]["node_id"] = ac.get("node_id")
+                existing_nodes[ac_id]["path"] = ac.get("path", [])
+                existing_nodes[ac_id]["display_path"] = ac.get("display_path")
+                existing_nodes[ac_id]["ordinal"] = ac.get("ordinal")
+                existing_nodes[ac_id]["root_ac_index"] = ac.get("root_ac_index")
+                existing_nodes[ac_id]["identity_model"] = ac.get("identity_model")
             else:
                 # New AC node - add it
                 existing_nodes[ac_id] = {
@@ -598,11 +842,20 @@ class OuroborosTUI(App[None]):
                     "depth": 1,
                     "is_atomic": True,
                     "children_ids": [],
+                    "node_id": ac.get("node_id"),
+                    "path": ac.get("path", []),
+                    "display_path": ac.get("display_path"),
+                    "ordinal": ac.get("ordinal"),
+                    "root_ac_index": ac.get("root_ac_index"),
+                    "identity_model": ac.get("identity_model"),
                 }
 
         # Ensure root exists and keep its children_ids in sync
         root_id = self._state.ac_tree.get("root_id", "root")
-        expected_child_ids = [f"ac_{ac.get('index', 0)}" for ac in acceptance_criteria]
+        expected_child_ids = [
+            ac.get("node_id") or ac.get("ac_id") or f"ac_{ac.get('index', 0)}"
+            for ac in acceptance_criteria
+        ]
 
         if root_id not in existing_nodes:
             existing_nodes[root_id] = {
@@ -617,8 +870,15 @@ class OuroborosTUI(App[None]):
             existing_nodes[root_id]["status"] = (
                 "executing" if current_ac_index is not None else "pending"
             )
-            # Sync children_ids: add any new ACs not already present
-            current_children = existing_nodes[root_id].get("children_ids", [])
+            # Sync children_ids to the current canonical root AC identities.
+            # This removes mixed-history legacy ``ac_<n>`` roots once a
+            # node-aware progress snapshot introduces the canonical ``node_*``
+            # ID, preventing duplicate root entries after resume replay.
+            current_children = [
+                child_id
+                for child_id in existing_nodes[root_id].get("children_ids", [])
+                if child_id in expected_child_ids
+            ]
             for child_id in expected_child_ids:
                 if child_id not in current_children:
                     current_children.append(child_id)
@@ -715,16 +975,27 @@ class OuroborosTUI(App[None]):
         self._state.ac_tree = tree_data
         self._notify_ac_tree_updated()
 
+    def _get_dashboard_screen(self) -> DashboardScreenV3 | None:
+        """Return the installed dashboard screen regardless of which screen is active."""
+        try:
+            screen = self.get_screen("dashboard")
+            if isinstance(screen, DashboardScreenV3):
+                return screen
+        except Exception:
+            pass
+        return None
+
+    def _forward_to_dashboard(self, method_name: str, message: Any) -> None:
+        """Forward a message to the dashboard screen even when it's not active."""
+        dashboard = self._get_dashboard_screen()
+        if dashboard is not None and hasattr(dashboard, method_name):
+            getattr(dashboard, method_name)(message)
+
     def _notify_ac_tree_updated(self) -> None:
         """Notify dashboard that AC tree has been updated."""
-        if self._screen_stack:
-            screen = self.screen
-            if isinstance(screen, DashboardScreenV3):
-                if hasattr(screen, "_tree") and screen._tree is not None:
-                    screen._tree.update_tree(self._state.ac_tree)
-            elif isinstance(screen, DashboardScreen):
-                if hasattr(screen, "_ac_tree") and screen._ac_tree is not None:
-                    screen._ac_tree.update_tree(self._state.ac_tree)
+        dashboard = self._get_dashboard_screen()
+        if dashboard is not None and hasattr(dashboard, "_tree") and dashboard._tree is not None:
+            dashboard._tree.update_tree(self._state.ac_tree)
 
     async def on_unmount(self) -> None:
         if self._subscription_task is not None:

@@ -6,7 +6,10 @@ of BaseEvents from the EventStore, it produces an OntologyLineage instance.
 
 from __future__ import annotations
 
+import logging
+
 from ouroboros.core.lineage import (
+    ControlDirectiveEmission,
     EvaluationSummary,
     GenerationPhase,
     GenerationRecord,
@@ -20,6 +23,9 @@ from ouroboros.events.base import BaseEvent
 # Sentinel for generations that haven't completed (started/failed).
 # These don't have a real ontology yet, but GenerationRecord requires one.
 _PENDING_ONTOLOGY = OntologySchema(name="(pending)", description="(pending)", fields=())
+
+
+logger = logging.getLogger(__name__)
 
 
 class LineageProjector:
@@ -46,6 +52,7 @@ class LineageProjector:
         lineage: OntologyLineage | None = None
         generations: dict[int, GenerationRecord] = {}
         rewind_history: list[RewindRecord] = []
+        directive_emissions: list[ControlDirectiveEmission] = []
 
         for event in events:
             if event.type == "lineage.created":
@@ -64,7 +71,7 @@ class LineageProjector:
                     try:
                         phase = GenerationPhase(data.get("phase", "wondering"))
                     except ValueError:
-                        phase = GenerationPhase.WONDERING
+                        continue  # Skip events with invalid/legacy phase values
                     generations[gen_num] = GenerationRecord(
                         generation_number=gen_num,
                         seed_id=data.get("seed_id") or "",
@@ -89,6 +96,7 @@ class LineageProjector:
                     parent_seed_id=data.get("parent_seed_id"),
                     ontology_snapshot=ontology,
                     evaluation_summary=eval_summary,
+                    seed_quality_canary_feedback=data.get("seed_quality_canary_feedback", ()),
                     wonder_questions=tuple(data.get("wonder_questions", [])),
                     phase=GenerationPhase.COMPLETED,
                     created_at=event.timestamp,
@@ -96,6 +104,17 @@ class LineageProjector:
                     execution_output=data.get("execution_output"),
                 )
                 generations[gen_num] = record
+
+            elif event.type == "lineage.generation.phase_changed":
+                data = event.data
+                gen_num = data.get("generation_number", 0)
+                if gen_num and gen_num in generations:
+                    try:
+                        phase = GenerationPhase(data.get("phase", "wondering"))
+                    except ValueError:
+                        continue  # Skip events with invalid/legacy phase values
+                    old = generations[gen_num]
+                    generations[gen_num] = old.model_copy(update={"phase": phase})
 
             elif event.type == "lineage.generation.failed":
                 data = event.data
@@ -122,6 +141,32 @@ class LineageProjector:
                         failure_error=error_msg,
                     )
 
+            elif event.type == "lineage.generation.interrupted":
+                data = event.data
+                gen_num = data["generation_number"]
+                interrupt_update: dict = {
+                    "phase": GenerationPhase.INTERRUPTED,
+                    "last_completed_phase": data.get("last_completed_phase"),
+                    "partial_state": data.get("partial_state"),
+                }
+                if data.get("seed_json"):
+                    interrupt_update["seed_json"] = data["seed_json"]
+                if gen_num in generations:
+                    old = generations[gen_num]
+                    generations[gen_num] = old.model_copy(update=interrupt_update)
+                else:
+                    logger.warning(
+                        "projector.interrupted_without_started",
+                        extra={"generation_number": gen_num},
+                    )
+                    generations[gen_num] = GenerationRecord(
+                        generation_number=gen_num,
+                        seed_id="",
+                        ontology_snapshot=_PENDING_ONTOLOGY,
+                        created_at=event.timestamp,
+                        **interrupt_update,
+                    )
+
             elif event.type == "lineage.converged":
                 if lineage is not None:
                     lineage = lineage.with_status(LineageStatus.CONVERGED)
@@ -131,8 +176,11 @@ class LineageProjector:
                     lineage = lineage.with_status(LineageStatus.EXHAUSTED)
 
             elif event.type == "lineage.stagnated":
-                if lineage is not None:
-                    lineage = lineage.with_status(LineageStatus.CONVERGED)
+                # Stagnation is a non-terminal recovery signal. The control
+                # directive stream maps it to UNSTUCK, so replay must leave the
+                # lineage ACTIVE and resumable rather than treating it as
+                # terminal success.
+                pass
 
             elif event.type == "lineage.rewound":
                 data = event.data
@@ -148,32 +196,74 @@ class LineageProjector:
                         discarded_generations=discarded,
                     )
                 )
-                # Remove generations after the rewind point
+                # Remove active generations after the rewind point. Directive
+                # emissions remain in the projected audit timeline so reports
+                # can still explain discarded branches preserved in
+                # rewind_history.
                 generations = {k: v for k, v in generations.items() if k <= to_gen}
                 if lineage is not None:
                     lineage = lineage.with_status(LineageStatus.ACTIVE)
 
+            elif event.type == "control.directive.emitted":
+                # Fold control-plane directives onto the lineage timeline
+                # alongside state events, per RFC #476 M2 / sub-RFC #511.
+                # The full event row remains in the EventStore; we project
+                # the audit-level summary so callers (TUI, reports) can
+                # render decisions without a second query.
+                data = event.data
+                directive_value = data.get("directive")
+                if not isinstance(directive_value, str) or not directive_value:
+                    # Silently skip malformed directive events rather than
+                    # corrupt the projection; the raw row is still queryable
+                    # via event_store directly for postmortem.
+                    continue
+                generation_number = data.get("generation_number")
+                if generation_number is not None and not isinstance(generation_number, int):
+                    continue
+                phase = data.get("phase")
+                if phase is not None and not isinstance(phase, str):
+                    continue
+                is_terminal = data.get("is_terminal", False)
+                if not isinstance(is_terminal, bool):
+                    continue
+                directive_emissions.append(
+                    ControlDirectiveEmission(
+                        directive=directive_value,
+                        reason=str(data.get("reason", "")),
+                        emitted_by=str(data.get("emitted_by", "")),
+                        timestamp=event.timestamp,
+                        generation_number=generation_number,
+                        phase=phase,
+                        is_terminal=is_terminal,
+                    )
+                )
+
         if lineage is None:
             return None
 
-        # Build final lineage with sorted generations and rewind history
+        # Build final lineage with sorted generations, rewind history, and
+        # any control-plane directive emissions that were folded in.
         sorted_records = tuple(generations[k] for k in sorted(generations.keys()))
         return lineage.model_copy(
             update={
                 "generations": sorted_records,
                 "rewind_history": tuple(rewind_history),
+                "directive_emissions": tuple(directive_emissions),
             }
         )
 
-    def find_resume_point(self, events: list[BaseEvent]) -> tuple[int, GenerationPhase]:
+    def find_resume_point(self, events: list[BaseEvent]) -> tuple[int, GenerationPhase, str | None]:
         """Determine where to resume from event history.
 
         Returns:
-            Tuple of (generation_number, last_completed_phase).
-            Returns (0, COMPLETED) if no generations started.
+            Tuple of (generation_number, terminal_phase, last_completed_phase_within_gen).
+            - last_completed_phase_within_gen is set for INTERRUPTED generations
+              to enable phase-level resume (skip already-completed phases).
+            Returns (0, COMPLETED, None) if no generations started.
         """
         last_gen = 0
         last_phase = GenerationPhase.COMPLETED
+        interrupted_phase: str | None = None
 
         for event in events:
             if event.type == "lineage.generation.started":
@@ -186,17 +276,46 @@ class LineageProjector:
                 if gen > last_gen:
                     last_gen = gen
                     last_phase = phase
+                    interrupted_phase = None
+
+            elif event.type == "lineage.generation.phase_changed":
+                gen = event.data.get("generation_number", 0)
+                phase_str = event.data.get("phase", "wondering")
+                try:
+                    phase = GenerationPhase(phase_str)
+                except ValueError:
+                    continue
+                if gen >= last_gen:
+                    last_gen = gen
+                    last_phase = phase
+                    interrupted_phase = None
 
             elif event.type == "lineage.generation.completed":
                 gen = event.data.get("generation_number", 0)
                 if gen >= last_gen:
                     last_gen = gen
                     last_phase = GenerationPhase.COMPLETED
+                    interrupted_phase = None
 
             elif event.type == "lineage.generation.failed":
                 gen = event.data.get("generation_number", 0)
                 if gen >= last_gen:
                     last_gen = gen
                     last_phase = GenerationPhase.FAILED
+                    interrupted_phase = None
 
-        return last_gen, last_phase
+            elif event.type == "lineage.generation.interrupted":
+                gen = event.data.get("generation_number", 0)
+                if gen >= last_gen:
+                    last_gen = gen
+                    last_phase = GenerationPhase.INTERRUPTED
+                    interrupted_phase = event.data.get("last_completed_phase")
+
+            elif event.type == "lineage.rewound":
+                target_gen = event.data.get("to_generation", 0)
+                if target_gen > 0:
+                    last_gen = target_gen
+                    last_phase = GenerationPhase.COMPLETED
+                    interrupted_phase = None
+
+        return last_gen, last_phase, interrupted_phase

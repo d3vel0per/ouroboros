@@ -12,14 +12,16 @@ Reflect handles all subsequent generations autonomously.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 import json
 import logging
 
 from pydantic import BaseModel, Field
 
+from ouroboros.config import get_llm_backend, get_reflect_model
 from ouroboros.core.errors import ProviderError
-from ouroboros.core.lineage import EvaluationSummary, MutationAction, OntologyLineage
+from ouroboros.core.lineage import EvaluationSummary, MutationAction, OntologyDelta, OntologyLineage
 from ouroboros.core.seed import Seed
 from ouroboros.core.text import truncate_head_tail
 from ouroboros.core.types import Result
@@ -33,8 +35,6 @@ from ouroboros.providers.base import (
 )
 
 logger = logging.getLogger(__name__)
-
-_FALLBACK_MODEL = "claude-opus-4-6"
 
 
 class OntologyMutation(BaseModel, frozen=True):
@@ -73,10 +73,103 @@ class ReflectEngine:
 
     When evaluation is fully approved (score >= 0.8, no drift), outputs
     minimal changes to allow convergence.
+
+    Adapter freshness:
+        ``llm_adapter`` is captured at MCP server startup. If the user
+        changes ``llm.backend`` in ``~/.ouroboros/config.yaml`` after the
+        server has started, the captured adapter is stale and every Reflect
+        call still hits the previous backend's adapter (issue #562). The
+        ``adapter_factory`` field lets callers supply a zero-arg factory
+        the engine invokes per call so Reflect always honors the live
+        config; if no factory is supplied the engine falls back to the
+        captured adapter (preserving today's behavior for tests and direct
+        consumers).
     """
 
     llm_adapter: LLMAdapter
-    model: str = _FALLBACK_MODEL
+    model: str | None = None
+    adapter_factory: Callable[[], LLMAdapter | None] | None = field(default=None)
+    adapter_backend: str | None = None
+    _captured_backend: str | None = field(default=None, init=False, repr=False)
+    _model_is_explicit: bool = field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Track explicit model pins while allowing backend-aware implicit defaults."""
+        self._model_is_explicit = self.model is not None
+        try:
+            self._captured_backend = self.adapter_backend or get_llm_backend()
+        except Exception:  # noqa: BLE001 — never fail engine init on config read
+            self._captured_backend = None
+        if self.model is None:
+            self._refresh_model(self._captured_backend)
+
+    def _refresh_model(self, backend: str | None) -> None:
+        if not self._model_is_explicit:
+            self.model = get_reflect_model(backend)
+
+    def _completion_model(self) -> str:
+        if self.model is None:
+            self._refresh_model(self._selected_backend())
+        assert self.model is not None
+        return self.model
+
+    def _resolve_adapter(self) -> LLMAdapter:
+        """Return the adapter the next ``complete()`` call should use."""
+        current_backend = self._selected_backend()
+        backend_drifted = (
+            self._captured_backend is not None
+            and current_backend
+            and current_backend != self._captured_backend
+        )
+
+        if self.adapter_factory is not None:
+            try:
+                fresh = self.adapter_factory()
+                if fresh is not None:
+                    # Treat the factory result as the latest known-good adapter so
+                    # a later transient factory failure does not fall back to a
+                    # stale startup adapter after backend/model state has moved.
+                    self.llm_adapter = fresh
+                    if current_backend:
+                        self._captured_backend = current_backend
+                        self._refresh_model(current_backend)
+                    return fresh
+            except Exception:  # noqa: BLE001 — fall through to captured adapter
+                logger.exception("ReflectEngine adapter_factory raised; using captured adapter")
+                return self.llm_adapter
+
+        if backend_drifted:
+            try:
+                from ouroboros.providers.factory import create_llm_adapter
+
+                rebuilt = create_llm_adapter(
+                    backend=current_backend,
+                    **_adapter_rebuild_kwargs(self.llm_adapter),
+                )
+                self.llm_adapter = rebuilt
+                self._captured_backend = current_backend
+                self._refresh_model(current_backend)
+                logger.info(
+                    "reflect.adapter_rebuilt_for_backend_drift",
+                    extra={"new_backend": current_backend},
+                )
+                return rebuilt
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "ReflectEngine failed to rebuild adapter for drifted backend; "
+                    "falling back to captured adapter"
+                )
+                return self.llm_adapter
+
+        return self.llm_adapter
+
+    def _selected_backend(self) -> str | None:
+        if self.adapter_backend is not None:
+            return self.adapter_backend
+        try:
+            return get_llm_backend()
+        except Exception:  # noqa: BLE001
+            return None
 
     async def reflect(
         self,
@@ -111,13 +204,16 @@ class ReflectEngine:
             Message(role=MessageRole.USER, content=prompt),
         ]
 
+        adapter = self._resolve_adapter()
         config = CompletionConfig(
-            model=self.model,
+            model=self._completion_model(),
+            role="reflect",
+            model_is_explicit=self._model_is_explicit,
             temperature=0.5,
             max_tokens=3000,
         )
 
-        result = await self.llm_adapter.complete(messages, config)
+        result = await adapter.complete(messages, config)
 
         if result.is_err:
             logger.error("ReflectEngine LLM call failed: %s", result.error)
@@ -132,7 +228,15 @@ class ReflectEngine:
             },
         )
 
-        return Result.ok(self._parse_response(raw_content, current_seed))
+        parsed = self._parse_response(raw_content, current_seed)
+        if parsed is None:
+            return Result.err(
+                ProviderError(
+                    message="Reflect failed to parse LLM response",
+                    provider="reflect",
+                )
+            )
+        return Result.ok(parsed)
 
     def _system_prompt(self) -> str:
         return """You are the Reflect Engine of Ouroboros, an evolutionary development system.
@@ -156,11 +260,14 @@ You must respond with a JSON object (no markdown, no code fences):
 }
 
 Guidelines:
-- If evaluation was mostly successful (score >= 0.8, approved), propose MINIMAL changes
+- If Wonder questions exist, you MUST propose at least one ontology_mutation that addresses them
+- If evaluation score >= 0.8 and approved, keep changes focused but still evolve the ontology based on Wonder insights
+- If evaluation score < 0.8 or not approved, propose more aggressive mutations to address failures
 - Each mutation must have a clear reason tied to evaluation findings or wonder questions
 - refined_acs should address the wonder questions and ontology tensions
 - Do NOT change things that are working well -- only evolve what needs evolution
 - action must be exactly one of: "add", "modify", "remove"
+- An empty ontology_mutations list is ONLY acceptable when there are no Wonder questions
 """
 
     def _build_prompt(
@@ -187,6 +294,21 @@ Guidelines:
         parts.append(f"  Drift: {eval_summary.drift_score}")
         if eval_summary.failure_reason:
             parts.append(f"  Failure: {eval_summary.failure_reason}")
+        if eval_summary.feedback_metadata:
+            parts.append("  Feedback Signals:")
+            for feedback in eval_summary.feedback_metadata:
+                details: list[str] = []
+                max_depth = feedback.details.get("max_depth")
+                if isinstance(max_depth, int):
+                    details.append(f"max_depth={max_depth}")
+                affected_count = feedback.details.get("affected_count")
+                if isinstance(affected_count, int):
+                    details.append(f"affected_count={affected_count}")
+                detail_suffix = f" ({', '.join(details)})" if details else ""
+                parts.append(
+                    f"    - [{feedback.severity.upper()}] {feedback.code}: "
+                    f"{feedback.message}{detail_suffix}"
+                )
         if eval_summary.ac_results:
             parts.append("\n  Per-AC Breakdown:")
             for ac in eval_summary.ac_results:
@@ -233,6 +355,28 @@ Guidelines:
                     f"approved={gen.evaluation_summary.final_approved if gen.evaluation_summary else 'N/A'}"
                 )
 
+            # Stagnation warning: detect consecutive identical ontologies
+            stagnant_count = 0
+            gens = lineage.generations
+            for i in range(len(gens) - 1, 0, -1):
+                if (
+                    OntologyDelta.compute(
+                        gens[i - 1].ontology_snapshot, gens[i].ontology_snapshot
+                    ).similarity
+                    >= 0.99
+                ):
+                    stagnant_count += 1
+                else:
+                    break
+            if stagnant_count >= 1:
+                parts.append(
+                    f"\n## WARNING: STAGNATION DETECTED"
+                    f"\n  The ontology has NOT changed for {stagnant_count} consecutive generation(s)."
+                    f"\n  Previous Reflect phases produced ZERO effective mutations."
+                    f"\n  You MUST propose concrete ontology mutations based on the Wonder questions above."
+                    f"\n  Translate each Wonder question into at least one add/modify/remove mutation."
+                )
+
         parts.append("\n## Your Task")
         parts.append(
             "Based on the evaluation results and wonder questions, propose specific "
@@ -242,8 +386,11 @@ Guidelines:
 
         return "\n".join(parts)
 
-    def _parse_response(self, content: str, current_seed: Seed) -> ReflectOutput:
-        """Parse LLM response into ReflectOutput."""
+    def _parse_response(self, content: str, current_seed: Seed) -> ReflectOutput | None:
+        """Parse LLM response into ReflectOutput.
+
+        Returns None on parse failure so the caller can retry or propagate error.
+        """
         try:
             cleaned = content.strip()
             if cleaned.startswith("```"):
@@ -285,11 +432,36 @@ Guidelines:
                     "raw_content": content[:1000],
                 },
             )
-            # Return current seed values with no mutations (safe fallback)
-            return ReflectOutput(
-                refined_goal=current_seed.goal,
-                refined_constraints=current_seed.constraints,
-                refined_acs=current_seed.acceptance_criteria,
-                ontology_mutations=(),
-                reasoning=f"Parse error, keeping current: {e}",
-            )
+            return None
+
+
+def _adapter_rebuild_kwargs(adapter: LLMAdapter) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "cwd": _adapter_cwd(adapter),
+        "max_turns": _adapter_max_turns(adapter),
+    }
+    for key, attr in (
+        ("permission_mode", "_permission_mode"),
+        ("allowed_tools", "_allowed_tools"),
+        ("cli_path", "_cli_path"),
+        ("timeout", "_timeout"),
+        ("max_retries", "_max_retries"),
+        ("on_message", "_on_message"),
+        ("api_key", "_api_key"),
+        ("api_base", "_api_base"),
+    ):
+        if hasattr(adapter, attr):
+            value = getattr(adapter, attr)
+            if value is not None:
+                kwargs[key] = value
+    return kwargs
+
+
+def _adapter_cwd(adapter: LLMAdapter) -> str | None:
+    value = getattr(adapter, "_cwd", None)
+    return str(value) if value is not None else None
+
+
+def _adapter_max_turns(adapter: LLMAdapter) -> int:
+    value = getattr(adapter, "_max_turns", 1)
+    return value if isinstance(value, int) and value > 0 else 1

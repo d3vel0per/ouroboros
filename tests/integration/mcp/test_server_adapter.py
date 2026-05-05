@@ -5,6 +5,7 @@ registration, resource handling, and the full server lifecycle.
 """
 
 import asyncio
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -475,12 +476,57 @@ class TestMCPServerAdapterIntegration:
 class TestCreateOuroborosServer:
     """Test the create_ouroboros_server factory function."""
 
+    EXPECTED_OUROBOROS_SERVER_TOOLS = {
+        "ouroboros_ac_dashboard",
+        "ouroboros_ac_tree_hud",
+        "ouroboros_auto",
+        "ouroboros_brownfield",
+        "ouroboros_cancel_execution",
+        "ouroboros_cancel_job",
+        "ouroboros_evaluate",
+        "ouroboros_evolve_rewind",
+        "ouroboros_evolve_step",
+        "ouroboros_execute_seed",
+        "ouroboros_generate_seed",
+        "ouroboros_interview",
+        "ouroboros_job_result",
+        "ouroboros_job_status",
+        "ouroboros_job_wait",
+        "ouroboros_lateral_think",
+        "ouroboros_lineage_status",
+        "ouroboros_measure_drift",
+        "ouroboros_pm_interview",
+        "ouroboros_qa",
+        "ouroboros_query_events",
+        "ouroboros_session_status",
+        "ouroboros_start_evolve_step",
+        "ouroboros_start_execute_seed",
+    }
+
     def test_creates_server_with_defaults(self) -> None:
         """Factory creates server with default configuration."""
         server = create_ouroboros_server()
 
         assert server.info.name == "ouroboros-mcp"
         assert server.info.version == "1.0.0"
+        tool_names = {tool.name for tool in server.info.tools}
+        assert tool_names == self.EXPECTED_OUROBOROS_SERVER_TOOLS
+
+    def test_create_server_forwards_bridge_context_to_auto_handler(self) -> None:
+        """Auto resume rebuilds should retain bridge access from server wiring."""
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        class FakeBridge:
+            manager = object()
+            tool_prefix = "bridge__"
+
+        bridge = FakeBridge()
+        server = create_ouroboros_server(mcp_bridge=bridge)
+        auto = server._tool_handlers["ouroboros_auto"]
+
+        assert isinstance(auto, AutoHandler)
+        assert auto.mcp_manager is bridge.manager
+        assert auto.mcp_tool_prefix == "bridge__"
 
     def test_creates_server_with_custom_config(self) -> None:
         """Factory creates server with custom configuration."""
@@ -508,6 +554,98 @@ class TestCreateOuroborosServer:
 
         # Server should be created without error
         assert server.info.name == "ouroboros-mcp"
+
+    def test_codex_runtime_uses_backend_without_claude_model_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex runtime wiring does not inject Claude-only default models."""
+        monkeypatch.delenv("OUROBOROS_EXECUTION_MODEL", raising=False)
+        monkeypatch.delenv("OUROBOROS_VALIDATION_MODEL", raising=False)
+
+        with patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime:
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex")
+
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args.kwargs["backend"] == "codex"
+        assert mock_create_runtime.call_args.kwargs["model"] is None
+
+    def test_codex_llm_backend_is_forwarded_to_adapter_factory(self) -> None:
+        """LLM-only backend selection is routed through the shared adapter factory."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex", llm_backend="codex")
+
+        mock_create_llm_adapter.assert_called_once()
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] == "codex"
+        assert mock_create_llm_adapter.call_args.kwargs["max_turns"] == 1
+
+    def test_evolution_adapter_factory_resolves_live_backend_with_cwd(self) -> None:
+        """Per-call evolution adapter factory must not freeze startup llm_backend."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+            patch("ouroboros.evolution.wonder.WonderEngine") as mock_wonder_engine,
+            patch("ouroboros.evolution.reflect.ReflectEngine") as mock_reflect_engine,
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex", llm_backend="codex")
+
+            initial_kwargs = mock_create_llm_adapter.call_args.kwargs
+            factory = mock_wonder_engine.call_args.kwargs["adapter_factory"]
+            assert mock_wonder_engine.call_args.kwargs["adapter_backend"] == "codex"
+            assert mock_reflect_engine.call_args.kwargs["adapter_factory"] is factory
+            assert mock_reflect_engine.call_args.kwargs["adapter_backend"] == "codex"
+
+            factory()
+
+        assert initial_kwargs["backend"] == "codex"
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] == "codex"
+        assert mock_create_llm_adapter.call_args.kwargs["cwd"] == initial_kwargs["cwd"]
+        assert mock_create_llm_adapter.call_args.kwargs["max_turns"] == 1
+
+    def test_evolution_adapter_factory_uses_live_backend_without_explicit_override(self) -> None:
+        """Per-call evolution adapter factory resolves live config absent override."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+            patch("ouroboros.evolution.wonder.WonderEngine") as mock_wonder_engine,
+            patch("ouroboros.evolution.reflect.ReflectEngine"),
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="codex")
+
+            factory = mock_wonder_engine.call_args.kwargs["adapter_factory"]
+            assert mock_wonder_engine.call_args.kwargs["adapter_backend"] is None
+            factory()
+
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] is None
+
+    def test_opencode_backend_is_accepted_at_server_creation(self) -> None:
+        """OpenCode backend is forwarded through the shared adapter factory."""
+        with (
+            patch("ouroboros.providers.create_llm_adapter") as mock_create_llm_adapter,
+            patch("ouroboros.orchestrator.create_agent_runtime") as mock_create_runtime,
+        ):
+            mock_create_llm_adapter.return_value = MagicMock()
+            mock_create_runtime.return_value = MagicMock()
+
+            create_ouroboros_server(runtime_backend="opencode", llm_backend="opencode")
+
+        mock_create_llm_adapter.assert_called_once()
+        assert mock_create_llm_adapter.call_args.kwargs["backend"] == "opencode"
+        mock_create_runtime.assert_called_once()
+        assert mock_create_runtime.call_args.kwargs["backend"] == "opencode"
 
 
 class TestMCPServerAdapterConcurrency:

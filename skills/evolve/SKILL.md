@@ -41,7 +41,20 @@ ooo evolve --rewind <lineage_id> <generation_number>
 
 ## Instructions
 
-### Path A: MCP Available (check for `ouroboros_evolve_step` tool)
+### Load MCP Tools (Required before Path A/B decision)
+
+The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before deciding between Path A and Path B.**
+
+1. Use the `ToolSearch` tool to find and load the evolve MCP tools:
+   ```
+   ToolSearch query: "+ouroboros evolve"
+   ```
+2. The tools will typically be named with prefix `mcp__plugin_ouroboros_ouroboros__` (e.g., `ouroboros_evolve_step`, `ouroboros_interview`, `ouroboros_generate_seed`). After ToolSearch returns, the tools become callable.
+3. If ToolSearch finds the tools → proceed to **Path A**. If not → proceed to **Path B**.
+
+**IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
+
+### Path A: MCP Available (loaded via ToolSearch above)
 
 **Starting a new evolutionary loop:**
 1. Parse the user's input as `initial_context`
@@ -79,14 +92,13 @@ ooo evolve --rewind <lineage_id> <generation_number>
 ### Path B: Plugin-only (no MCP tools available)
 
 If MCP tools are not available, explain the evolutionary loop concept and
-suggest installing the Ouroboros MCP server:
+suggest installing the Ouroboros MCP server. See [Getting Started](docs/getting-started.md) for install options, then run:
 
 ```
-pip install ouroboros-ai
 ouroboros mcp serve
 ```
 
-Then add to Claude Code's MCP configuration.
+Then add to your runtime's MCP configuration (e.g., `~/.claude/mcp.json` for Claude Code).
 
 ## Key Concepts
 

@@ -18,9 +18,16 @@ ensuring root cause resolution is important.
 """
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
+import os
 
+from ouroboros.config import (
+    get_consensus_advocate_model,
+    get_consensus_devil_model,
+    get_consensus_judge_model,
+    get_consensus_models,
+)
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.ontology_aspect import AnalysisResult
 from ouroboros.core.types import Result
@@ -39,17 +46,48 @@ from ouroboros.events.evaluation import (
     create_stage3_completed_event,
     create_stage3_started_event,
 )
-from ouroboros.providers.base import CompletionConfig, Message, MessageRole
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
 from ouroboros.strategies.devil_advocate import ConsensusContext, DevilAdvocateStrategy
 
 # Default models for consensus voting (Frontier tier)
 # Can be overridden via ConsensusConfig.models
-DEFAULT_CONSENSUS_MODELS: tuple[str, ...] = (
-    "openrouter/openai/gpt-4o",
-    "openrouter/anthropic/claude-opus-4-6",
-    "openrouter/google/gemini-2.5-pro",
+DEFAULT_CONSENSUS_MODELS: tuple[str, ...] = get_consensus_models()
+
+
+# Perspective labels for single-model fallback (same model, different prompts)
+SINGLE_MODEL_PERSPECTIVES: tuple[tuple[str, VoterRole, str], ...] = (
+    (
+        "advocate",
+        VoterRole.ADVOCATE,
+        "You are an ADVOCATE reviewer. Focus on strengths, correct implementations, "
+        "and how the artifact meets the acceptance criteria. Give credit where due, "
+        "but do not ignore genuine issues.",
+    ),
+    (
+        "devil-advocate",
+        VoterRole.DEVIL,
+        "You are a DEVIL'S ADVOCATE reviewer. Critically examine the artifact for "
+        "hidden flaws, edge cases, security issues, and whether it truly addresses "
+        "the root problem or merely treats symptoms. Be constructively skeptical.",
+    ),
+    (
+        "judge",
+        VoterRole.JUDGE,
+        "You are a neutral JUDGE reviewer. Evaluate the artifact objectively, weighing "
+        "both strengths and weaknesses. Focus on whether the acceptance criteria are "
+        "genuinely satisfied with production-quality standards.",
+    ),
 )
+
+
+def _has_multi_model_credentials() -> bool:
+    """Check if credentials are available for multi-model consensus.
+
+    Returns True if OPENROUTER_API_KEY is set, which enables routing
+    to different model providers (GPT-4o, Claude, Gemini).
+    """
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    return bool(key and not key.startswith("YOUR_"))
 
 
 # JSON schema for consensus vote output
@@ -92,11 +130,18 @@ class ConsensusConfig:
         diversity_required: Require different providers
     """
 
-    models: tuple[str, ...] = DEFAULT_CONSENSUS_MODELS
+    models: tuple[str, ...] | None = None
+    models_are_explicit: bool = field(default=False, init=False)
     temperature: float = 0.3
     max_tokens: int = 1024
     majority_threshold: float = 0.66  # 2/3 = 0.6666...
     diversity_required: bool = True
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default models while preserving explicit caller pins."""
+        object.__setattr__(self, "models_are_explicit", self.models is not None)
+        if self.models is None:
+            object.__setattr__(self, "models", get_consensus_models())
 
 
 def _get_consensus_system_prompt() -> str:
@@ -204,6 +249,11 @@ class ConsensusEvaluator:
     Uses multiple Frontier tier models for diverse verification.
     Requires 2/3 majority for approval.
 
+    When OpenRouter API key is not configured, falls back to
+    single-model multi-perspective mode: the same underlying model
+    evaluates from three different viewpoints (advocate, devil's
+    advocate, judge). Output honestly reflects the actual mode.
+
     Example:
         evaluator = ConsensusEvaluator(llm_adapter)
         result = await evaluator.evaluate(context, trigger_reason)
@@ -211,7 +261,7 @@ class ConsensusEvaluator:
 
     def __init__(
         self,
-        llm_adapter: LiteLLMAdapter,
+        llm_adapter: LLMAdapter,
         config: ConsensusConfig | None = None,
     ) -> None:
         """Initialize evaluator.
@@ -230,6 +280,9 @@ class ConsensusEvaluator:
     ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
         """Run consensus evaluation with multiple models.
 
+        Automatically detects whether multi-model credentials are
+        available. If not, runs single-model multi-perspective mode.
+
         Args:
             context: Evaluation context
             trigger_reason: Why consensus was triggered
@@ -237,10 +290,33 @@ class ConsensusEvaluator:
         Returns:
             Result containing ConsensusResult and events, or error
         """
+        if self._should_use_multi_model():
+            return await self._evaluate_multi_model(context, trigger_reason)
+        return await self._evaluate_single_model(context, trigger_reason)
+
+    def _should_use_multi_model(self) -> bool:
+        """Determine whether to use multi-model or single-model mode.
+
+        Uses multi-model when:
+        - Models are NOT openrouter/* (custom models, tests), OR
+        - OPENROUTER_API_KEY is properly configured
+        """
+        assert self._config.models is not None
+        needs_openrouter = any(m.startswith("openrouter/") for m in self._config.models)
+        if not needs_openrouter:
+            return True  # Custom models (e.g., tests) — use as-is
+        return _has_multi_model_credentials()
+
+    async def _evaluate_multi_model(
+        self,
+        context: EvaluationContext,
+        trigger_reason: str,
+    ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
+        """Multi-model consensus: each model votes independently."""
         events: list[BaseEvent] = []
+        assert self._config.models is not None
         models = list(self._config.models)
 
-        # Emit start event
         events.append(
             create_stage3_started_event(
                 execution_id=context.execution_id,
@@ -249,17 +325,14 @@ class ConsensusEvaluator:
             )
         )
 
-        # Build messages
         messages = [
             Message(role=MessageRole.SYSTEM, content=_get_consensus_system_prompt()),
             Message(role=MessageRole.USER, content=build_consensus_prompt(context)),
         ]
 
-        # Collect votes from all models concurrently
         vote_tasks = [self._get_vote(messages, model) for model in models]
         vote_results = await asyncio.gather(*vote_tasks, return_exceptions=True)
 
-        # Process results
         votes: list[Vote] = []
         errors: list[str] = []
 
@@ -272,7 +345,6 @@ class ConsensusEvaluator:
                 continue
             votes.append(result.value)
 
-        # Need at least 2 votes to proceed
         if len(votes) < 2:
             return Result.err(
                 ValidationError(
@@ -281,12 +353,115 @@ class ConsensusEvaluator:
                 )
             )
 
-        # Calculate consensus
+        return self._build_consensus(context, votes, events, is_single_model=False)
+
+    async def _evaluate_single_model(
+        self,
+        context: EvaluationContext,
+        trigger_reason: str,
+    ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
+        """Single-model multi-perspective: same model, different prompts.
+
+        Each perspective uses a distinct system prompt that shapes the
+        evaluation angle (advocate, devil's advocate, judge), producing
+        genuinely different assessments even from the same model.
+        """
+        events: list[BaseEvent] = []
+        perspective_labels = [p[0] for p in SINGLE_MODEL_PERSPECTIVES]
+
+        events.append(
+            create_stage3_started_event(
+                execution_id=context.execution_id,
+                models=[f"session/{label}" for label in perspective_labels],
+                trigger_reason=f"single-model-perspectives:{trigger_reason}",
+            )
+        )
+
+        user_prompt = build_consensus_prompt(context)
+        vote_tasks = [
+            self._get_perspective_vote(user_prompt, label, role, system_prompt)
+            for label, role, system_prompt in SINGLE_MODEL_PERSPECTIVES
+        ]
+        vote_results = await asyncio.gather(*vote_tasks, return_exceptions=True)
+
+        votes: list[Vote] = []
+        errors: list[str] = []
+
+        for (label, _, _), result in zip(SINGLE_MODEL_PERSPECTIVES, vote_results, strict=True):
+            if isinstance(result, Exception):
+                errors.append(f"{label}: {result}")
+                continue
+            if result.is_err:
+                errors.append(f"{label}: {result.error.message}")
+                continue
+            votes.append(result.value)
+
+        if len(votes) < 2:
+            return Result.err(
+                ValidationError(
+                    f"Not enough perspective votes collected: {len(votes)}/3",
+                    details={"errors": errors},
+                )
+            )
+
+        return self._build_consensus(context, votes, events, is_single_model=True)
+
+    async def _get_perspective_vote(
+        self,
+        user_prompt: str,
+        label: str,
+        role: VoterRole,
+        perspective_prompt: str,
+    ) -> Result[Vote, ProviderError | ValidationError]:
+        """Get a vote from a specific perspective using the session model."""
+        base_system = _get_consensus_system_prompt()
+        system_prompt = f"{base_system}\n\n## Your Perspective\n{perspective_prompt}"
+
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=system_prompt),
+            Message(role=MessageRole.USER, content=user_prompt),
+        ]
+
+        config = CompletionConfig(
+            model="",  # Use adapter's default model
+            role="consensus_perspective",
+            temperature=self._config.temperature,
+            max_tokens=self._config.max_tokens,
+            response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
+        )
+
+        llm_result = await self._llm.complete(messages, config)
+        if llm_result.is_err:
+            return Result.err(llm_result.error)
+
+        model_label = f"session/{label}"
+        vote_result = parse_vote_response(llm_result.value.content, model_label)
+        if vote_result.is_err:
+            return Result.err(vote_result.error)
+
+        vote = vote_result.value
+        return Result.ok(
+            Vote(
+                model=vote.model,
+                approved=vote.approved,
+                confidence=vote.confidence,
+                reasoning=vote.reasoning,
+                role=role,
+            )
+        )
+
+    def _build_consensus(
+        self,
+        context: EvaluationContext,
+        votes: list[Vote],
+        events: list[BaseEvent],
+        *,
+        is_single_model: bool,
+    ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
+        """Build ConsensusResult from collected votes."""
         approving = sum(1 for v in votes if v.approved)
         majority_ratio = approving / len(votes)
         approved = majority_ratio >= self._config.majority_threshold
-
-        # Collect disagreements (reasoning from dissenting votes)
         disagreements = tuple(v.reasoning for v in votes if v.approved != approved)
 
         consensus_result = ConsensusResult(
@@ -294,9 +469,9 @@ class ConsensusEvaluator:
             votes=tuple(votes),
             majority_ratio=majority_ratio,
             disagreements=disagreements,
+            is_single_model=is_single_model,
         )
 
-        # Emit completion event
         events.append(
             create_stage3_completed_event(
                 execution_id=context.execution_id,
@@ -333,6 +508,8 @@ class ConsensusEvaluator:
         """
         config = CompletionConfig(
             model=model,
+            role="consensus_vote",
+            model_is_explicit=self._config.models_are_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
             response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
@@ -372,11 +549,26 @@ class DeliberativeConfig:
         max_tokens: Maximum tokens per response
     """
 
-    advocate_model: str = "openrouter/anthropic/claude-opus-4-6"
-    devil_model: str = "openrouter/openai/gpt-4o"
-    judge_model: str = "openrouter/google/gemini-2.5-pro"
+    advocate_model: str | None = None
+    devil_model: str | None = None
+    judge_model: str | None = None
+    advocate_model_is_explicit: bool = field(default=False, init=False)
+    devil_model_is_explicit: bool = field(default=False, init=False)
+    judge_model_is_explicit: bool = field(default=False, init=False)
     temperature: float = 0.3
     max_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default models while preserving explicit caller pins."""
+        object.__setattr__(self, "advocate_model_is_explicit", self.advocate_model is not None)
+        object.__setattr__(self, "devil_model_is_explicit", self.devil_model is not None)
+        object.__setattr__(self, "judge_model_is_explicit", self.judge_model is not None)
+        if self.advocate_model is None:
+            object.__setattr__(self, "advocate_model", get_consensus_advocate_model())
+        if self.devil_model is None:
+            object.__setattr__(self, "devil_model", get_consensus_devil_model())
+        if self.judge_model is None:
+            object.__setattr__(self, "judge_model", get_consensus_judge_model())
 
 
 def _parse_judgment_response(
@@ -484,7 +676,7 @@ class DeliberativeConsensus:
 
     def __init__(
         self,
-        llm_adapter: LiteLLMAdapter,
+        llm_adapter: LLMAdapter,
         config: DeliberativeConfig | None = None,
         devil_strategy: DevilAdvocateStrategy | None = None,
     ) -> None:
@@ -498,9 +690,11 @@ class DeliberativeConsensus:
         """
         self._llm = llm_adapter
         self._config = config or DeliberativeConfig()
+        assert self._config.devil_model is not None
         self._devil_strategy = devil_strategy or DevilAdvocateStrategy(
             llm_adapter=llm_adapter,
             model=self._config.devil_model,
+            model_is_explicit=self._config.devil_model_is_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
         )
@@ -625,6 +819,7 @@ class DeliberativeConsensus:
             # Advocate uses direct LLM call with role-specific prompt
             system_prompt = _get_advocate_system_prompt()
             model = self._config.advocate_model
+            assert model is not None
 
             messages = [
                 Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -633,6 +828,8 @@ class DeliberativeConsensus:
 
             config = CompletionConfig(
                 model=model,
+                role="consensus_advocate",
+                model_is_explicit=self._config.advocate_model_is_explicit,
                 temperature=self._config.temperature,
                 max_tokens=self._config.max_tokens,
                 response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
@@ -772,8 +969,11 @@ Based on both positions above, make your final judgment."""
             Message(role=MessageRole.USER, content=user_prompt),
         ]
 
+        assert self._config.judge_model is not None
         config = CompletionConfig(
             model=self._config.judge_model,
+            role="consensus_judge",
+            model_is_explicit=self._config.judge_model_is_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
             response_format={"type": "json_schema", "json_schema": JUDGMENT_SCHEMA},
@@ -783,12 +983,13 @@ Based on both positions above, make your final judgment."""
         if llm_result.is_err:
             return Result.err(llm_result.error)
 
+        assert self._config.judge_model is not None
         return _parse_judgment_response(llm_result.value.content, self._config.judge_model)
 
 
 async def run_consensus_evaluation(
     context: EvaluationContext,
-    llm_adapter: LiteLLMAdapter,
+    llm_adapter: LLMAdapter,
     trigger_reason: str = "manual",
     config: ConsensusConfig | None = None,
 ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
@@ -809,7 +1010,7 @@ async def run_consensus_evaluation(
 
 async def run_deliberative_evaluation(
     context: EvaluationContext,
-    llm_adapter: LiteLLMAdapter,
+    llm_adapter: LLMAdapter,
     trigger_reason: str = "manual",
     config: DeliberativeConfig | None = None,
     devil_strategy: DevilAdvocateStrategy | None = None,

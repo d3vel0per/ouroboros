@@ -1,0 +1,283 @@
+"""Unit tests for orchestrator runtime factory helpers."""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
+from ouroboros.orchestrator.hermes_runtime import HermesCliRuntime
+from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
+from ouroboros.orchestrator.runtime_factory import (
+    create_agent_runtime,
+    resolve_agent_runtime_backend,
+)
+
+
+class TestResolveAgentRuntimeBackend:
+    """Tests for backend resolution."""
+
+    def test_resolve_explicit_codex_alias(self) -> None:
+        """Normalizes the codex_cli alias to codex."""
+        assert resolve_agent_runtime_backend("codex_cli") == "codex"
+
+    def test_resolve_uses_config_helper(self) -> None:
+        """Falls back to config/env helper when no explicit backend is provided."""
+        with patch(
+            "ouroboros.orchestrator.runtime_factory.get_agent_runtime_backend",
+            return_value="codex",
+        ):
+            assert resolve_agent_runtime_backend() == "codex"
+
+    def test_resolve_opencode_aliases(self) -> None:
+        """OpenCode aliases normalize to opencode."""
+        assert resolve_agent_runtime_backend("opencode") == "opencode"
+        assert resolve_agent_runtime_backend("opencode_cli") == "opencode"
+
+    def test_resolve_hermes_aliases(self) -> None:
+        """Hermes aliases normalize to hermes."""
+        assert resolve_agent_runtime_backend("hermes") == "hermes"
+        assert resolve_agent_runtime_backend("hermes_cli") == "hermes"
+
+    def test_resolve_rejects_unknown_backend(self) -> None:
+        """Raises for unsupported backends."""
+        with pytest.raises(ValueError):
+            resolve_agent_runtime_backend("unknown")
+
+
+class TestCreateAgentRuntime:
+    """Tests for runtime construction."""
+
+    def test_create_claude_runtime(self) -> None:
+        """Creates the Claude adapter for the claude backend."""
+        runtime = create_agent_runtime(backend="claude", permission_mode="acceptEdits")
+        assert isinstance(runtime, ClaudeAgentAdapter)
+        assert runtime._cwd
+
+    def test_create_codex_runtime_uses_configured_cli_path(self) -> None:
+        """Creates Codex runtime with the configured CLI path."""
+        mock_dispatcher = object()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_codex_cli_path",
+                return_value="/tmp/codex",
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=mock_dispatcher,
+            ) as mock_create_dispatcher,
+        ):
+            runtime = create_agent_runtime(
+                backend="codex",
+                permission_mode="acceptEdits",
+                cwd="/tmp/project",
+            )
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._cli_path == "/tmp/codex"
+        assert runtime._cwd == "/tmp/project"
+        assert runtime._skill_dispatcher is mock_dispatcher
+        assert mock_create_dispatcher.call_args.kwargs["cwd"] == "/tmp/project"
+        assert mock_create_dispatcher.call_args.kwargs["runtime_backend"] == "codex"
+
+    def test_create_codex_runtime_propagates_runtime_profile(self) -> None:
+        """``get_runtime_profile()`` must reach CodexCliRuntime via the factory.
+
+        The runtime is the only place that translates the orchestrator
+        ``runtime_profile`` into a Codex ``--profile`` argument, so a
+        regression in the factory wiring would silently disable
+        worker-subprocess isolation. Lock the path under test.
+        """
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_runtime_profile",
+                return_value="worker",
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._runtime_profile == "worker"
+        assert runtime._codex_profile == "ouroboros-worker"
+
+    def test_create_codex_runtime_default_profile_is_none(self) -> None:
+        """Unset profile must remain unset all the way through to the runtime."""
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_runtime_profile",
+                return_value=None,
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="codex", cwd="/tmp/project")
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._runtime_profile is None
+        assert runtime._codex_profile is None
+
+    def test_create_claude_runtime_uses_factory_cwd_and_cli_path(self) -> None:
+        """Claude runtime receives the same construction options as other backends."""
+        with patch(
+            "ouroboros.orchestrator.runtime_factory.get_cli_path",
+            return_value="/tmp/claude",
+        ):
+            runtime = create_agent_runtime(backend="claude", cwd="/tmp/project")
+
+        assert isinstance(runtime, ClaudeAgentAdapter)
+        assert runtime._cwd == "/tmp/project"
+        assert runtime._cli_path == "/tmp/claude"
+
+    def test_create_opencode_runtime_uses_configured_cli_path(self) -> None:
+        """Creates OpenCode runtime with the explicit CLI path."""
+        runtime = create_agent_runtime(
+            backend="opencode",
+            permission_mode="acceptEdits",
+            cwd="/tmp/project",
+            cli_path="/tmp/opencode",
+        )
+
+        assert isinstance(runtime, OpenCodeRuntime)
+        assert runtime._cli_path == "/tmp/opencode"
+        assert runtime._cwd == "/tmp/project"
+
+    def test_create_runtime_uses_configured_opencode_alias_when_backend_omitted(self) -> None:
+        """Configured OpenCode aliases should resolve through the shared runtime factory."""
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_agent_runtime_backend",
+                return_value="opencode_cli",
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_agent_permission_mode",
+                return_value="acceptEdits",
+            ) as mock_get_permission_mode,
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_llm_backend",
+                return_value="opencode",
+            ),
+        ):
+            runtime = create_agent_runtime(cwd="/tmp/project")
+
+        assert isinstance(runtime, OpenCodeRuntime)
+        assert runtime._cwd == "/tmp/project"
+        assert runtime._permission_mode == "acceptEdits"
+        assert mock_get_permission_mode.call_args.kwargs["backend"] == "opencode"
+
+    def test_create_runtime_uses_configured_permission_mode(self) -> None:
+        """Runtime factory uses config/env permission defaults when omitted."""
+        with patch(
+            "ouroboros.orchestrator.runtime_factory.get_agent_permission_mode",
+            return_value="bypassPermissions",
+        ):
+            runtime = create_agent_runtime(backend="codex")
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._permission_mode == "bypassPermissions"
+
+    def test_create_opencode_runtime_uses_backend_specific_permission_default(self) -> None:
+        """OpenCode runtime asks the shared config helper for the OpenCode-specific mode."""
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_agent_permission_mode",
+                return_value="bypassPermissions",
+            ) as mock_get_permission_mode,
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="opencode")
+
+        assert isinstance(runtime, OpenCodeRuntime)
+        assert runtime._permission_mode == "bypassPermissions"
+        assert mock_get_permission_mode.call_args.kwargs["backend"] == "opencode"
+
+    def test_create_runtime_uses_configured_llm_backend_when_omitted(self) -> None:
+        """Runtime factory reuses config/env llm backend defaults for builtin tool dispatch."""
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_llm_backend",
+                return_value="opencode",
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="codex")
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._llm_backend == "opencode"
+
+    def test_create_hermes_runtime_uses_configured_cli_path(self) -> None:
+        """Creates Hermes runtime with the configured CLI path and dispatcher context."""
+        mock_dispatcher = object()
+
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.get_hermes_cli_path",
+                return_value="/tmp/hermes",
+            ),
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=mock_dispatcher,
+            ),
+        ):
+            runtime = create_agent_runtime(
+                backend="hermes",
+                permission_mode="acceptEdits",
+                cwd="/tmp/project",
+                llm_backend="codex",
+            )
+
+        assert isinstance(runtime, HermesCliRuntime)
+        assert runtime._cli_path == "/tmp/hermes"
+        assert runtime._cwd == "/tmp/project"
+        assert runtime._skill_dispatcher is mock_dispatcher
+        assert runtime._llm_backend == "codex"
+
+    def test_opencode_runtime_always_uses_subprocess_mode(self) -> None:
+        """OpenCodeRuntime always gets opencode_mode='subprocess' regardless of config.
+
+        The runtime factory hardcodes 'subprocess' because OpenCodeRuntime
+        runs `opencode run --pure` (no bridge plugin). Plugin mode is
+        exclusively an MCP-server concern.
+        """
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="opencode")
+
+        assert isinstance(runtime, OpenCodeRuntime)
+        assert runtime._opencode_mode == "subprocess"
+
+    def test_opencode_runtime_ignores_config_plugin_mode(self) -> None:
+        """Even when config says plugin, runtime factory forces subprocess.
+
+        Config might say opencode_mode=plugin (user set up plugin mode) but
+        OpenCodeRuntime is standalone `ouroboros run` — no bridge, so
+        handlers must not emit _subagent envelopes.
+        """
+        with (
+            patch(
+                "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+                return_value=object(),
+            ),
+        ):
+            runtime = create_agent_runtime(backend="opencode")
+
+        assert isinstance(runtime, OpenCodeRuntime)
+        assert runtime._opencode_mode == "subprocess"

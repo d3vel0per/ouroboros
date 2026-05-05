@@ -1,21 +1,17 @@
-# TUI Usage Guide
+# TUI Dashboard Reference
 
 Ouroboros includes an interactive terminal user interface (TUI) built with [Textual](https://textual.textualize.io/) for real-time workflow monitoring.
+
+> **New to Ouroboros?** See [Getting Started](../getting-started.md) for install and onboarding.
 
 ## Launching the TUI
 
 ```bash
-# Via uvx (no install needed)
-uvx --from ouroboros-ai ouroboros tui monitor
-
-# Local development
-uv run ouroboros tui monitor
+ouroboros tui monitor
 
 # Monitor with a specific database file
-uv run ouroboros tui monitor --db-path ~/.ouroboros/ouroboros.db
+ouroboros tui monitor --db-path ~/.ouroboros/ouroboros.db
 ```
-
-## Getting Started
 
 When launched, the TUI opens with a **Session Selector** screen where you pick an existing session to monitor. Once selected, it switches to the Dashboard.
 
@@ -122,7 +118,7 @@ Browse and select from available sessions. Useful when multiple workflows have b
 
 ## Lineage Screen (Key: `e`)
 
-View evolutionary lineage across generations when using `ooo evolve` or `ooo ralph`. Shows how seeds evolved and converged over multiple iterations.
+View evolutionary lineage across generations when using evolutionary loops (`ooo evolve`). Shows how seeds evolved and converged over multiple iterations.
 
 ## Keyboard Shortcuts
 

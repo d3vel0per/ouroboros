@@ -5,13 +5,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
 
-from ouroboros.core.errors import ProviderError
+from ouroboros.config.models import CredentialsConfig, ProviderCredentials
+from ouroboros.core.errors import ConfigError, ProviderError
 from ouroboros.providers.base import (
     CompletionConfig,
     Message,
     MessageRole,
 )
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+from ouroboros.providers.litellm_adapter import LiteLLMAdapter  # noqa: E402
 
 
 def create_mock_response(
@@ -127,11 +128,71 @@ class TestLiteLLMAdapterGetApiKey:
 
         assert result == "or-key"
 
+    def test_unknown_model_uses_openrouter_credentials_fallback(self) -> None:
+        """Unknown models can resolve credentials from the openrouter provider."""
+        adapter = LiteLLMAdapter()
+        credentials = CredentialsConfig(
+            providers={
+                "openrouter": ProviderCredentials(
+                    api_key="cred-openrouter-key",
+                    base_url="https://openrouter.example/v1",
+                ),
+            }
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(adapter, "_load_credentials_config", return_value=credentials),
+        ):
+            result = adapter._get_api_key("acme/gpt-4-custom")
+
+        assert result == "cred-openrouter-key"
+
     def test_missing_env_var_returns_none(self) -> None:
         """Returns None if no environment variable is set."""
         adapter = LiteLLMAdapter()
 
         with patch.dict("os.environ", {}, clear=True):
+            result = adapter._get_api_key("openrouter/openai/gpt-4")
+
+        assert result is None
+
+    def test_credentials_file_used_when_env_absent(self) -> None:
+        """credentials.yaml provider entries are used when env vars are missing."""
+        adapter = LiteLLMAdapter()
+        credentials = CredentialsConfig(
+            providers={
+                "openrouter": ProviderCredentials(
+                    api_key="cred-openrouter-key",
+                    base_url="https://openrouter.example/v1",
+                )
+            }
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(adapter, "_load_credentials_config", return_value=credentials),
+        ):
+            result = adapter._get_api_key("openrouter/openai/gpt-4")
+
+        assert result == "cred-openrouter-key"
+
+    def test_placeholder_credentials_are_treated_as_unset(self) -> None:
+        """Template credentials.yaml placeholders should not be treated as real API keys."""
+        adapter = LiteLLMAdapter()
+        credentials = CredentialsConfig(
+            providers={
+                "openrouter": ProviderCredentials(
+                    api_key="YOUR_OPENROUTER_API_KEY",
+                    base_url="https://openrouter.example/v1",
+                )
+            }
+        )
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(adapter, "_load_credentials_config", return_value=credentials),
+        ):
             result = adapter._get_api_key("openrouter/openai/gpt-4")
 
         assert result is None
@@ -240,6 +301,29 @@ class TestLiteLLMAdapterBuildCompletionKwargs:
 
         assert kwargs["api_base"] == "https://custom.api"
 
+    def test_includes_api_base_from_credentials(self) -> None:
+        """Configured provider base URLs are applied when constructor override is absent."""
+        adapter = LiteLLMAdapter()
+        credentials = CredentialsConfig(
+            providers={
+                "openrouter": ProviderCredentials(
+                    api_key="cred-openrouter-key",
+                    base_url="https://openrouter.example/v1",
+                )
+            }
+        )
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        config = CompletionConfig(model="openrouter/openai/gpt-4")
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(adapter, "_load_credentials_config", return_value=credentials),
+        ):
+            kwargs = adapter._build_completion_kwargs(messages, config)
+
+        assert kwargs["api_key"] == "cred-openrouter-key"
+        assert kwargs["api_base"] == "https://openrouter.example/v1"
+
 
 class TestLiteLLMAdapterParseResponse:
     """Test LiteLLMAdapter._parse_response method."""
@@ -335,6 +419,13 @@ class TestLiteLLMAdapterExtractProvider:
 
         assert result == "anthropic"
 
+    def test_infers_openai_from_reasoning_model_prefixes(self) -> None:
+        """Infers OpenAI for o-series model prefixes."""
+        adapter = LiteLLMAdapter()
+
+        assert adapter._extract_provider("o3") == "openai"
+        assert adapter._extract_provider("o4-mini") == "openai"
+
     def test_unknown_model_returns_unknown(self) -> None:
         """Returns 'unknown' for unrecognized model strings."""
         adapter = LiteLLMAdapter()
@@ -361,6 +452,26 @@ class TestLiteLLMAdapterComplete:
 
         assert result.is_ok
         assert result.value.content == "Hi there!"
+
+    async def test_profile_config_error_returns_result_err(self) -> None:
+        """Bad profile config should not escape adapter.complete as ConfigError."""
+        adapter = LiteLLMAdapter()
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        config = CompletionConfig(model="gpt-4", profile="missing-profile")
+
+        with (
+            patch(
+                "ouroboros.providers.profiles.load_config", side_effect=ConfigError("bad config")
+            ),
+            patch("litellm.acompletion", new_callable=AsyncMock) as mock_acompletion,
+        ):
+            result = await adapter.complete(messages, config)
+
+        assert result.is_err
+        assert isinstance(result.error, ProviderError)
+        assert result.error.provider == "litellm"
+        assert "Invalid LLM profile configuration" in result.error.message
+        mock_acompletion.assert_not_called()
 
     async def test_rate_limit_error_returns_result_err(self) -> None:
         """Returns Result.err on rate limit error after retries."""
@@ -492,7 +603,7 @@ class TestLiteLLMAdapterComplete:
 
 
 class TestLiteLLMAdapterRetryBehavior:
-    """Test retry behavior using stamina."""
+    """Test retry behavior for transient provider failures."""
 
     async def test_retries_on_rate_limit(self) -> None:
         """Retries on rate limit error before giving up."""

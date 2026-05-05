@@ -14,7 +14,22 @@ from typing import Annotated
 import typer
 
 from ouroboros import __version__
-from ouroboros.cli.commands import config, init, mcp, run, status, tui
+from ouroboros.cli.commands import (
+    auto,
+    cancel,
+    codex,
+    config,
+    detect,
+    init,
+    mcp,
+    pm,
+    resume,
+    run,
+    setup,
+    status,
+    tui,
+    uninstall,
+)
 from ouroboros.cli.formatters import console
 
 # Create the main Typer app
@@ -26,19 +41,35 @@ app = typer.Typer(
 )
 
 # Register command groups
+app.add_typer(auto.app, name="auto")
 app.add_typer(init.app, name="init")
 app.add_typer(run.app, name="run")
 app.add_typer(config.app, name="config")
 app.add_typer(status.app, name="status")
+app.add_typer(cancel.app, name="cancel")
+app.add_typer(codex.app, name="codex")
 app.add_typer(mcp.app, name="mcp")
+app.add_typer(setup.app, name="setup")
+app.add_typer(detect.app, name="detect")
 app.add_typer(tui.app, name="tui")
+app.add_typer(pm.app, name="pm")
+app.add_typer(resume.app, name="resume")
+app.add_typer(uninstall.app, name="uninstall")
 
 
 # Top-level convenience aliases
 @app.command(hidden=True)
-def monitor() -> None:
+def monitor(
+    backend: Annotated[
+        str,
+        typer.Option(
+            "--backend",
+            help="TUI backend to use: 'python' (default) or 'slt' (native binary).",
+        ),
+    ] = "python",
+) -> None:
     """Launch the TUI monitor (shorthand for 'ouroboros tui monitor')."""
-    tui.monitor_command()
+    tui.monitor_command(backend=backend)
 
 
 def version_callback(value: bool) -> None:

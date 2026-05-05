@@ -4,15 +4,18 @@ This module implements the interview protocol that refines vague ideas into
 clear requirements through iterative questioning. Users control when to stop.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+import functools
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 import structlog
 
+from ouroboros.config import get_clarification_model
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.file_lock import file_lock as _file_lock
 from ouroboros.core.security import InputValidator
@@ -27,15 +30,74 @@ from ouroboros.providers.base import (
 log = structlog.get_logger()
 
 # Interview round constants
-MIN_ROUNDS_BEFORE_EARLY_EXIT = 3  # Must complete at least 3 rounds
-SOFT_LIMIT_WARNING_THRESHOLD = 15  # Warn about diminishing returns after this
+# Start scoring after 3 answered rounds. Closing pressure and auto-completion
+# are gated separately by ambiguity thresholds and sustained score quality.
+MIN_ROUNDS_BEFORE_EARLY_EXIT = 3
 DEFAULT_INTERVIEW_ROUNDS = 10  # Reference value for prompts (not enforced)
-
-# Default model moved to config.models.ClarificationConfig.default_model
-_FALLBACK_MODEL = "claude-opus-4-6"
 
 # Legacy alias for backward compatibility
 MAX_INTERVIEW_ROUNDS = DEFAULT_INTERVIEW_ROUNDS
+MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS = 3500
+INITIAL_CONTEXT_SUMMARY_QUESTION = (
+    "Your saved initial context is too long to safely send to the interview "
+    "model without risking CLI prompt failure. Please reply with a concise "
+    "summary of the full context, including goals, constraints, and success "
+    "criteria. I will use that summary for the next interview question."
+)
+INITIAL_CONTEXT_SUMMARY_REQUIRED = (
+    "[Initial context exceeds the prompt-safe size and no user summary has been "
+    "recorded yet. Ask the user to provide a concise summary before scoring or "
+    "generating a seed.]"
+)
+PROMPT_SAFE_CONTEXT_TRUNCATION_NOTICE = "\n\n[Context truncated for prompt safety.]"
+
+
+class InterviewPerspective(StrEnum):
+    """Internal perspectives used to keep interviews broad and practical."""
+
+    RESEARCHER = "researcher"
+    SIMPLIFIER = "simplifier"
+    ARCHITECT = "architect"
+    BREADTH_KEEPER = "breadth-keeper"
+    SEED_CLOSER = "seed-closer"
+
+
+@dataclass(frozen=True, slots=True)
+class InterviewPerspectiveStrategy:
+    """Prompt data for one internal interview perspective."""
+
+    perspective: InterviewPerspective
+    system_prompt: str
+    approach_instructions: tuple[str, ...]
+    question_templates: tuple[str, ...]
+
+
+@functools.lru_cache(maxsize=1)
+def _load_interview_perspective_strategies() -> dict[
+    InterviewPerspective,
+    InterviewPerspectiveStrategy,
+]:
+    """Lazy-load perspective prompts from agent markdown files."""
+    from ouroboros.agents.loader import load_persona_prompt_data
+
+    mapping = {
+        InterviewPerspective.RESEARCHER: "researcher",
+        InterviewPerspective.SIMPLIFIER: "simplifier",
+        InterviewPerspective.ARCHITECT: "architect",
+        InterviewPerspective.BREADTH_KEEPER: "breadth-keeper",
+        InterviewPerspective.SEED_CLOSER: "seed-closer",
+    }
+
+    return {
+        perspective: InterviewPerspectiveStrategy(
+            perspective=perspective,
+            system_prompt=data.system_prompt,
+            approach_instructions=data.approach_instructions,
+            question_templates=data.question_templates,
+        )
+        for perspective, filename in mapping.items()
+        for data in [load_persona_prompt_data(filename)]
+    }
 
 
 class InterviewStatus(StrEnum):
@@ -88,6 +150,9 @@ class InterviewState(BaseModel):
     codebase_paths: list[dict[str, str]] = Field(default_factory=list)
     codebase_context: str = ""
     explore_completed: bool = False
+    ambiguity_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    ambiguity_breakdown: dict[str, Any] | None = None
+    completion_candidate_streak: int = Field(default=0, ge=0)
 
     @property
     def current_round_number(self) -> int:
@@ -99,9 +164,80 @@ class InterviewState(BaseModel):
         """Check if interview is marked complete (user-controlled)."""
         return self.status == InterviewStatus.COMPLETED
 
+    @property
+    def needs_initial_context_summary(self) -> bool:
+        """True when oversized initial context has no recorded summary."""
+        if len(self.initial_context) <= MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS:
+            return False
+        return not any(
+            round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION
+            and bool(round_data.user_response)
+            for round_data in self.rounds
+        )
+
+    @property
+    def can_reopen(self) -> bool:
+        """True when a completed interview should be reopenable.
+
+        Any completed interview is reopenable: the main session is the final
+        gate on seed-ready (see Seed-ready Acceptance Guard in skills/interview/
+        SKILL.md). When it sends another answer, it is explicitly challenging
+        the prior closure — the stored ambiguity score is no longer trustworthy
+        and must be re-evaluated against the extended round history.
+        """
+        return self.is_complete
+
     def mark_updated(self) -> None:
         """Update the updated_at timestamp."""
         self.updated_at = datetime.now(UTC)
+
+    def store_ambiguity(
+        self,
+        *,
+        score: float,
+        breakdown: dict[str, Any],
+    ) -> None:
+        """Persist the latest ambiguity evaluation on the interview state."""
+        self.ambiguity_score = score
+        self.ambiguity_breakdown = breakdown
+        self.mark_updated()
+
+    def clear_stored_ambiguity(self) -> None:
+        """Invalidate any persisted ambiguity snapshot after interview changes."""
+        if self.ambiguity_score is None and self.ambiguity_breakdown is None:
+            return
+
+        self.ambiguity_score = None
+        self.ambiguity_breakdown = None
+        self.mark_updated()
+
+
+def prompt_safe_initial_context(state: InterviewState) -> str:
+    """Return initial context safe for LLM prompts across interview consumers."""
+    if len(state.initial_context) <= MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS:
+        return state.initial_context
+    for round_data in reversed(state.rounds):
+        if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION and round_data.user_response:
+            return _truncate_prompt_safe_context(round_data.user_response)
+    return INITIAL_CONTEXT_SUMMARY_REQUIRED
+
+
+def _truncate_prompt_safe_context(context: str) -> str:
+    """Cap prompt context while leaving an explicit truncation marker."""
+    if len(context) <= MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS:
+        return context
+
+    content_budget = MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS - len(
+        PROMPT_SAFE_CONTEXT_TRUNCATION_NOTICE
+    )
+    if content_budget <= 0:
+        return context[:MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS]
+    return context[:content_budget] + PROMPT_SAFE_CONTEXT_TRUNCATION_NOTICE
+
+
+def initial_context_summary_missing(state: InterviewState) -> bool:
+    """Return True when a long initial context still needs a user summary."""
+    return prompt_safe_initial_context(state) == INITIAL_CONTEXT_SUMMARY_REQUIRED
 
 
 @dataclass
@@ -142,12 +278,22 @@ class InterviewEngine:
 
     llm_adapter: LLMAdapter
     state_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "data")
-    model: str = _FALLBACK_MODEL
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     temperature: float = 0.7
     max_tokens: int = 2048
+    _MAX_TOTAL_PROMPT_CHARS = 4800
+    _MAX_SYSTEM_PROMPT_CHARS = 3500
+    _MIN_SYSTEM_PROMPT_CHARS = 1200
+    _MAX_INITIAL_CONTEXT_SYSTEM_CHARS = 1800
+    _MAX_INITIAL_CONTEXT_TOTAL_CHARS = MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS
+    _INITIAL_CONTEXT_SUMMARY_QUESTION = INITIAL_CONTEXT_SUMMARY_QUESTION
 
     def __post_init__(self) -> None:
         """Ensure state directory exists."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_clarification_model()
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
     def _state_file_path(self, interview_id: str) -> Path:
@@ -189,21 +335,15 @@ class InterviewEngine:
             initial_context=initial_context,
         )
 
-        # Auto-detect brownfield projects from CWD
+        # Auto-detect brownfield projects from CWD.
+        # codebase_paths is informational only — the main session (not MCP)
+        # handles codebase exploration directly via Read/Glob/Grep.
         if cwd:
             from ouroboros.bigbang.explore import detect_brownfield
 
             if detect_brownfield(cwd):
                 state.is_brownfield = True
                 state.codebase_paths = [{"path": cwd, "role": "primary"}]
-                try:
-                    await self._trigger_codebase_exploration(state)
-                except Exception as e:
-                    log.warning(
-                        "interview.brownfield_explore_failed",
-                        interview_id=interview_id,
-                        error=str(e),
-                    )
 
         log.info(
             "interview.started",
@@ -225,6 +365,9 @@ class InterviewEngine:
         Returns:
             Result containing the next question or error.
         """
+        if state.is_complete and state.needs_initial_context_summary:
+            return Result.ok(self._INITIAL_CONTEXT_SUMMARY_QUESTION)
+
         if state.is_complete:
             return Result.err(
                 ValidationError(
@@ -233,19 +376,45 @@ class InterviewEngine:
                     value=state.status,
                 )
             )
+        effective_initial_context = self._effective_initial_context(state)
+        if effective_initial_context is None:
+            return Result.ok(self._INITIAL_CONTEXT_SUMMARY_QUESTION)
 
         # Build the context from previous rounds
-        conversation_history = self._build_conversation_history(state)
+        conversation_history = self._build_conversation_history(
+            state,
+            initial_context=effective_initial_context,
+        )
+        preserve_prefix_messages = (
+            1 if len(effective_initial_context) > self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS else 0
+        )
+        conversation_history = self._trim_messages_to_budget(
+            conversation_history,
+            max_chars=self._MAX_TOTAL_PROMPT_CHARS - self._MIN_SYSTEM_PROMPT_CHARS,
+            preserve_prefix_messages=preserve_prefix_messages,
+        )
 
         # Generate next question
-        system_prompt = self._build_system_prompt(state)
+        history_chars = sum(len(message.content) for message in conversation_history)
+        system_prompt_budget = min(
+            self._MAX_SYSTEM_PROMPT_CHARS,
+            self._MAX_TOTAL_PROMPT_CHARS - history_chars,
+        )
+        system_prompt = self._build_system_prompt(
+            state,
+            initial_context=effective_initial_context,
+            max_chars=system_prompt_budget,
+        )
         messages = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
             *conversation_history,
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="clarification",
+            model_is_explicit=self.model_is_explicit,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
@@ -298,12 +467,29 @@ class InterviewEngine:
             return Result.err(ValidationError(error_msg, field="user_response"))
 
         if state.is_complete:
-            return Result.err(
-                ValidationError(
-                    "Cannot record response - interview is complete",
-                    field="status",
-                    value=state.status,
+            if not state.can_reopen:
+                return Result.err(
+                    ValidationError(
+                        "Cannot record response - interview is complete",
+                        field="status",
+                        value=state.status,
+                    )
                 )
+            prior_ambiguity = state.ambiguity_score
+            prior_streak = state.completion_candidate_streak
+            state.status = InterviewStatus.IN_PROGRESS
+            state.clear_stored_ambiguity()
+            # The completion-candidate streak is the other half of the cached
+            # closure decision (authoring_handlers auto-completes when
+            # streak >= AUTO_COMPLETE_STREAK_REQUIRED). Leaving it intact would
+            # let the reopened session auto-close after a single qualifying
+            # score instead of rebuilding the required two-signal stability.
+            state.completion_candidate_streak = 0
+            log.info(
+                "interview.reopened",
+                interview_id=state.interview_id,
+                prior_ambiguity_score=prior_ambiguity,
+                prior_completion_candidate_streak=prior_streak,
             )
 
         # Create new round
@@ -323,52 +509,17 @@ class InterviewEngine:
             response_length=len(user_response),
         )
 
-        # Trigger codebase exploration if brownfield conditions met
-        await self._trigger_codebase_exploration(state)
-
         # Note: No auto-complete on round limit. User controls when to stop.
         # CLI handles prompting user to continue after each round.
 
         return Result.ok(state)
 
-    async def _trigger_codebase_exploration(self, state: InterviewState) -> None:
-        """Trigger codebase exploration for brownfield projects.
-
-        Explores referenced codebase directories and stores the context
-        in the interview state. Only runs once (guarded by explore_completed).
-        Failures are logged but do not interrupt the interview flow.
-
-        Args:
-            state: Current interview state (mutated in place on success).
-        """
-        if not state.is_brownfield or not state.codebase_paths or state.explore_completed:
-            return
-
-        try:
-            from ouroboros.bigbang.explore import CodebaseExplorer, format_explore_results
-
-            explorer = CodebaseExplorer(llm_adapter=self.llm_adapter, model=self.model)
-            results = await explorer.explore(state.codebase_paths)
-            state.codebase_context = format_explore_results(results)
-            state.explore_completed = True
-
-            log.info(
-                "interview.explore_completed",
-                interview_id=state.interview_id,
-                paths_explored=len(results),
-                context_length=len(state.codebase_context),
-            )
-        except Exception as e:
-            log.warning(
-                "interview.explore_failed",
-                interview_id=state.interview_id,
-                error=str(e),
-            )
-
     async def save_state(self, state: InterviewState) -> Result[Path, ValidationError]:
         """Persist interview state to disk.
 
         Uses file locking to prevent race conditions during concurrent access.
+        The blocking file I/O is offloaded to a thread to avoid stalling the
+        asyncio event loop.
 
         Args:
             state: The interview state to save.
@@ -379,12 +530,14 @@ class InterviewEngine:
         try:
             file_path = self._state_file_path(state.interview_id)
             state.mark_updated()
+            # Serialize while still on the event-loop (CPU-bound, not I/O)
+            content = state.model_dump_json(indent=2)
 
-            # Use file locking to prevent race conditions
-            with _file_lock(file_path, exclusive=True):
-                # Write state as JSON
-                content = state.model_dump_json(indent=2)
-                file_path.write_text(content, encoding="utf-8")
+            def _sync_write() -> None:
+                with _file_lock(file_path, exclusive=True):
+                    file_path.write_text(content, encoding="utf-8")
+
+            await asyncio.to_thread(_sync_write)
 
             log.info(
                 "interview.state_saved",
@@ -410,6 +563,8 @@ class InterviewEngine:
         """Load interview state from disk.
 
         Uses file locking to prevent race conditions during concurrent access.
+        The blocking file I/O is offloaded to a thread to avoid stalling the
+        asyncio event loop.
 
         Args:
             interview_id: The interview ID to load.
@@ -429,9 +584,12 @@ class InterviewEngine:
             )
 
         try:
-            # Use shared lock for reading
-            with _file_lock(file_path, exclusive=False):
-                content = file_path.read_text(encoding="utf-8")
+
+            def _sync_read() -> str:
+                with _file_lock(file_path, exclusive=False):
+                    return file_path.read_text(encoding="utf-8")
+
+            content = await asyncio.to_thread(_sync_read)
 
             state = InterviewState.model_validate_json(content)
 
@@ -457,78 +615,385 @@ class InterviewEngine:
                 )
             )
 
-    def _build_system_prompt(self, state: InterviewState) -> str:
+    def _build_system_prompt(
+        self,
+        state: InterviewState,
+        initial_context: str | None = None,
+        max_chars: int | None = None,
+    ) -> str:
         """Build the system prompt for question generation.
 
         Args:
             state: Current interview state.
+            initial_context: Optional prompt-safe context to use instead of
+                ``state.initial_context``.
+            max_chars: Optional cap for the returned system prompt. When omitted,
+                uses the standard system-prompt cap.
 
         Returns:
             The system prompt.
         """
-        import os
-
         from ouroboros.agents.loader import load_agent_prompt
 
-        round_info = f"Round {state.current_round_number}"
-        preferred_web_tool = os.environ.get("OUROBOROS_WEB_SEARCH_TOOL", "").strip()
-        web_search_hint = (
-            f"\n- PREFERRED: Use {preferred_web_tool} for web search" if preferred_web_tool else ""
-        )
+        max_prompt_chars = max_chars or self._MAX_SYSTEM_PROMPT_CHARS
+        effective_round_number = self._next_conversation_round_number(state)
+        round_info = f"Round {effective_round_number}"
 
         base_prompt = load_agent_prompt("socratic-interviewer")
 
+        context_for_prompt = (
+            initial_context if initial_context is not None else state.initial_context
+        )
+        prompt_initial_context = self._initial_context_for_system_prompt(context_for_prompt)
+
         # For first round, add explicit instruction to start directly with a question
-        if state.current_round_number == 1:
+        if effective_round_number == 1:
             dynamic_header = (
                 f"You are an expert requirements engineer conducting a Socratic interview.\n\n"
                 f"CRITICAL: Start your FIRST response with a DIRECT QUESTION about the project. "
                 f'Do NOT introduce yourself. Do NOT say "I\'ll conduct" or "Let me ask". '
                 f"Just ask a specific, clarifying question immediately.\n\n"
                 f"This is {round_info}. Your ONLY job is to ask questions that reduce ambiguity.\n\n"
-                f"Initial context: {state.initial_context}\n"
+                f"Initial context: {prompt_initial_context}\n"
             )
         else:
             dynamic_header = (
                 f"You are an expert requirements engineer conducting a Socratic interview.\n\n"
                 f"This is {round_info}. Your ONLY job is to ask questions that reduce ambiguity.\n\n"
-                f"Initial context: {state.initial_context}\n"
+                f"Initial context: {prompt_initial_context}\n"
             )
 
-        if web_search_hint:
-            base_prompt = base_prompt.replace("## TOOL USAGE", f"## TOOL USAGE{web_search_hint}\n")
-
-        # Inject codebase context for brownfield projects
-        if state.is_brownfield and state.codebase_context:
+        # Answer prefix hints — always present so the question generator
+        # can interpret enriched answers regardless of brownfield status.
+        dynamic_header += (
+            "\n\nAnswer prefixes the caller may use:\n"
+            "- [from-code]: Existing codebase state (factual, read from files).\n"
+            "- [from-user]: Human decisions/judgments.\n"
+            "- [from-research]: Externally researched information (API docs, pricing, compatibility)."
+        )
+        # Brownfield hint: main session handles code reading, MCP just asks questions
+        if state.is_brownfield:
             dynamic_header += (
-                f"\n\n## Existing Codebase Context\n{state.codebase_context}"
-                "\n\nCRITICAL: You have codebase context. Ask CONFIRMATION questions "
-                "citing specific files/patterns."
-                '\n- GOOD: "I see Express.js with JWT middleware in src/auth/. '
-                'Should the new feature use this?"'
-                '\n- BAD: "Do you have any authentication set up?"'
-                '\n- Frame as: "I found X. Should I assume Y?" not "Do you have X?"'
+                "\n\nThis is a BROWNFIELD project. The caller (main session) has direct "
+                "codebase access and will enrich answers with code context. Focus your "
+                "questions on INTENT and DECISIONS, not on discovering what exists."
             )
 
-        return f"{dynamic_header}\n{base_prompt}"
+        ambiguity_snapshot = self._build_ambiguity_snapshot_prompt(state)
+        if ambiguity_snapshot:
+            dynamic_header += f"\n\n{ambiguity_snapshot}"
 
-    def _build_conversation_history(self, state: InterviewState) -> list[Message]:
+        perspective_panel = self._build_perspective_panel_prompt(state)
+
+        _OVERHEAD = 20  # newlines, ellipsis, separators
+
+        # Preserve the dynamic header first; it contains the capped initial
+        # context and first-turn instructions. Trim the optional panel/base
+        # prompt before falling back to hard-truncating the header.
+        available_after_header = max_prompt_chars - len(dynamic_header) - _OVERHEAD
+        if available_after_header <= 0:
+            dynamic_header = dynamic_header[: max_prompt_chars - _OVERHEAD]
+            perspective_panel = ""
+            base_budget = 0
+        elif len(perspective_panel) > available_after_header:
+            perspective_panel = perspective_panel[:available_after_header]
+            base_budget = 0
+        else:
+            base_budget = available_after_header - len(perspective_panel)
+
+        trimmed_base = base_prompt[:base_budget] if base_budget < len(base_prompt) else base_prompt
+        full_prompt = f"{dynamic_header}\n{trimmed_base}\n\n{perspective_panel}"
+
+        # Hard-truncate as final safety net
+        if len(full_prompt) > max_prompt_chars:
+            full_prompt = full_prompt[:max_prompt_chars]
+
+        return full_prompt
+
+    def _initial_context_for_system_prompt(self, initial_context: str) -> str:
+        """Return the initial context portion safe to embed in system prompt."""
+        if len(initial_context) <= self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS:
+            return initial_context
+        return (
+            initial_context[: self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS]
+            + "\n\n[Initial context continues in the first user message.]"
+        )
+
+    def _initial_context_overflow_message(self, initial_context: str) -> str:
+        """Return overflow initial context as durable user-message content."""
+        if len(initial_context) <= self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS:
+            return ""
+        overflow = initial_context[self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS :]
+        return f"Additional initial context omitted from the system prompt:\n{overflow}"
+
+    def _effective_initial_context(self, state: InterviewState) -> str | None:
+        """Return prompt-safe initial context, or None when a summary is needed."""
+        context = prompt_safe_initial_context(state)
+        if context == INITIAL_CONTEXT_SUMMARY_REQUIRED:
+            return None
+        return context
+
+    def _build_ambiguity_snapshot_prompt(self, state: InterviewState) -> str:
+        """Build prompt context from the latest ambiguity snapshot."""
+        if state.ambiguity_score is None:
+            return ""
+
+        from pydantic import ValidationError as PydanticValidationError
+
+        from ouroboros.bigbang.ambiguity import (
+            AmbiguityScore,
+            ScoreBreakdown,
+            get_completion_floor_failures,
+            get_milestone,
+        )
+
+        milestone, milestone_desc = get_milestone(state.ambiguity_score)
+
+        lines = [
+            "## Current Ambiguity Snapshot",
+            f"- Overall ambiguity: {state.ambiguity_score:.2f}",
+            f"- Milestone: **{milestone.value.upper()}** — {milestone_desc}",
+        ]
+
+        reconstructed_score: AmbiguityScore | None = None
+        if isinstance(state.ambiguity_breakdown, dict):
+            try:
+                reconstructed_score = AmbiguityScore(
+                    overall_score=state.ambiguity_score,
+                    breakdown=ScoreBreakdown.model_validate(state.ambiguity_breakdown),
+                )
+            except PydanticValidationError:
+                reconstructed_score = None
+
+            weakest_components: list[tuple[float, str, str]] = []
+            for payload in state.ambiguity_breakdown.values():
+                if not isinstance(payload, dict):
+                    continue
+                clarity = payload.get("clarity_score")
+                if clarity is None:
+                    continue
+                weakest_components.append(
+                    (
+                        float(clarity),
+                        str(payload.get("name", "Unknown")),
+                        str(payload.get("justification", "")),
+                    )
+                )
+
+            weakest_components.sort(key=lambda item: item[0])
+            for clarity, name, justification in weakest_components[:2]:
+                lines.append(f"- Weakest area: {name} ({clarity:.2f} clarity)")
+                if justification:
+                    lines.append(f"  Reason: {justification}")
+
+        if reconstructed_score is not None:
+            floor_failures = get_completion_floor_failures(
+                reconstructed_score,
+                is_brownfield=state.is_brownfield,
+            )
+            if floor_failures:
+                lines.append(f"- Per-dimension gaps: {'; '.join(floor_failures)}")
+                lines.append(
+                    "- Keep drilling those dimensions before asking a closure-style question, "
+                    "even when overall ambiguity reads low."
+                )
+            else:
+                lines.append("- Per-dimension gaps: none")
+
+        lines.append("- Drill into the weakest area with a concrete, scenario-grounded question.")
+        return "\n".join(lines)
+
+    def _select_perspectives(self, state: InterviewState) -> tuple[InterviewPerspective, ...]:
+        """Choose the active perspective panel for the current round."""
+        from ouroboros.bigbang.ambiguity import SEED_CLOSER_ACTIVATION_THRESHOLD
+
+        perspectives: list[InterviewPerspective] = [InterviewPerspective.BREADTH_KEEPER]
+
+        effective_round_number = self._next_conversation_round_number(state)
+        if effective_round_number <= 2:
+            perspectives.extend(
+                [
+                    InterviewPerspective.RESEARCHER,
+                    InterviewPerspective.SIMPLIFIER,
+                ]
+            )
+        elif effective_round_number <= 5:
+            perspectives.extend(
+                [
+                    InterviewPerspective.RESEARCHER,
+                    InterviewPerspective.SIMPLIFIER,
+                    InterviewPerspective.ARCHITECT,
+                ]
+            )
+        else:
+            perspectives.extend(
+                [
+                    InterviewPerspective.RESEARCHER,
+                    InterviewPerspective.SIMPLIFIER,
+                    InterviewPerspective.ARCHITECT,
+                ]
+            )
+
+        if (
+            state.ambiguity_score is not None
+            and state.ambiguity_score <= SEED_CLOSER_ACTIVATION_THRESHOLD
+        ):
+            perspectives.append(InterviewPerspective.SEED_CLOSER)
+
+        if state.is_brownfield and InterviewPerspective.ARCHITECT not in perspectives:
+            perspectives.append(InterviewPerspective.ARCHITECT)
+
+        # Preserve declaration order while removing duplicates.
+        return tuple(dict.fromkeys(perspectives))
+
+    def _build_perspective_panel_prompt(self, state: InterviewState) -> str:
+        """Build instructions for the internal perspective panel."""
+        strategies = _load_interview_perspective_strategies()
+        sections = [
+            "## Perspective Panel",
+            "Before asking the next question, silently consult these internal agents.",
+            "They are planning aids only. Emit exactly one final question to the user.",
+            "",
+        ]
+
+        for perspective in self._select_perspectives(state):
+            strategy = strategies[perspective]
+            sections.append(f"### {perspective.value}")
+            sections.append(f"Focus: {strategy.system_prompt}")
+            if strategy.approach_instructions:
+                sections.append("Approach cues:")
+                sections.extend(f"- {item}" for item in strategy.approach_instructions[:3])
+            if strategy.question_templates:
+                sections.append("Question patterns:")
+                sections.extend(f"- {item}" for item in strategy.question_templates[:2])
+            sections.append("")
+
+        sections.extend(
+            [
+                "## Panel Synthesis Rules",
+                "- Keep independent ambiguity tracks visible instead of collapsing onto one favorite subtopic.",
+                "- If one file, abstraction, or bug has dominated several rounds, zoom back out before going deeper.",
+                "- Preserve both implementation and written-output requirements when the user asked for both.",
+                "- Prefer breadth recap questions when multiple unresolved tracks still exist.",
+                "- Only ask a closure question when closure mode is active; otherwise keep drilling into the weakest area.",
+                "- Even when the score is seed-ready, do not end the interview on the first low-ambiguity turn.",
+            ]
+        )
+
+        return "\n".join(sections)
+
+    def _next_conversation_round_number(self, state: InterviewState) -> int:
+        """Return the next real interview round, ignoring summary sentinels."""
+        return (
+            sum(
+                1
+                for round_data in state.rounds
+                if round_data.question != self._INITIAL_CONTEXT_SUMMARY_QUESTION
+            )
+            + 1
+        )
+
+    # Agent SDK CLI can return empty responses when the combined prompt
+    # (system_prompt + conversation history) exceeds an internal threshold.
+    # Cap each user response to keep the total prompt within safe limits.
+    _MAX_USER_RESPONSE_CHARS = 800
+
+    def _build_conversation_history(
+        self,
+        state: InterviewState,
+        initial_context: str | None = None,
+    ) -> list[Message]:
         """Build conversation history from completed rounds.
+
+        Long user responses are truncated to prevent Agent SDK CLI from
+        returning empty responses due to prompt size.
 
         Args:
             state: Current interview state.
+            initial_context: Prompt-safe initial context to use for overflow
+                instead of ``state.initial_context``.
 
         Returns:
             List of messages representing the conversation.
         """
         messages: list[Message] = []
+        context_for_prompt = (
+            initial_context if initial_context is not None else state.initial_context
+        )
+
+        has_conversation_rounds = self._next_conversation_round_number(state) > 1
+        overflow = self._initial_context_overflow_message(context_for_prompt)
+        if overflow:
+            messages.append(Message(role=MessageRole.USER, content=overflow))
+        elif not has_conversation_rounds and context_for_prompt:
+            # Some chat providers reject a first request that contains only a
+            # system message. Mirror the user's initial context as the first
+            # user turn so provider adapters always receive a non-system
+            # conversation message on round one. Summary-recovery sentinel
+            # rounds do not count as conversation because they are skipped
+            # below. Long contexts keep using the overflow path above to
+            # preserve prompt-budget caps.
+            user_content = context_for_prompt
+            if len(user_content) > self._MAX_USER_RESPONSE_CHARS:
+                user_content = user_content[: self._MAX_USER_RESPONSE_CHARS] + "..."
+            messages.append(Message(role=MessageRole.USER, content=user_content))
 
         for round_data in state.rounds:
+            if round_data.question == self._INITIAL_CONTEXT_SUMMARY_QUESTION:
+                continue
             messages.append(Message(role=MessageRole.ASSISTANT, content=round_data.question))
             if round_data.user_response:
-                messages.append(Message(role=MessageRole.USER, content=round_data.user_response))
+                response = round_data.user_response
+                if len(response) > self._MAX_USER_RESPONSE_CHARS:
+                    response = response[: self._MAX_USER_RESPONSE_CHARS] + "..."
+                messages.append(Message(role=MessageRole.USER, content=response))
 
         return messages
+
+    def _trim_messages_to_budget(
+        self,
+        messages: list[Message],
+        *,
+        max_chars: int,
+        preserve_prefix_messages: int = 0,
+    ) -> list[Message]:
+        """Keep durable prefix messages plus newest conversation within a budget."""
+        if sum(len(message.content) for message in messages) <= max_chars:
+            return messages
+
+        prefix = messages[:preserve_prefix_messages]
+        remaining_messages = messages[preserve_prefix_messages:]
+        prefix_chars = sum(len(message.content) for message in prefix)
+        if prefix_chars >= max_chars:
+            retained_prefix: list[Message] = []
+            used_prefix_chars = 0
+            for message in prefix:
+                remaining = max_chars - used_prefix_chars
+                if remaining <= 0:
+                    break
+                if len(message.content) <= remaining:
+                    retained_prefix.append(message)
+                    used_prefix_chars += len(message.content)
+                else:
+                    retained_prefix.append(
+                        Message(role=message.role, content=message.content[:remaining])
+                    )
+                    break
+            return retained_prefix
+
+        retained: list[Message] = []
+        used_chars = prefix_chars
+        for message in reversed(remaining_messages):
+            remaining = max_chars - used_chars
+            if remaining <= 0:
+                break
+            if len(message.content) <= remaining:
+                retained.append(message)
+                used_chars += len(message.content)
+            else:
+                retained.append(Message(role=message.role, content=message.content[-remaining:]))
+                break
+        return [*prefix, *reversed(retained)]
 
     async def complete_interview(
         self, state: InterviewState

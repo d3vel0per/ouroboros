@@ -13,12 +13,18 @@ from ouroboros.bigbang.ambiguity import (
     ComponentScore,
     ScoreBreakdown,
 )
-from ouroboros.bigbang.interview import InterviewRound, InterviewState
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewRound,
+    InterviewState,
+    InterviewStatus,
+)
 from ouroboros.bigbang.seed_generator import (
     SeedGenerator,
     load_seed,
     save_seed_sync,
 )
+from ouroboros.config.loader import get_clarification_model
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.seed import (
     EvaluationPrinciple,
@@ -164,7 +170,7 @@ class TestSeedGeneratorConstruction:
                 output_dir=Path(tmp_dir) / "seeds",
             )
 
-            assert generator.model == "claude-opus-4-6"
+            assert generator.model == get_clarification_model()
             assert generator.temperature == 0.2
             assert generator.max_tokens == 4096
 
@@ -255,6 +261,44 @@ class TestSeedGeneratorAmbiguityGating:
 
             assert result.is_ok
             assert isinstance(result.value, Seed)
+
+    @pytest.mark.asyncio
+    async def test_generate_requires_summary_for_large_initial_context(self) -> None:
+        """SeedGenerator.generate() fails when long initial_context has no summary."""
+        mock_adapter = AsyncMock()
+        state = InterviewState(
+            interview_id="test_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+        )
+        low_ambiguity = create_low_ambiguity_score()
+        generator = SeedGenerator(llm_adapter=mock_adapter)
+
+        result = await generator.generate(state, low_ambiguity)
+
+        assert result.is_err
+        assert isinstance(result.error, ValidationError)
+        assert "summary required" in result.error.message
+
+    @pytest.mark.asyncio
+    async def test_generate_requires_summary_for_completed_large_initial_context(
+        self,
+    ) -> None:
+        """Completed long-context interviews still enforce summary before seed generation."""
+        mock_adapter = AsyncMock()
+        state = InterviewState(
+            interview_id="test_completed_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+            status=InterviewStatus.COMPLETED,
+        )
+        low_ambiguity = create_low_ambiguity_score()
+        generator = SeedGenerator(llm_adapter=mock_adapter)
+
+        result = await generator.generate(state, low_ambiguity)
+
+        assert result.is_err
+        assert isinstance(result.error, ValidationError)
+        assert "summary required" in result.error.message
+        mock_adapter.complete.assert_not_called()
 
 
 class TestSeedGeneratorExtraction:
@@ -450,6 +494,55 @@ class TestSeedGeneratorMetadata:
             assert seed.metadata.created_at is not None
 
 
+class TestSeedGeneratorInterviewContext:
+    """Test SeedGenerator._build_interview_context."""
+
+    def test_context_uses_prompt_safe_initial_context_summary(self) -> None:
+        """_build_interview_context avoids oversized raw initial_context."""
+        mock_adapter = AsyncMock()
+        generator = SeedGenerator(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response="Short project summary",
+            )
+        )
+
+        context = generator._build_interview_context(state)
+
+        assert "Short project summary" in context
+        assert "TAIL_MARKER" not in context
+        assert INITIAL_CONTEXT_SUMMARY_QUESTION not in context
+
+    def test_context_caps_oversized_initial_context_summary(self) -> None:
+        """_build_interview_context does not serialize oversized summary rounds raw."""
+        mock_adapter = AsyncMock()
+        generator = SeedGenerator(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_large_summary",
+            initial_context=("A" * 4_000) + "RAW_TAIL",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response=("B" * 4_000) + "SUMMARY_TAIL",
+            )
+        )
+
+        context = generator._build_interview_context(state)
+
+        assert "Context truncated for prompt safety" in context
+        assert "RAW_TAIL" not in context
+        assert "SUMMARY_TAIL" not in context
+        assert INITIAL_CONTEXT_SUMMARY_QUESTION not in context
+
+
 class TestSeedGeneratorErrorHandling:
     """Test SeedGenerator error handling."""
 
@@ -483,7 +576,7 @@ class TestSeedGeneratorErrorHandling:
         low_ambiguity = create_low_ambiguity_score()
 
         # Missing required fields — both initial and retry return bad data
-        bad_response = Result.ok(create_mock_completion_response("INVALID: missing fields"))
+        bad_response: Result = Result.ok(create_mock_completion_response("INVALID: missing fields"))
         mock_adapter.complete = AsyncMock(side_effect=[bad_response, bad_response])
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -561,12 +654,14 @@ class TestSeedGeneratorRobustParsing:
         state = create_interview_state_with_rounds()
         low_ambiguity = create_low_ambiguity_score()
 
-        conversational = Result.ok(
+        conversational: Result = Result.ok(
             create_mock_completion_response(
                 "Let me explore the codebase to provide accurate context."
             )
         )
-        valid = Result.ok(create_mock_completion_response(create_valid_extraction_response()))
+        valid: Result = Result.ok(
+            create_mock_completion_response(create_valid_extraction_response())
+        )
         mock_adapter.complete = AsyncMock(side_effect=[conversational, valid])
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -587,7 +682,7 @@ class TestSeedGeneratorRobustParsing:
         state = create_interview_state_with_rounds()
         low_ambiguity = create_low_ambiguity_score()
 
-        bad = Result.ok(
+        bad: Result = Result.ok(
             create_mock_completion_response("I'd be happy to help! Let me think about this...")
         )
         mock_adapter.complete = AsyncMock(side_effect=[bad, bad])

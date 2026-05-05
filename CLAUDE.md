@@ -25,17 +25,23 @@ When the user types any of these commands, read the corresponding SKILL.md file 
 | `ooo tutorial` | Read `skills/tutorial/SKILL.md` and follow it |
 | `ooo setup` | Read `skills/setup/SKILL.md` and follow it |
 | `ooo welcome` | Read `skills/welcome/SKILL.md` and follow it |
+| `ooo cancel` | Read `skills/cancel/SKILL.md` and follow it |
 | `ooo qa` or `ooo qa ...` | Read `skills/qa/SKILL.md` and follow it |
 | `ooo help` | Read `skills/help/SKILL.md` and follow it |
+| `ooo update` | Read `skills/update/SKILL.md` and follow it |
+| `ooo pm` or `ooo pm ...` | Read `skills/pm/SKILL.md` and follow it |
+| `ooo brownfield` or `ooo brownfield ...` | Read `skills/brownfield/SKILL.md` and follow it |
+| `ooo publish` or `ooo publish ...` | Read `skills/publish/SKILL.md` and follow it |
+| `ooo resume-session` | Read `skills/resume-session/SKILL.md` and follow it |
 
 **Important**: Do NOT use the Skill tool. Read the file with the Read tool and execute its instructions directly.
 
 ## Agents
 
-Custom agents are in `agents/`. When a skill references an agent (e.g., `ouroboros:socratic-interviewer`), read its definition from `agents/{name}.md` and adopt that role.
+Bundled agents live in `src/ouroboros/agents/`. When a skill references an agent (e.g., `ouroboros:socratic-interviewer`), read its definition from `src/ouroboros/agents/{name}.md` and adopt that role. Use `OUROBOROS_AGENTS_DIR` or `.claude-plugin/agents/` only for explicit custom overrides.
 
 <!-- ooo:START -->
-<!-- ooo:VERSION:0.20.0 -->
+<!-- ooo:VERSION:0.26.0 -->
 # Ouroboros — Specification-First AI Development
 
 > Before telling AI what to build, define what should be built.
@@ -74,6 +80,9 @@ Each command loads its agent/MCP on-demand. Details in each skill file.
 | `ooo tutorial` | Interactive hands-on learning |
 | `ooo setup` | — |
 | `ooo help` | — |
+| `ooo update` | PyPI version check + upgrade |
+| `ooo publish` | `gh` CLI — Seed to GitHub Issues |
+| `ooo resume-session` | Restore previous Claude Code session context |
 
 ## Agents
 

@@ -14,13 +14,16 @@ and autonomously evolves through Wonder → Reflect cycles for Gen 2+.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from enum import StrEnum
+import inspect
 import json
 import logging
-import os
+import signal
 from typing import Any
 
+from ouroboros.config.models import RuntimeControlsConfig
 from ouroboros.core.errors import OuroborosError
 from ouroboros.core.lineage import (
     EvaluationSummary,
@@ -32,24 +35,43 @@ from ouroboros.core.lineage import (
 )
 from ouroboros.core.seed import Seed
 from ouroboros.core.types import Result
+from ouroboros.events.control import create_control_directive_emitted_event
 from ouroboros.events.lineage import (
     lineage_converged,
     lineage_created,
     lineage_exhausted,
     lineage_generation_completed,
     lineage_generation_failed,
+    lineage_generation_interrupted,
+    lineage_generation_phase_changed,
     lineage_generation_started,
     lineage_ontology_evolved,
     lineage_stagnated,
     lineage_wonder_degraded,
 )
 from ouroboros.evolution.convergence import ConvergenceCriteria, ConvergenceSignal
+from ouroboros.evolution.directive_mapping import (
+    is_terminal_directive,
+    step_action_to_directive,
+)
 from ouroboros.evolution.projector import LineageProjector
 from ouroboros.evolution.reflect import ReflectEngine, ReflectOutput
+from ouroboros.evolution.watchdog import (
+    GenerationProgressWatchdog,
+    GenerationWatchdogTimeout,
+)
 from ouroboros.evolution.wonder import WonderEngine, WonderOutput
+from ouroboros.observability.drift import DriftMeasuredEvent, DriftMeasurement
 from ouroboros.persistence.event_store import EventStore
 
 logger = logging.getLogger(__name__)
+
+
+def _default_runtime_controls() -> RuntimeControlsConfig:
+    """Load runtime controls through the config/env compatibility layer."""
+    from ouroboros.config.loader import get_runtime_controls_config
+
+    return get_runtime_controls_config()
 
 
 @dataclass
@@ -60,12 +82,21 @@ class EvolutionaryLoopConfig:
     convergence_threshold: float = 0.95
     stagnation_window: int = 3
     min_generations: int = 3
-    generation_timeout_seconds: int = int(
-        os.environ.get("OUROBOROS_GENERATION_TIMEOUT", "0")
-    )  # 0 = no timeout
+    generation_timeout_seconds: int = 0  # Deprecated: use runtime_controls.
+    runtime_controls: RuntimeControlsConfig = field(default_factory=_default_runtime_controls)
     enable_oscillation_detection: bool = True
     eval_gate_enabled: bool = True
     eval_min_score: float = 0.7
+
+    def __post_init__(self) -> None:
+        """Map legacy generation_timeout_seconds onto no-progress detection."""
+        if self.generation_timeout_seconds > 0:
+            self.runtime_controls = RuntimeControlsConfig.model_validate(
+                {
+                    **self.runtime_controls.model_dump(),
+                    "generation_no_progress_timeout_seconds": (self.generation_timeout_seconds),
+                }
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +134,7 @@ class StepAction(StrEnum):
     STAGNATED = "stagnated"
     EXHAUSTED = "exhausted"
     FAILED = "failed"
+    INTERRUPTED = "interrupted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +146,11 @@ class StepResult:
     lineage: OntologyLineage
     action: StepAction
     next_generation: int
+
+    @property
+    def is_interrupted(self) -> bool:
+        """Whether this step was interrupted by graceful shutdown."""
+        return self.action == StepAction.INTERRUPTED
 
 
 class EvolutionaryLoop:
@@ -153,6 +190,13 @@ class EvolutionaryLoop:
         self.executor = executor
         self.evaluator = evaluator
         self.validator = validator
+        self._project_dir_context: ContextVar[str | None] = ContextVar(
+            "evolutionary_loop_project_dir",
+            default=None,
+        )
+        self._shutdown_requested = False
+        self._original_sigint_handler: signal.Handlers | None = None
+        self._sigint_installed = False
         self._convergence = ConvergenceCriteria(
             convergence_threshold=self.config.convergence_threshold,
             stagnation_window=self.config.stagnation_window,
@@ -162,6 +206,142 @@ class EvolutionaryLoop:
             eval_gate_enabled=self.config.eval_gate_enabled,
             eval_min_score=self.config.eval_min_score,
         )
+
+    def _install_sigint_handler(self) -> None:
+        """Replace SIGINT handler with graceful shutdown flag."""
+        if self._sigint_installed:
+            return
+        self._shutdown_requested = False
+
+        def _handle_sigint(signum: int, frame: Any) -> None:  # noqa: ARG001
+            if self._shutdown_requested:
+                # Second Ctrl+C: force exit
+                logger.warning("evolution.force_shutdown")
+                raise KeyboardInterrupt
+            logger.info("evolution.graceful_shutdown_requested")
+            self._shutdown_requested = True
+
+        try:
+            self._original_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, _handle_sigint)
+            self._sigint_installed = True
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "evolution.sigint_handler_unavailable",
+                extra={"reason": str(exc)},
+            )
+            self._original_sigint_handler = None
+
+    def _uninstall_sigint_handler(self) -> None:
+        """Restore the original SIGINT handler."""
+        if not self._sigint_installed:
+            return
+        if self._original_sigint_handler is not None:
+            try:
+                signal.signal(signal.SIGINT, self._original_sigint_handler)
+            except (ValueError, OSError) as exc:
+                logger.warning(
+                    "evolution.sigint_handler_restore_failed",
+                    extra={"reason": str(exc)},
+                )
+            self._original_sigint_handler = None
+        self._sigint_installed = False
+
+    def set_project_dir(self, project_dir: str | None) -> Token[str | None]:
+        """Set task-local project directory context for the current generation."""
+        return self._project_dir_context.set(project_dir)
+
+    def get_project_dir(self) -> str | None:
+        """Return the task-local project directory for the current execution."""
+        return self._project_dir_context.get()
+
+    def reset_project_dir(self, token: Token[str | None]) -> None:
+        """Restore the previous task-local project directory context."""
+        self._project_dir_context.reset(token)
+
+    async def _emit_step_directive(
+        self,
+        action: StepAction,
+        *,
+        lineage_id: str,
+        generation_number: int,
+        phase: str,
+        reason: str,
+        retry_budget_remaining: int = 1,
+    ) -> None:
+        """Emit ``control.directive.emitted`` at a ``StepAction`` decision point.
+
+        Slice 1 of #472 — translates the local ``StepAction`` outcome onto
+        the shared :class:`Directive` vocabulary and persists the
+        translation so projectors (#514) can render the decision lane
+        alongside ``lineage.*`` state events. ``StepAction.CONTINUE``
+        deliberately produces no event (the underlying
+        ``lineage.generation.completed`` event already records the
+        no-op continuation; emitting on every CONTINUE would flood the
+        journal).
+
+        Args:
+            action: Outcome being returned to the caller.
+            lineage_id: Target aggregate id (required by the factory).
+            generation_number: Correlation field for projector
+                interleaving.
+            phase: Current pipeline phase string for the projector.
+            reason: Short audit-level rationale.
+            retry_budget_remaining: Forwarded to
+                :func:`step_action_to_directive` for the
+                ``StepAction.FAILED`` branch.
+        """
+        directive = step_action_to_directive(action, retry_budget_remaining=retry_budget_remaining)
+        if directive is None:
+            return
+        await self.event_store.append(
+            create_control_directive_emitted_event(
+                target_type="lineage",
+                target_id=lineage_id,
+                emitted_by="evolver",
+                directive=directive,
+                reason=reason,
+                lineage_id=lineage_id,
+                generation_number=generation_number,
+                phase=phase,
+                extra={"step_action": str(action), "is_terminal": is_terminal_directive(directive)},
+            )
+        )
+
+    async def _phase_for_failed_step_directive(
+        self,
+        *,
+        lineage_id: str,
+        generation_number: int,
+    ) -> str:
+        """Return the phase recorded by the generation failure event.
+
+        ``evolve_step`` emits its StepAction-level directive after
+        ``_run_generation`` has already emitted the phase-specific
+        ``lineage.generation.failed`` event. Replaying that last failure
+        preserves the real phase (wondering/reflecting/seeding/etc.)
+        instead of stamping every failed step as ``executing``.
+        """
+        events = await self.event_store.replay_lineage(lineage_id)
+        saw_cancelled_failure = False
+        for event in reversed(events):
+            if event.data.get("generation_number") != generation_number:
+                continue
+            if event.type == "lineage.generation.failed":
+                phase = event.data.get("phase")
+                if isinstance(phase, str) and phase:
+                    if phase != GenerationPhase.CANCELLED.value:
+                        return phase
+                    saw_cancelled_failure = True
+                    continue
+            if saw_cancelled_failure and event.type in {
+                "lineage.generation.phase_changed",
+                "lineage.generation.started",
+            }:
+                phase = event.data.get("phase")
+                if isinstance(phase, str) and phase:
+                    return phase
+        return GenerationPhase.FAILED.value
 
     async def run(
         self,
@@ -189,9 +369,28 @@ class EvolutionaryLoop:
         # Emit lineage created event
         await self.event_store.append(lineage_created(lineage.lineage_id, lineage.goal))
 
+        self._install_sigint_handler()
         generation_results: list[GenerationResult] = []
         current_seed = initial_seed
+
+        try:
+            return await self._run_loop(
+                lineage,
+                current_seed,
+                generation_results,
+            )
+        finally:
+            self._uninstall_sigint_handler()
+
+    async def _run_loop(
+        self,
+        lineage: OntologyLineage,
+        current_seed: Seed,
+        generation_results: list[GenerationResult],
+    ) -> Result[EvolutionaryResult, OuroborosError]:
+        """Inner loop extracted for SIGINT handler bracket."""
         generation_number = 0
+        failure_error: OuroborosError | None = None
 
         while True:
             generation_number += 1
@@ -204,37 +403,27 @@ class EvolutionaryLoop:
                 },
             )
 
-            # Run generation with timeout
-            loop_timeout = self.config.generation_timeout_seconds or None
-            try:
-                gen_result = await asyncio.wait_for(
-                    self._run_generation(
-                        lineage=lineage,
-                        generation_number=generation_number,
-                        current_seed=current_seed,
-                    ),
-                    timeout=loop_timeout,
-                )
-            except TimeoutError:
+            # Run generation with progress-aware liveness controls.
+            gen_result = await self._run_generation_with_watchdog(
+                lineage=lineage,
+                generation_number=generation_number,
+                current_seed=current_seed,
+            )
+            if gen_result.is_err and isinstance(gen_result.error, GenerationWatchdogTimeout):
+                failure_error = gen_result.error
                 logger.error(
-                    "evolution.generation.timeout",
+                    "evolution.generation.watchdog_timeout",
                     extra={
                         "lineage_id": lineage.lineage_id,
                         "generation": generation_number,
-                        "timeout": self.config.generation_timeout_seconds,
+                        "timeout_kind": gen_result.error.timeout_kind,
+                        "details": gen_result.error.details,
                     },
-                )
-                await self.event_store.append(
-                    lineage_generation_failed(
-                        lineage.lineage_id,
-                        generation_number,
-                        "executing",
-                        f"Generation timed out after {self.config.generation_timeout_seconds}s",
-                    )
                 )
                 break
 
             if gen_result.is_err:
+                failure_error = gen_result.error
                 logger.error(
                     "evolution.generation.failed",
                     extra={
@@ -246,6 +435,20 @@ class EvolutionaryLoop:
                 break
 
             result = gen_result.value
+
+            # Graceful shutdown: generation was interrupted between phases
+            if result.phase == GenerationPhase.INTERRUPTED:
+                logger.info(
+                    "evolution.generation.interrupted_gracefully",
+                    extra={
+                        "lineage_id": lineage.lineage_id,
+                        "generation": generation_number,
+                    },
+                )
+                generation_results.append(result)
+                current_seed = result.seed  # Use interrupted gen's seed (may be evolved)
+                break
+
             generation_results.append(result)
 
             # Record generation in lineage
@@ -274,6 +477,12 @@ class EvolutionaryLoop:
                     list(result.wonder_output.questions) if result.wonder_output else None,
                     seed_json=json.dumps(result.seed.to_dict()),
                     execution_output=result.execution_output,
+                    parent_seed_id=result.seed.metadata.parent_seed_id,
+                    seed_quality_canary_feedback=[
+                        feedback.model_dump(mode="json")
+                        for feedback in record.seed_quality_canary_feedback
+                    ]
+                    or None,
                 )
             )
 
@@ -288,20 +497,21 @@ class EvolutionaryLoop:
                 )
 
             # Check convergence
-            signal = self._convergence.evaluate(
+            conv_signal = self._convergence.evaluate(
                 lineage,
                 result.wonder_output,
                 latest_evaluation=result.evaluation_summary,
+                validation_output=result.validation_output,
             )
 
-            if signal.converged:
+            if conv_signal.converged:
                 logger.info(
                     "evolution.converged",
                     extra={
                         "lineage_id": lineage.lineage_id,
                         "generation": generation_number,
-                        "reason": signal.reason,
-                        "similarity": signal.ontology_similarity,
+                        "reason": conv_signal.reason,
+                        "similarity": conv_signal.ontology_similarity,
                     },
                 )
 
@@ -315,23 +525,25 @@ class EvolutionaryLoop:
                         )
                     )
                     lineage = lineage.with_status(LineageStatus.EXHAUSTED)
-                elif "Stagnation" in signal.reason or "Oscillation" in signal.reason:
+                elif "Stagnation" in conv_signal.reason or "Oscillation" in conv_signal.reason:
                     await self.event_store.append(
                         lineage_stagnated(
                             lineage.lineage_id,
                             generation_number,
-                            signal.reason,
+                            conv_signal.reason,
                             self.config.stagnation_window,
                         )
                     )
-                    lineage = lineage.with_status(LineageStatus.CONVERGED)
+                    # Stagnation is a non-terminal control handoff: the shared
+                    # Directive contract maps STAGNATED to UNSTUCK, so keep the
+                    # lineage resumable for the lateral-thinking recovery path.
                 else:
                     await self.event_store.append(
                         lineage_converged(
                             lineage.lineage_id,
                             generation_number,
-                            signal.reason,
-                            signal.ontology_similarity,
+                            conv_signal.reason,
+                            conv_signal.ontology_similarity,
                         )
                     )
                     lineage = lineage.with_status(LineageStatus.CONVERGED)
@@ -342,14 +554,20 @@ class EvolutionaryLoop:
             current_seed = result.seed
 
         # Best-so-far recovery: if no generations completed, report error
-        if not generation_results:
-            return Result.err(OuroborosError("No generations completed before failure"))
+        # But allow interrupted results through (they enable resume)
+        completed_results = [r for r in generation_results if r.phase == GenerationPhase.COMPLETED]
+        has_interrupted = any(r.phase == GenerationPhase.INTERRUPTED for r in generation_results)
+        if not completed_results and not has_interrupted:
+            return Result.err(
+                failure_error or OuroborosError("No generations completed before failure")
+            )
 
         # Partial results available — return best-so-far (lineage stays ACTIVE for resume)
+        # total_generations counts only completed generations to avoid overstating progress
         return Result.ok(
             EvolutionaryResult(
                 lineage=lineage,
-                total_generations=len(generation_results),
+                total_generations=len(completed_results),
                 converged=lineage.status == LineageStatus.CONVERGED,
                 final_seed=current_seed,
                 generation_results=tuple(generation_results),
@@ -400,6 +618,8 @@ class EvolutionaryLoop:
             await self.event_store.append(lineage_created(lineage.lineage_id, lineage.goal))
             generation_number = 1
             current_seed = initial_seed
+            last_phase = GenerationPhase.COMPLETED  # Gen 1: no prior state
+            interrupted_at_phase = None
 
         else:
             # Gen 2+: reconstruct from events
@@ -416,18 +636,61 @@ class EvolutionaryLoop:
                 )
 
             # Determine resume point
-            last_gen, last_phase = projector.find_resume_point(events)
+            last_gen, last_phase, interrupted_at_phase = projector.find_resume_point(events)
 
-            if last_phase == GenerationPhase.FAILED:
-                # Resume the failed generation
+            if last_phase in (GenerationPhase.FAILED, GenerationPhase.INTERRUPTED):
+                # Resume the failed/interrupted generation
                 generation_number = last_gen
             else:
                 generation_number = last_gen + 1
 
-            # Reconstruct seed from last completed generation
+            # Reconstruct seed — prefer interrupted gen's seed_json (has evolved state)
             if initial_seed is not None:
                 # Caller provided seed explicitly (e.g., after rewind)
                 current_seed = initial_seed
+            elif last_phase == GenerationPhase.INTERRUPTED:
+                # Try to use the interrupted generation's seed (preserves evolved state)
+                interrupted_gen = next(
+                    (
+                        g
+                        for g in reversed(lineage.generations)
+                        if g.phase == GenerationPhase.INTERRUPTED
+                    ),
+                    None,
+                )
+                if interrupted_gen and interrupted_gen.seed_json:
+                    try:
+                        current_seed = Seed.from_dict(json.loads(interrupted_gen.seed_json))
+                    except Exception as e:
+                        logger.warning(
+                            "evolution.resume.interrupted_seed_failed",
+                            extra={"error": str(e)},
+                        )
+                        # Fall through to last completed generation
+                        interrupted_gen = None
+
+                if not interrupted_gen or not interrupted_gen.seed_json:
+                    # Fallback: use last completed generation's seed.
+                    # IMPORTANT: also reset interrupted_at_phase so we don't
+                    # skip phases with a stale seed from a different generation.
+                    interrupted_at_phase = None
+                    last_completed = next(
+                        (
+                            g
+                            for g in reversed(lineage.generations)
+                            if g.phase == GenerationPhase.COMPLETED
+                        ),
+                        None,
+                    )
+                    if last_completed and last_completed.seed_json:
+                        current_seed = Seed.from_dict(json.loads(last_completed.seed_json))
+                    else:
+                        return Result.err(
+                            OuroborosError(
+                                "Lineage was interrupted before any generation completed. "
+                                "Re-provide initial_seed to resume."
+                            )
+                        )
             elif lineage.generations:
                 last_completed = next(
                     (
@@ -438,6 +701,16 @@ class EvolutionaryLoop:
                     None,
                 )
                 if last_completed is None:
+                    has_interrupted = any(
+                        g.phase == GenerationPhase.INTERRUPTED for g in lineage.generations
+                    )
+                    if has_interrupted:
+                        return Result.err(
+                            OuroborosError(
+                                "Lineage was interrupted before any generation completed. "
+                                "Re-provide initial_seed to resume."
+                            )
+                        )
                     return Result.err(
                         OuroborosError("Events exist but no completed generations found")
                     )
@@ -458,41 +731,51 @@ class EvolutionaryLoop:
             else:
                 return Result.err(OuroborosError("Events exist but no completed generations found"))
 
-        # Step 2: Run one generation
-        timeout = self.config.generation_timeout_seconds or None  # 0 = no timeout
+        # Step 2: Run one generation with graceful shutdown support
+        # Pass resume phase hint for interrupted generations
+        resume_after_phase = (
+            interrupted_at_phase if last_phase == GenerationPhase.INTERRUPTED else None
+        )
+        self._install_sigint_handler()
         try:
-            gen_result = await asyncio.wait_for(
-                self._run_generation(
-                    lineage=lineage,
-                    generation_number=generation_number,
-                    current_seed=current_seed,
-                    execute=execute,
-                    parallel=parallel,
-                ),
-                timeout=timeout,
+            gen_result = await self._run_generation_with_watchdog(
+                lineage=lineage,
+                generation_number=generation_number,
+                current_seed=current_seed,
+                execute=execute,
+                parallel=parallel,
+                resume_after_phase=resume_after_phase,
             )
-        except TimeoutError:
-            # Note: _run_generation's CancelledError handler already emits
-            # generation.failed (asyncio.wait_for cancels the task before
-            # raising TimeoutError). No duplicate event emission needed here.
+        finally:
+            self._uninstall_sigint_handler()
 
-            # Return FAILED step result
+        if gen_result.is_err and isinstance(gen_result.error, GenerationWatchdogTimeout):
             failed_gen = GenerationResult(
                 generation_number=generation_number,
                 seed=current_seed,
                 phase=GenerationPhase.FAILED,
                 success=False,
             )
-            signal = ConvergenceSignal(
+            conv_signal = ConvergenceSignal(
                 converged=False,
-                reason=f"Generation timed out after {self.config.generation_timeout_seconds}s",
+                reason=gen_result.error.message,
                 ontology_similarity=0.0,
                 generation=generation_number,
+            )
+            await self._emit_step_directive(
+                StepAction.FAILED,
+                lineage_id=lineage.lineage_id,
+                generation_number=generation_number,
+                phase=await self._phase_for_failed_step_directive(
+                    lineage_id=lineage.lineage_id,
+                    generation_number=generation_number,
+                ),
+                reason=conv_signal.reason,
             )
             return Result.ok(
                 StepResult(
                     generation_result=failed_gen,
-                    convergence_signal=signal,
+                    convergence_signal=conv_signal,
                     lineage=lineage,
                     action=StepAction.FAILED,
                     next_generation=generation_number,
@@ -500,32 +783,34 @@ class EvolutionaryLoop:
             )
 
         if gen_result.is_err:
-            # Emit generation.failed event so the event store reflects the failure.
-            # Without this, only generation.started is recorded, leaving an orphan.
-            await self.event_store.append(
-                lineage_generation_failed(
-                    lineage.lineage_id,
-                    generation_number,
-                    "executing",
-                    str(gen_result.error),
-                )
-            )
+            # Note: _run_generation_phases already emits a phase-specific
+            # generation.failed event. No duplicate emission here.
             failed_gen = GenerationResult(
                 generation_number=generation_number,
                 seed=current_seed,
                 phase=GenerationPhase.FAILED,
                 success=False,
             )
-            signal = ConvergenceSignal(
+            conv_signal = ConvergenceSignal(
                 converged=False,
                 reason=str(gen_result.error),
                 ontology_similarity=0.0,
                 generation=generation_number,
             )
+            await self._emit_step_directive(
+                StepAction.FAILED,
+                lineage_id=lineage.lineage_id,
+                generation_number=generation_number,
+                phase=await self._phase_for_failed_step_directive(
+                    lineage_id=lineage.lineage_id,
+                    generation_number=generation_number,
+                ),
+                reason=conv_signal.reason,
+            )
             return Result.ok(
                 StepResult(
                     generation_result=failed_gen,
-                    convergence_signal=signal,
+                    convergence_signal=conv_signal,
                     lineage=lineage,
                     action=StepAction.FAILED,
                     next_generation=generation_number,
@@ -533,6 +818,31 @@ class EvolutionaryLoop:
             )
 
         result = gen_result.value
+
+        # Handle graceful interruption — return without emitting completed
+        if result.phase == GenerationPhase.INTERRUPTED:
+            conv_signal = ConvergenceSignal(
+                converged=False,
+                reason="Generation interrupted by SIGINT",
+                ontology_similarity=0.0,
+                generation=generation_number,
+            )
+            await self._emit_step_directive(
+                StepAction.INTERRUPTED,
+                lineage_id=lineage.lineage_id,
+                generation_number=generation_number,
+                phase="interrupted",
+                reason=conv_signal.reason,
+            )
+            return Result.ok(
+                StepResult(
+                    generation_result=result,
+                    convergence_signal=conv_signal,
+                    lineage=lineage,
+                    action=StepAction.INTERRUPTED,
+                    next_generation=generation_number,
+                )
+            )
 
         # Step 3: Emit generation completed event (with seed_json)
         record = GenerationRecord(
@@ -560,6 +870,12 @@ class EvolutionaryLoop:
                 list(result.wonder_output.questions) if result.wonder_output else None,
                 seed_json=json.dumps(result.seed.to_dict()),
                 execution_output=result.execution_output,
+                parent_seed_id=result.seed.metadata.parent_seed_id,
+                seed_quality_canary_feedback=[
+                    feedback.model_dump(mode="json")
+                    for feedback in record.seed_quality_canary_feedback
+                ]
+                or None,
             )
         )
 
@@ -574,14 +890,15 @@ class EvolutionaryLoop:
             )
 
         # Step 4: Check convergence
-        signal = self._convergence.evaluate(
+        conv_signal = self._convergence.evaluate(
             lineage,
             result.wonder_output,
             latest_evaluation=result.evaluation_summary,
+            validation_output=result.validation_output,
         )
 
         action = StepAction.CONTINUE
-        if signal.converged:
+        if conv_signal.converged:
             if generation_number >= self.config.max_generations:
                 await self.event_store.append(
                     lineage_exhausted(
@@ -592,33 +909,42 @@ class EvolutionaryLoop:
                 )
                 lineage = lineage.with_status(LineageStatus.EXHAUSTED)
                 action = StepAction.EXHAUSTED
-            elif "Stagnation" in signal.reason or "Oscillation" in signal.reason:
+            elif "Stagnation" in conv_signal.reason or "Oscillation" in conv_signal.reason:
                 await self.event_store.append(
                     lineage_stagnated(
                         lineage.lineage_id,
                         generation_number,
-                        signal.reason,
+                        conv_signal.reason,
                         self.config.stagnation_window,
                     )
                 )
-                lineage = lineage.with_status(LineageStatus.CONVERGED)
+                # Stagnation is a non-terminal control handoff: the shared
+                # Directive contract maps STAGNATED to UNSTUCK, so keep the
+                # lineage resumable for the lateral-thinking recovery path.
                 action = StepAction.STAGNATED
             else:
                 await self.event_store.append(
                     lineage_converged(
                         lineage.lineage_id,
                         generation_number,
-                        signal.reason,
-                        signal.ontology_similarity,
+                        conv_signal.reason,
+                        conv_signal.ontology_similarity,
                     )
                 )
                 lineage = lineage.with_status(LineageStatus.CONVERGED)
                 action = StepAction.CONVERGED
 
+        await self._emit_step_directive(
+            action,
+            lineage_id=lineage.lineage_id,
+            generation_number=generation_number,
+            phase=str(result.phase),
+            reason=conv_signal.reason,
+        )
         return Result.ok(
             StepResult(
                 generation_result=result,
-                convergence_signal=signal,
+                convergence_signal=conv_signal,
                 lineage=lineage,
                 action=action,
                 next_generation=generation_number + 1,
@@ -632,11 +958,17 @@ class EvolutionaryLoop:
         current_seed: Seed,
         execute: bool = True,
         parallel: bool = True,
+        resume_after_phase: str | None = None,
+        execution_id: str | None = None,
     ) -> Result[GenerationResult, OuroborosError]:
         """Run a single generation within the loop.
 
         Gen 1: Execute → Evaluate (seed already provided)
         Gen 2+: Wonder → Reflect → Seed → Execute → Evaluate
+
+        Args:
+            resume_after_phase: If set, skip phases up to and including this
+                phase (for resuming interrupted generations).
         """
         try:
             return await self._run_generation_phases(
@@ -645,10 +977,13 @@ class EvolutionaryLoop:
                 current_seed=current_seed,
                 execute=execute,
                 parallel=parallel,
+                resume_after_phase=resume_after_phase,
+                execution_id=execution_id,
             )
         except asyncio.CancelledError:
-            # MCP transport disconnect or task cancellation after generation.started
-            # was emitted. Emit generation.failed so we don't leave orphaned events.
+            # MCP transport disconnect, timeout, or external task cancellation.
+            # Use 'failed' (not 'interrupted') to avoid conflicting with the
+            # graceful SIGINT shutdown path which emits 'interrupted'.
             logger.warning(
                 "evolution.generation.cancelled",
                 extra={
@@ -666,8 +1001,162 @@ class EvolutionaryLoop:
                     )
                 )
             except Exception:
-                pass  # Best-effort: event store may also be shutting down
+                logger.warning("evolution.generation.cancelled_event_failed", exc_info=True)
             raise
+
+    async def _run_generation_with_watchdog(
+        self,
+        lineage: OntologyLineage,
+        generation_number: int,
+        current_seed: Seed,
+        execute: bool = True,
+        parallel: bool = True,
+        resume_after_phase: str | None = None,
+    ) -> Result[GenerationResult, OuroborosError]:
+        """Run one generation under progress-aware liveness controls."""
+        execution_id = self._generation_execution_id(lineage.lineage_id, generation_number)
+        watchdog = GenerationProgressWatchdog(
+            event_store=self.event_store,
+            lineage_id=lineage.lineage_id,
+            generation_number=generation_number,
+            execution_id=execution_id,
+            controls=self.config.runtime_controls,
+        )
+        try:
+            return await watchdog.watch(
+                self._run_generation(
+                    lineage=lineage,
+                    generation_number=generation_number,
+                    current_seed=current_seed,
+                    execute=execute,
+                    parallel=parallel,
+                    resume_after_phase=resume_after_phase,
+                    execution_id=execution_id,
+                )
+            )
+        except GenerationWatchdogTimeout as exc:
+            return Result.err(exc)
+
+    @staticmethod
+    def _generation_execution_id(lineage_id: str, generation_number: int) -> str:
+        """Build the deterministic execution ID for an evolve generation."""
+        return f"evolve:{lineage_id}:generation:{generation_number}"
+
+    async def _call_executor(
+        self,
+        seed: Seed,
+        *,
+        parallel: bool,
+        execution_id: str | None,
+    ) -> Any:
+        """Call the configured executor with optional execution_id support."""
+        kwargs: dict[str, Any] = {"parallel": parallel}
+        if execution_id is not None and self._callable_accepts_keyword(
+            self.executor,
+            "execution_id",
+        ):
+            kwargs["execution_id"] = execution_id
+        return await self.executor(seed, **kwargs)
+
+    @staticmethod
+    def _callable_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+        """Return True when *callable_obj* accepts *keyword*."""
+        try:
+            signature = inspect.signature(callable_obj)
+        except (TypeError, ValueError):
+            return False
+
+        for parameter in signature.parameters.values():
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                return True
+        return keyword in signature.parameters
+
+    async def _check_shutdown(
+        self,
+        lineage_id: str,
+        generation_number: int,
+        last_completed_phase: str | None,
+        current_seed: Seed,
+        wonder_output: WonderOutput | None = None,
+        reflect_output: ReflectOutput | None = None,
+        execution_output: str | None = None,
+        evaluation_summary: EvaluationSummary | None = None,
+        validation_output: str | None = None,
+    ) -> GenerationResult | None:
+        """Check if graceful shutdown was requested.
+
+        Returns a GenerationResult with INTERRUPTED phase if shutdown was
+        requested, or None to continue normally.
+        """
+        if not self._shutdown_requested:
+            return None
+
+        logger.info(
+            "evolution.generation.graceful_interrupt",
+            extra={
+                "lineage_id": lineage_id,
+                "generation": generation_number,
+                "last_completed_phase": last_completed_phase,
+            },
+        )
+
+        # Build partial state from whatever we have so far
+        partial_state: dict[str, Any] = {}
+        try:
+            if wonder_output:
+                partial_state["wonder_questions"] = list(wonder_output.questions)
+            if reflect_output:
+                partial_state["reflect_output"] = reflect_output.model_dump(mode="json")
+            if execution_output:
+                partial_state["execution_output"] = execution_output[:10_000]
+            if evaluation_summary:
+                partial_state["evaluation_summary"] = evaluation_summary.model_dump(mode="json")
+            if validation_output:
+                partial_state["validation_output"] = validation_output[:5_000]
+        except (TypeError, ValueError, KeyError):
+            logger.warning("evolution.generation.partial_state_build_failed", exc_info=True)
+
+        try:
+            try:
+                seed_json_str = json.dumps(current_seed.to_dict())
+            except (TypeError, AttributeError):
+                seed_json_str = None
+
+            await self.event_store.append(
+                lineage_generation_interrupted(
+                    lineage_id,
+                    generation_number,
+                    last_completed_phase=last_completed_phase,
+                    partial_state=partial_state or None,
+                    seed_json=seed_json_str,
+                )
+            )
+        except Exception:
+            logger.error(
+                "evolution.generation.interrupted_event_failed",
+                extra={
+                    "lineage_id": lineage_id,
+                    "generation": generation_number,
+                    "last_completed_phase": last_completed_phase,
+                },
+                exc_info=True,
+            )
+            logger.warning(
+                "evolution.generation.resume_may_fail: interrupted event was NOT persisted. "
+                "On next resume, this generation may restart from scratch."
+            )
+
+        return GenerationResult(
+            generation_number=generation_number,
+            seed=current_seed,
+            wonder_output=wonder_output,
+            reflect_output=reflect_output,
+            execution_output=execution_output,
+            evaluation_summary=evaluation_summary,
+            validation_output=validation_output,
+            phase=GenerationPhase.INTERRUPTED,
+            success=False,
+        )
 
     async def _run_generation_phases(
         self,
@@ -676,19 +1165,86 @@ class EvolutionaryLoop:
         current_seed: Seed,
         execute: bool = True,
         parallel: bool = True,
+        resume_after_phase: str | None = None,
+        execution_id: str | None = None,
     ) -> Result[GenerationResult, OuroborosError]:
         """Inner implementation of _run_generation with all phase logic.
 
         Separated from _run_generation to allow CancelledError guard at the
         outer level without deeply nesting the entire method body.
+
+        Args:
+            resume_after_phase: If set, skip phases that were already completed
+                before interruption. Phase order: wondering → reflecting →
+                seeding → executing → evaluating.
         """
+        # Phase ordering for resume skip logic
+        _PHASE_ORDER = ["wondering", "reflecting", "seeding", "executing", "evaluating"]
+
+        def _should_skip(phase: str) -> bool:
+            """Return True if this phase was already completed before interruption."""
+            if resume_after_phase is None:
+                return False
+            try:
+                return _PHASE_ORDER.index(phase) <= _PHASE_ORDER.index(resume_after_phase)
+            except ValueError:
+                return False
+
         wonder_output: WonderOutput | None = None
         reflect_output: ReflectOutput | None = None
         ontology_delta: OntologyDelta | None = None
+        restored_execution_output: str | None = None
+        restored_evaluation_summary: EvaluationSummary | None = None
+        restored_validation_output: str | None = None
+
+        # Restore partial state from interrupted generation if resuming
+        if resume_after_phase and lineage.generations:
+            interrupted_gen = next(
+                (
+                    g
+                    for g in reversed(lineage.generations)
+                    if g.phase == GenerationPhase.INTERRUPTED
+                ),
+                None,
+            )
+            if interrupted_gen and interrupted_gen.partial_state:
+                ps = interrupted_gen.partial_state
+                if _should_skip("wondering") and ps.get("wonder_questions"):
+                    wonder_output = WonderOutput(
+                        questions=tuple(ps["wonder_questions"]),
+                        should_continue=True,
+                    )
+                if _should_skip("reflecting") and ps.get("reflect_output"):
+                    try:
+                        reflect_output = ReflectOutput.model_validate(ps["reflect_output"])
+                    except Exception as e:
+                        logger.warning(
+                            "evolution.resume.reflect_output_restore_failed",
+                            extra={"error": str(e)},
+                        )
+                if _should_skip("executing") and ps.get("execution_output"):
+                    restored_execution_output = ps["execution_output"]
+                if _should_skip("evaluating") and ps.get("evaluation_summary"):
+                    try:
+                        restored_evaluation_summary = EvaluationSummary.model_validate(
+                            ps["evaluation_summary"]
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "evolution.resume.evaluation_summary_restore_failed",
+                            extra={"error": str(e)},
+                        )
+                if _should_skip("evaluating") and ps.get("validation_output"):
+                    restored_validation_output = ps["validation_output"]
 
         # Gen 2+: Wonder and Reflect phases
         if generation_number > 1 and lineage.generations:
-            prev_gen = lineage.generations[-1]
+            # Use last COMPLETED generation for context (evaluation, execution output).
+            # The tail may be an interrupted/failed record which lacks these fields.
+            prev_gen = next(
+                (g for g in reversed(lineage.generations) if g.phase == GenerationPhase.COMPLETED),
+                lineage.generations[-1],  # fallback if no completed gen exists
+            )
 
             # Emit generation started
             await self.event_store.append(
@@ -699,17 +1255,22 @@ class EvolutionaryLoop:
                 )
             )
 
-            # Wonder phase
-            if self.wonder_engine:
+            # Wonder phase (skip if already completed before interruption)
+            if self.wonder_engine and not _should_skip("wondering"):
                 wonder_result = await self.wonder_engine.wonder(
                     current_ontology=current_seed.ontology_schema,
                     evaluation_summary=prev_gen.evaluation_summary,
                     execution_output=prev_gen.execution_output,
                     lineage=lineage,
+                    seed=current_seed,
                 )
                 if wonder_result.is_ok:
                     wonder_output = wonder_result.value
-                    if not wonder_output.should_continue:
+                    if not wonder_output.should_continue and not wonder_output.questions:
+                        # Only early-return if Wonder has NO questions at all.
+                        # If questions exist, we must continue to Reflect even if
+                        # should_continue=false, because the questions represent
+                        # ontological gaps that need to be addressed.
                         logger.info("evolution.wonder.nothing_to_learn")
                         return Result.ok(
                             GenerationResult(
@@ -719,6 +1280,15 @@ class EvolutionaryLoop:
                                 phase=GenerationPhase.COMPLETED,
                                 success=True,
                             )
+                        )
+                    if not wonder_output.should_continue and wonder_output.questions:
+                        logger.warning(
+                            "evolution.wonder.continue_override",
+                            extra={
+                                "generation": generation_number,
+                                "question_count": len(wonder_output.questions),
+                                "reason": "Wonder said stop but has unanswered questions",
+                            },
                         )
                 else:
                     # Wonder degraded - emit event but continue
@@ -730,30 +1300,129 @@ class EvolutionaryLoop:
                         )
                     )
 
-            # Reflect phase
-            if self.reflect_engine and wonder_output and prev_gen.evaluation_summary:
-                reflect_result = await self.reflect_engine.reflect(
-                    current_seed=current_seed,
-                    execution_output=prev_gen.execution_output or "",
-                    evaluation_summary=prev_gen.evaluation_summary,
-                    wonder_output=wonder_output,
-                    lineage=lineage,
-                )
+            # Check for graceful shutdown after Wonder phase
+            post_wonder_phase = (
+                GenerationPhase.WONDERING.value if wonder_output is not None else None
+            )
+            interrupted = await self._check_shutdown(
+                lineage.lineage_id,
+                generation_number,
+                post_wonder_phase,
+                current_seed,
+                wonder_output=wonder_output,
+            )
+            if interrupted:
+                return Result.ok(interrupted)
 
-                if reflect_result.is_err:
-                    await self.event_store.append(
-                        lineage_generation_failed(
-                            lineage.lineage_id,
-                            generation_number,
-                            GenerationPhase.REFLECTING.value,
-                            str(reflect_result.error),
-                        )
+            # Phase transition: wondering → reflecting
+            await self.event_store.append(
+                lineage_generation_phase_changed(
+                    lineage.lineage_id,
+                    generation_number,
+                    GenerationPhase.REFLECTING.value,
+                )
+            )
+
+            # Reflect phase (with retry on parse failure)
+            # Skip if already completed before interruption
+            if (
+                self.reflect_engine
+                and wonder_output
+                and prev_gen.evaluation_summary
+                and not _should_skip("reflecting")
+            ):
+                max_reflect_attempts = 2
+                for attempt in range(max_reflect_attempts):
+                    reflect_result = await self.reflect_engine.reflect(
+                        current_seed=current_seed,
+                        execution_output=prev_gen.execution_output or "",
+                        evaluation_summary=prev_gen.evaluation_summary,
+                        wonder_output=wonder_output,
+                        lineage=lineage,
                     )
-                    return Result.err(OuroborosError(f"Reflect failed: {reflect_result.error}"))
+
+                    if reflect_result.is_ok:
+                        break
+
+                    if attempt < max_reflect_attempts - 1:
+                        logger.warning(
+                            "evolution.reflect.retry",
+                            extra={
+                                "generation": generation_number,
+                                "attempt": attempt + 1,
+                                "error": str(reflect_result.error),
+                            },
+                        )
+                    else:
+                        await self.event_store.append(
+                            lineage_generation_failed(
+                                lineage.lineage_id,
+                                generation_number,
+                                GenerationPhase.REFLECTING.value,
+                                str(reflect_result.error),
+                            )
+                        )
+                        return Result.err(
+                            OuroborosError(
+                                f"Reflect failed after {max_reflect_attempts} attempts: {reflect_result.error}"
+                            )
+                        )
 
                 reflect_output = reflect_result.value
 
-                # Generate evolved seed
+                # Warn if Reflect produced no ontology mutations despite Wonder questions
+                if wonder_output.questions and not reflect_output.ontology_mutations:
+                    logger.warning(
+                        "evolution.reflect.empty_mutations",
+                        extra={
+                            "generation": generation_number,
+                            "wonder_question_count": len(wonder_output.questions),
+                        },
+                    )
+
+                # Check for graceful shutdown after Reflect phase
+                interrupted = await self._check_shutdown(
+                    lineage.lineage_id,
+                    generation_number,
+                    GenerationPhase.REFLECTING.value,
+                    current_seed,
+                    wonder_output=wonder_output,
+                    reflect_output=reflect_output,
+                )
+                if interrupted:
+                    return Result.ok(interrupted)
+
+            # Seed generation — outside Reflect block so it runs even when
+            # Reflect is skipped on resume (resume_after_phase="reflecting")
+            # When seeding is skipped on resume, still compute ontology_delta
+            # so lineage.ontology.evolved events are emitted consistently.
+            if reflect_output and _should_skip("seeding"):
+                # Seeding was already done before interruption; compute delta
+                # from the previous generation's ontology to the current seed.
+                if lineage.generations:
+                    prev_completed = next(
+                        (
+                            g
+                            for g in reversed(lineage.generations)
+                            if g.phase == GenerationPhase.COMPLETED
+                        ),
+                        None,
+                    )
+                    if prev_completed:
+                        ontology_delta = OntologyDelta.compute(
+                            prev_completed.ontology_snapshot,
+                            current_seed.ontology_schema,
+                        )
+            elif reflect_output and not _should_skip("seeding"):
+                # Phase transition: reflecting → seeding
+                await self.event_store.append(
+                    lineage_generation_phase_changed(
+                        lineage.lineage_id,
+                        generation_number,
+                        GenerationPhase.SEEDING.value,
+                    )
+                )
+
                 if self.seed_generator:
                     seed_result = self.seed_generator.generate_from_reflect(
                         current_seed,
@@ -792,14 +1461,63 @@ class EvolutionaryLoop:
                 )
             )
 
+        # Check for graceful shutdown before executing.
+        # Derive the actual last completed phase from what ran:
+        # - reflect_output set → seeding completed
+        # - wonder_output set but no reflect → only wondering completed
+        # - neither → Gen 1 or no prior phases ran
+        if reflect_output is not None:
+            pre_exec_phase = GenerationPhase.SEEDING.value
+        elif wonder_output is not None:
+            pre_exec_phase = GenerationPhase.WONDERING.value
+        else:
+            pre_exec_phase = None  # Gen 1: no phase completed yet
+        interrupted = await self._check_shutdown(
+            lineage.lineage_id,
+            generation_number,
+            pre_exec_phase,
+            current_seed,
+            wonder_output=wonder_output,
+            reflect_output=reflect_output,
+        )
+        if interrupted:
+            return Result.ok(interrupted)
+
+        # Phase transition: → executing
+        await self.event_store.append(
+            lineage_generation_phase_changed(
+                lineage.lineage_id,
+                generation_number,
+                GenerationPhase.EXECUTING.value,
+            )
+        )
+
         # Execute phase (placeholder - actual execution via OrchestratorRunner)
-        execution_output: str | None = None
-        if execute and self.executor:
+        # Skip if already completed before interruption (use restored output)
+        execution_output: str | None = restored_execution_output
+        if execution_output and _should_skip("executing"):
+            logger.info(
+                "evolution.generation.execution_restored_from_checkpoint",
+                extra={"generation": generation_number},
+            )
+        elif execute and self.executor:
             try:
-                exec_result = await self.executor(current_seed, parallel=parallel)
+                exec_result = await self._call_executor(
+                    current_seed,
+                    parallel=parallel,
+                    execution_id=execution_id,
+                )
                 if hasattr(exec_result, "is_ok") and exec_result.is_ok:
                     orch_result = exec_result.value
-                    execution_output = getattr(orch_result, "final_message", str(orch_result))
+                    summary = getattr(orch_result, "summary", {})
+                    verification_report = (
+                        summary.get("verification_report") if isinstance(summary, dict) else None
+                    )
+                    execution_output = (
+                        verification_report
+                        if isinstance(verification_report, str) and verification_report
+                        else getattr(orch_result, "final_message", str(orch_result))
+                    )
                     # Log structured metadata for observability
                     logger.info(
                         "evolution.generation.executed",
@@ -834,8 +1552,14 @@ class EvolutionaryLoop:
                 return Result.err(OuroborosError(f"Execution error: {e}"))
 
         # Validate phase - reconcile parallel execution artifacts
-        validation_output: str | None = None
-        if execute and execution_output and self.validator:
+        # Skip if restored from checkpoint (resume after evaluating)
+        validation_output: str | None = restored_validation_output
+        if validation_output and _should_skip("evaluating"):
+            logger.info(
+                "evolution.generation.validation_restored_from_checkpoint",
+                extra={"generation": generation_number},
+            )
+        elif execute and execution_output and self.validator:
             try:
                 validation_result = await self.validator(current_seed, execution_output)
                 if isinstance(validation_result, str):
@@ -847,10 +1571,16 @@ class EvolutionaryLoop:
                         validation_output = f"Validation error: {validation_result.error}"
                 else:
                     validation_output = str(validation_result)
-                logger.info(
-                    "evolution.generation.validated",
-                    extra={"generation": generation_number},
-                )
+                if validation_output and "skipped" in validation_output.lower():
+                    logger.warning(
+                        "evolution.generation.validation_skipped",
+                        extra={"generation": generation_number, "output": validation_output},
+                    )
+                else:
+                    logger.info(
+                        "evolution.generation.validated",
+                        extra={"generation": generation_number},
+                    )
             except Exception as e:
                 logger.warning(
                     "evolution.validation.failed",
@@ -858,9 +1588,37 @@ class EvolutionaryLoop:
                 )
                 validation_output = f"Validation skipped: {e}"
 
+        # Check for graceful shutdown after executing
+        interrupted = await self._check_shutdown(
+            lineage.lineage_id,
+            generation_number,
+            GenerationPhase.EXECUTING.value,
+            current_seed,
+            wonder_output=wonder_output,
+            reflect_output=reflect_output,
+            execution_output=execution_output,
+        )
+        if interrupted:
+            return Result.ok(interrupted)
+
+        # Phase transition: → evaluating
+        await self.event_store.append(
+            lineage_generation_phase_changed(
+                lineage.lineage_id,
+                generation_number,
+                GenerationPhase.EVALUATING.value,
+            )
+        )
+
         # Evaluate phase (placeholder - actual evaluation via EvaluationPipeline)
-        evaluation_summary: EvaluationSummary | None = None
-        if execute and self.evaluator:
+        # Skip if already completed before interruption (use restored summary)
+        evaluation_summary: EvaluationSummary | None = restored_evaluation_summary
+        if evaluation_summary and _should_skip("evaluating"):
+            logger.info(
+                "evolution.generation.evaluation_restored_from_checkpoint",
+                extra={"generation": generation_number},
+            )
+        elif execute and self.evaluator:
             try:
                 eval_result = await self.evaluator(current_seed, execution_output)
                 if hasattr(eval_result, "is_ok") and eval_result.is_ok:
@@ -872,6 +1630,44 @@ class EvolutionaryLoop:
                     "evolution.evaluation.failed",
                     extra={"error": str(e), "generation": generation_number},
                 )
+
+        # Measure drift after evaluation
+        if execution_output:
+            try:
+                drift_measurement = DriftMeasurement()
+                drift_metrics = drift_measurement.measure(
+                    current_output=execution_output,
+                    constraint_violations=[],
+                    current_concepts=[],
+                    seed=current_seed,
+                )
+                drift_event = DriftMeasuredEvent(
+                    execution_id=lineage.lineage_id,
+                    seed_id=current_seed.metadata.seed_id,
+                    iteration=generation_number,
+                    metrics=drift_metrics,
+                )
+                await self.event_store.append(drift_event)
+            except Exception as e:
+                logger.warning(
+                    "evolution.drift.measurement_failed",
+                    extra={"error": str(e), "generation": generation_number},
+                )
+
+        # Check for graceful shutdown after evaluating
+        interrupted = await self._check_shutdown(
+            lineage.lineage_id,
+            generation_number,
+            GenerationPhase.EVALUATING.value,
+            current_seed,
+            wonder_output=wonder_output,
+            reflect_output=reflect_output,
+            execution_output=execution_output,
+            evaluation_summary=evaluation_summary,
+            validation_output=validation_output,
+        )
+        if interrupted:
+            return Result.ok(interrupted)
 
         return Result.ok(
             GenerationResult(

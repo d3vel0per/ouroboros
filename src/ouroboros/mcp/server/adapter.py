@@ -8,19 +8,24 @@ handling, and server lifecycle.
 import asyncio
 from collections.abc import Sequence
 import inspect
+import keyword
 import os
+from pathlib import Path
+import re
 from typing import Any
 
 import structlog
 
 from ouroboros.core.types import Result
+from ouroboros.events.io import new_call_id
+from ouroboros.events.io_recorder import IOJournalRecorder, use_io_journal_recorder
 from ouroboros.mcp.errors import (
     MCPResourceNotFoundError,
     MCPServerError,
     MCPToolError,
 )
 from ouroboros.mcp.server.protocol import PromptHandler, ResourceHandler, ToolHandler
-from ouroboros.mcp.server.security import AuthConfig, RateLimitConfig, SecurityLayer
+from ouroboros.mcp.server.security import AuthConfig, AuthMethod, RateLimitConfig, SecurityLayer
 from ouroboros.mcp.types import (
     MCPCapabilities,
     MCPPromptDefinition,
@@ -32,8 +37,104 @@ from ouroboros.mcp.types import (
     MCPToolResult,
     ToolInputType,
 )
+from ouroboros.orchestrator.agent_runtime_context import AgentRuntimeContext
+from ouroboros.orchestrator.control_bus import ControlBus, ControlBusDrainError
 
 log = structlog.get_logger(__name__)
+
+VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse", "streamable-http"})
+
+
+def _is_single_segment_resource_uri(uri: str) -> bool:
+    """Return True for base URIs like ``scheme://name``."""
+    _scheme, separator, rest = uri.partition("://")
+    if not separator:
+        return "/" not in uri
+    return "/" not in rest
+
+
+def _safe_cwd() -> Path:
+    """Return cwd if it looks like a usable project directory, else fall back to home.
+
+    Some launchers can spawn the MCP server with ``cwd=/``, which is not a
+    writable project root. This helper centralises the fallback so every
+    consumer inside ``create_ouroboros_server`` uses the same safe directory.
+    """
+    cwd = Path.cwd()
+    if cwd == Path("/") or not os.access(cwd, os.W_OK):
+        return Path.home()
+    return cwd
+
+
+def _default_interview_state_dir() -> Path:
+    """Return the global interview state directory for MCP handlers."""
+    from ouroboros.config.models import get_config_dir
+
+    return get_config_dir() / "data"
+
+
+def _string_argument(arguments: dict[str, Any], *names: str) -> str | None:
+    """Return the first non-empty string argument among *names*."""
+    for name in names:
+        value = arguments.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _int_argument(arguments: dict[str, Any], *names: str) -> int | None:
+    """Return the first integer argument among *names*."""
+    for name in names:
+        value = arguments.get(name)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def validate_transport(transport: str) -> str:
+    """Normalize and validate a transport string.
+
+    Returns the lowercased transport if valid, raises ValueError otherwise.
+    """
+    transport = transport.lower().replace("_", "-")
+    if transport not in VALID_TRANSPORTS:
+        msg = f"Invalid transport {transport!r}. Must be one of: {', '.join(sorted(VALID_TRANSPORTS))}"
+        raise ValueError(msg)
+    return transport
+
+
+def _extract_feedback_metadata_from_artifact(artifact: str) -> tuple[Any, ...]:
+    """Extract structured feedback metadata emitted inside execution artifacts."""
+    import json
+    import re
+
+    from ouroboros.core.lineage import FeedbackMetadata
+
+    matches = re.findall(r"^Feedback Metadata JSON:\s*(\{.+\})$", artifact, flags=re.MULTILINE)
+    if not matches:
+        return ()
+
+    feedback_items: list[FeedbackMetadata] = []
+    for payload in matches:
+        try:
+            parsed = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        raw_feedback = parsed.get("feedback_metadata")
+        if not isinstance(raw_feedback, list):
+            continue
+
+        for item in raw_feedback:
+            if not isinstance(item, dict):
+                continue
+            try:
+                feedback_items.append(FeedbackMetadata.model_validate(item))
+            except Exception:
+                continue
+
+    return tuple(feedback_items)
+
 
 # Map MCPToolParameter types to Python annotations for FastMCP schema inference.
 _TOOL_TYPE_MAP: dict[ToolInputType, type] = {
@@ -56,13 +157,50 @@ def _build_tool_signature(parameters: tuple[MCPToolParameter, ...]) -> inspect.S
     By setting __signature__ with explicit parameters, FastMCP generates the
     correct schema and clients can send flat argument dicts.
     """
+    signature, _ = _build_tool_signature_with_aliases(parameters)
+    return signature
+
+
+def _to_safe_signature_name(name: str) -> str:
+    """Return a valid Python identifier for a tool parameter name."""
+    if name.isidentifier() and not keyword.iskeyword(name):
+        return name
+
+    # Replace invalid characters with underscore and avoid starting with a digit.
+    sanitized = re.sub(r"[^0-9a-zA-Z_]", "_", name)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    if not sanitized or sanitized[0].isdigit():
+        sanitized = f"_{sanitized or 'param'}"
+
+    if keyword.iskeyword(sanitized):
+        sanitized = f"_{sanitized}"
+
+    return sanitized
+
+
+def _build_tool_signature_with_aliases(
+    parameters: tuple[MCPToolParameter, ...],
+) -> tuple[inspect.Signature, dict[str, str]]:
+    """Build signature plus map from schema args to original MCP parameter names."""
+
     sig_params = []
+    alias_counts: dict[str, int] = {}
+    alias_to_original: dict[str, str] = {}
+
     for p in parameters:
+        parameter_name = _to_safe_signature_name(p.name)
+        alias_count = alias_counts.get(parameter_name, 0) + 1
+        alias_counts[parameter_name] = alias_count
+        if alias_count > 1:
+            parameter_name = f"{parameter_name}_{alias_count}"
+
+        alias_to_original[parameter_name] = p.name
+
         python_type = _TOOL_TYPE_MAP.get(p.type, Any)
         if p.required:
             sig_params.append(
                 inspect.Parameter(
-                    name=p.name,
+                    name=parameter_name,
                     kind=inspect.Parameter.KEYWORD_ONLY,
                     annotation=python_type,
                 )
@@ -71,13 +209,104 @@ def _build_tool_signature(parameters: tuple[MCPToolParameter, ...]) -> inspect.S
             default = p.default if p.default is not None else None
             sig_params.append(
                 inspect.Parameter(
-                    name=p.name,
+                    name=parameter_name,
                     kind=inspect.Parameter.KEYWORD_ONLY,
                     default=default,
                     annotation=python_type | None,
                 )
             )
-    return inspect.Signature(parameters=sig_params)
+
+    return inspect.Signature(parameters=sig_params), alias_to_original
+
+
+_PROJECT_ROOT_MARKERS = (
+    # VCS (most universal — nearly every project has one)
+    ".git",
+    # Python
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    # Node.js
+    "package.json",
+    # Rust
+    "Cargo.toml",
+    # Go
+    "go.mod",
+    # Java / Kotlin
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    # Ruby
+    "Gemfile",
+    # PHP
+    "composer.json",
+)
+
+
+def _looks_like_project_root(path: object) -> bool:
+    """Return True when the given path looks like a project root."""
+    from pathlib import Path
+
+    if not isinstance(path, Path):
+        return False
+
+    return any((path / marker).exists() for marker in _PROJECT_ROOT_MARKERS)
+
+
+def _project_dir_from_seed(seed: Any) -> str | None:
+    """Extract a likely project directory from seed metadata or brownfield context."""
+    if seed is None:
+        return None
+
+    seed_meta = getattr(seed, "metadata", None)
+    if seed_meta:
+        project_dir = getattr(seed_meta, "project_dir", None) or getattr(
+            seed_meta,
+            "working_directory",
+            None,
+        )
+        if project_dir:
+            return str(project_dir)
+
+    brownfield_context = getattr(seed, "brownfield_context", None)
+    context_references = getattr(brownfield_context, "context_references", ()) or ()
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        role = getattr(reference, "role", None)
+        if isinstance(path, str) and path and role == "primary":
+            return path
+
+    for reference in context_references:
+        path = getattr(reference, "path", None)
+        if isinstance(path, str) and path:
+            return path
+
+    return None
+
+
+def _project_dir_from_artifact(artifact: str) -> str | None:
+    """Extract a likely project root from Write/Edit/File tool output."""
+    from pathlib import Path
+    import re
+
+    # Match quoted paths (spaces allowed) and unquoted paths.
+    # Examples:  Write: /foo/bar.py  |  File: "/path with spaces/bar.py"
+    write_matches: list[str] = []
+    for m in re.finditer(r'(?:Write|Edit|File): (?:"([^"]+)"|(.+))', artifact):
+        path_candidate = m.group(1) or m.group(2)
+        if path_candidate:
+            write_matches.append(path_candidate.strip())
+    for path_str in write_matches:
+        candidate = Path(path_str).parent
+        for _ in range(10):
+            if _looks_like_project_root(candidate):
+                return str(candidate)
+            if candidate == candidate.parent:
+                break
+            candidate = candidate.parent
+
+    return None
 
 
 class MCPServerAdapter:
@@ -122,6 +351,8 @@ class MCPServerAdapter:
         self._resource_handlers: dict[str, ResourceHandler] = {}
         self._prompt_handlers: dict[str, PromptHandler] = {}
         self._mcp_server: Any = None
+        self._owned_resources: list[Any] = []  # objects with async close()
+        self._runtime_context: AgentRuntimeContext | None = None
 
         # Initialize security layer
         self._security = SecurityLayer(
@@ -167,6 +398,25 @@ class MCPServerAdapter:
         for defn in handler.definitions:
             self._resource_handlers[defn.uri] = handler
             log.info("mcp.server.resource_registered", uri=defn.uri)
+
+    def _find_resource_handler(self, uri: str) -> ResourceHandler | None:
+        """Find a resource handler by exact URI or registered base URI prefix."""
+        exact_handler = self._resource_handlers.get(uri)
+        if exact_handler is not None:
+            return exact_handler
+
+        matching_base_uri = max(
+            (
+                registered_uri
+                for registered_uri in self._resource_handlers
+                if uri.startswith(f"{registered_uri}/")
+            ),
+            key=len,
+            default=None,
+        )
+        if matching_base_uri is None:
+            return None
+        return self._resource_handlers[matching_base_uri]
 
     def register_prompt(self, handler: PromptHandler) -> None:
         """Register a prompt handler.
@@ -245,8 +495,19 @@ class MCPServerAdapter:
             return Result.err(security_result.error)
 
         try:
-            timeout = getattr(handler, "TIMEOUT_SECONDS", 30.0)
-            result = await asyncio.wait_for(handler.handle(arguments), timeout=timeout)
+            timeout = getattr(handler, "TIMEOUT_SECONDS", None)
+
+            async def invoke_handler() -> Result[MCPToolResult, MCPServerError]:
+                if timeout is not None and timeout > 0:
+                    return await asyncio.wait_for(handler.handle(arguments), timeout=timeout)
+                return await handler.handle(arguments)
+
+            recorder = self._io_recorder_for_tool_call(name, arguments)
+            if recorder is not None:
+                with use_io_journal_recorder(recorder):
+                    result = await invoke_handler()
+            else:
+                result = await invoke_handler()
             return result
         except TimeoutError:
             log.error("mcp.server.tool_timeout", tool=name)
@@ -279,7 +540,7 @@ class MCPServerAdapter:
         Returns:
             Result containing the resource content or an error.
         """
-        handler = self._resource_handlers.get(uri)
+        handler = self._find_resource_handler(uri)
         if not handler:
             return Result.err(
                 MCPResourceNotFoundError(
@@ -351,18 +612,50 @@ class MCPServerAdapter:
         Uses the MCP SDK's FastMCP server implementation.
 
         Args:
-            transport: Transport type - "stdio" or "sse".
-            host: Host to bind to (SSE only).
-            port: Port to bind to (SSE only).
+            transport: Transport type - "stdio", "sse", or "streamable-http"
+                (case-insensitive).
+            host: Host to bind to for network transports. Defaults to "localhost".
+            port: Port to bind to for network transports. Defaults to 8080.
+
+        Raises:
+            ValueError: If transport is invalid or incompatible with security config.
         """
+        transport = validate_transport(transport)
+
+        # FastMCP transport cannot provide credentials or client identity
+        if self._security.auth_config.method != AuthMethod.NONE:
+            msg = (
+                f"FastMCP transport does not support authentication. "
+                f"Configured auth method: {self._security.auth_config.method.value}. "
+                f"All tool calls will be rejected. Use AuthMethod.NONE for FastMCP transports."
+            )
+            raise ValueError(msg)
+
+        if self._security.rate_limit_config.enabled:
+            msg = (
+                "FastMCP transport does not support rate limiting "
+                "(requires client identity). Configured rate_limit_config.enabled=True "
+                "will have no effect. Disable rate limiting for FastMCP transports."
+            )
+            raise ValueError(msg)
+
         try:
             from mcp.server.fastmcp import FastMCP
         except ImportError as e:
-            msg = "mcp package not installed. Install with: pip install mcp"
+            msg = "mcp package not installed. Install with: pip install 'ouroboros-ai[mcp]'"
             raise ImportError(msg) from e
 
-        # Create FastMCP server
-        self._mcp_server = FastMCP(self._name)
+        # Pass host/port at construction time for network transports — FastMCP
+        # reads these from its internal settings, so the run_* method alone
+        # won't pick them up.
+        if transport in {"sse", "streamable-http"}:
+            self._mcp_server = FastMCP(
+                self._name,
+                host=host,
+                port=port,
+            )
+        else:
+            self._mcp_server = FastMCP(self._name)
 
         # Register tools with FastMCP
         for _name, handler in self._tool_handlers.items():
@@ -378,7 +671,23 @@ class MCPServerAdapter:
                         and isinstance(kwargs["kwargs"], dict)
                     ):
                         kwargs = kwargs["kwargs"]
-                    result = await h.handle(kwargs)
+
+                    _, alias_to_original = _build_tool_signature_with_aliases(
+                        h.definition.parameters,
+                    )
+                    normalized_kwargs: dict[str, Any] = {}
+                    for alias_key, original_key in alias_to_original.items():
+                        if alias_key in kwargs:
+                            normalized_kwargs[original_key] = kwargs[alias_key]
+                    for key, value in kwargs.items():
+                        normalized_kwargs.setdefault(key, value)
+
+                    # Route through call_tool() to enforce security checks.
+                    # FastMCP does not provide credentials, so:
+                    # - Input validation is enforced
+                    # - Auth/authorization will reject if any auth method configured
+                    # - Rate limiting cannot apply (requires client_id)
+                    result = await self.call_tool(h.definition.name, normalized_kwargs)
                     if result.is_ok:
                         # Convert MCPToolResult to FastMCP format
                         tool_result = result.value
@@ -416,6 +725,24 @@ class MCPServerAdapter:
             wrapper = _make_resource_wrapper(res_handler, uri)
             self._mcp_server.resource(uri)(wrapper)
 
+            if _is_single_segment_resource_uri(uri):
+
+                def _make_resource_template_wrapper(h: ResourceHandler, base_uri: str) -> Any:
+                    async def resource_template_wrapper(resource_id: str) -> str:
+                        resource_uri = f"{base_uri}/{resource_id}"
+                        result = await h.handle(resource_uri)
+                        if result.is_ok:
+                            content = result.value
+                            return content.text or ""
+                        else:
+                            raise RuntimeError(str(result.error))
+
+                    return resource_template_wrapper
+
+                template = f"{uri}/{{resource_id}}"
+                template_wrapper = _make_resource_template_wrapper(res_handler, uri)
+                self._mcp_server.resource(template)(template_wrapper)
+
         log.info(
             "mcp.server.starting",
             name=self._name,
@@ -423,16 +750,106 @@ class MCPServerAdapter:
             resources=len(self._resource_handlers),
         )
 
+        # Log sandbox environment for diagnostics.  Note: CODEX_SANDBOX_
+        # NETWORK_DISABLED=1 does NOT necessarily block MCP-spawned child
+        # processes — Codex may grant MCP servers a different seatbelt
+        # profile than shell commands.
+        if os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED") == "1":
+            log.info(
+                "mcp.server.sandbox_env_detected",
+                detail=(
+                    "CODEX_SANDBOX_NETWORK_DISABLED=1 detected. "
+                    "MCP-spawned agent runtimes may still have network "
+                    "access. If they fail, consider running the parent "
+                    "Codex with --sandbox danger-full-access."
+                ),
+            )
+
         # Run the server with the appropriate transport
         if transport == "sse":
-            await self._mcp_server.run_sse_async(host=host, port=port)
+            await self._mcp_server.run_sse_async()
+        elif transport == "streamable-http":
+            await self._mcp_server.run_streamable_http_async()
         else:
             await self._mcp_server.run_stdio_async()
 
+    @property
+    def runtime_context(self) -> AgentRuntimeContext | None:
+        """Return the session-scoped runtime context owned by this server."""
+        return self._runtime_context
+
+    def set_runtime_context(self, context: AgentRuntimeContext) -> None:
+        """Attach the session-scoped runtime context to the server object graph."""
+        self._runtime_context = context
+
+    def register_owned_resource(self, resource: Any) -> None:
+        """Register a resource whose ``close()`` will be called on shutdown."""
+        self._owned_resources.append(resource)
+
+    def _io_recorder_for_tool_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> IOJournalRecorder | None:
+        """Build a per-MCP-call recorder for shared LLM adapters."""
+        context = self._runtime_context
+        if context is None:
+            return None
+        event_store = getattr(context, "event_store", None)
+        if event_store is None:
+            return None
+
+        session_id = _string_argument(arguments, "session_id", "qa_session_id")
+        execution_id = _string_argument(arguments, "execution_id")
+        lineage_id = _string_argument(arguments, "lineage_id")
+        generation_number = _int_argument(arguments, "generation_number", "generation")
+        phase = _string_argument(arguments, "phase", "current_phase")
+
+        if execution_id is not None:
+            target_type = "execution"
+            target_id = execution_id
+        elif lineage_id is not None:
+            target_type = "lineage"
+            target_id = lineage_id
+        elif session_id is not None:
+            target_type = "session"
+            target_id = session_id
+        else:
+            target_type = "mcp_tool"
+            target_id = f"{name}:{new_call_id()}"
+
+        return IOJournalRecorder(
+            event_store=event_store,
+            target_type=target_type,
+            target_id=target_id,
+            session_id=session_id,
+            execution_id=execution_id,
+            lineage_id=lineage_id,
+            generation_number=generation_number,
+            phase=phase,
+        )
+
     async def shutdown(self) -> None:
-        """Shutdown the server gracefully."""
+        """Shutdown the server gracefully, closing owned resources."""
         log.info("mcp.server.shutdown", name=self._name)
-        # FastMCP handles its own shutdown when run_async completes
+        for resource in self._owned_resources:
+            close_fn = getattr(resource, "close", None)
+            if callable(close_fn):
+                try:
+                    await close_fn()
+                except ControlBusDrainError:
+                    log.error(
+                        "mcp.server.control_bus_close_failed",
+                        resource=type(resource).__name__,
+                    )
+                    raise
+                except Exception as exc:
+                    log.warning(
+                        "mcp.server.resource_close_failed",
+                        resource=type(resource).__name__,
+                        error=str(exc),
+                    )
+        self._owned_resources.clear()
 
 
 def create_ouroboros_server(
@@ -442,7 +859,12 @@ def create_ouroboros_server(
     auth_config: AuthConfig | None = None,
     rate_limit_config: RateLimitConfig | None = None,
     event_store: Any | None = None,
+    brownfield_store: Any | None = None,
     state_dir: Any | None = None,
+    runtime_backend: str | None = None,
+    llm_backend: str | None = None,
+    opencode_mode: str | None = None,
+    mcp_bridge: Any | None = None,
 ) -> MCPServerAdapter:
     """Create an Ouroboros MCP server with all tools and dependencies wired.
 
@@ -463,53 +885,113 @@ def create_ouroboros_server(
         auth_config: Optional authentication configuration.
         rate_limit_config: Optional rate limiting configuration.
         event_store: Optional EventStore instance. If not provided, creates default.
+        brownfield_store: Optional BrownfieldStore instance for shared brownfield
+            MCP access. If not provided, handlers create their own store.
         state_dir: Optional pathlib.Path for interview state directory.
-                   If not provided, uses ~/.ouroboros/data.
+                   If not provided, uses ``get_config_dir() / "data"``
+                   (typically ``~/.ouroboros/data``).
+        runtime_backend: Optional orchestrator runtime backend override.
+        llm_backend: Optional LLM-only backend override.
+        opencode_mode: Optional OpenCode integration mode (``"plugin"`` or
+            ``"subprocess"``). When None, resolved from
+            ``orchestrator.opencode_mode`` in the config file. Controls
+            whether ``_subagent`` envelopes are emitted (plugin) or handlers
+            run in-process (subprocess / non-opencode runtimes).
 
     Returns:
-        Configured MCPServerAdapter with all 10 tools registered.
+        Configured MCPServerAdapter with all tools registered.
 
     Raises:
         ImportError: If MCP SDK is not installed.
     """
-    # Import tool definitions
-    from pathlib import Path
-
     from rich.console import Console
 
     # Import service dependencies
     from ouroboros.bigbang.interview import InterviewEngine
     from ouroboros.bigbang.seed_generator import SeedGenerator
+    from ouroboros.config import (
+        get_assertion_extraction_model,
+        get_clarification_model,
+        get_runtime_controls_config,
+        get_semantic_model,
+    )
     from ouroboros.evaluation import (
         EvaluationContext,
         EvaluationPipeline,
         PipelineConfig,
+        SemanticConfig,
     )
+    from ouroboros.mcp.job_manager import JobManager
+    from ouroboros.mcp.resources.handlers import (
+        EventsResourceHandler,
+        SeedsResourceHandler,
+        SessionsResourceHandler,
+    )
+    from ouroboros.mcp.tools.brownfield_handler import BrownfieldHandler
     from ouroboros.mcp.tools.definitions import (
         ACDashboardHandler,
+        ACTreeHUDHandler,
+        AutoHandler,
+        CancelExecutionHandler,
+        CancelJobHandler,
         EvaluateHandler,
         EvolveRewindHandler,
         EvolveStepHandler,
         ExecuteSeedHandler,
         GenerateSeedHandler,
         InterviewHandler,
+        JobResultHandler,
+        JobStatusHandler,
+        JobWaitHandler,
         LateralThinkHandler,
         LineageStatusHandler,
         MeasureDriftHandler,
         QueryEventsHandler,
         SessionStatusHandler,
+        StartEvolveStepHandler,
+        StartExecuteSeedHandler,
     )
+    from ouroboros.mcp.tools.pm_handler import PMInterviewHandler
     from ouroboros.mcp.tools.qa import QAHandler
     from ouroboros.mcp.tools.registry import ToolRegistry
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
+    from ouroboros.orchestrator import create_agent_runtime, resolve_agent_runtime_backend
     from ouroboros.orchestrator.runner import (
         OrchestratorRunner,
     )
-    from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
+    from ouroboros.providers import create_llm_adapter
 
-    # Create LLM adapter (shared across services)
-    # Default to ClaudeCodeAdapter — uses Max Plan auth, no API key needed.
-    llm_adapter = ClaudeCodeAdapter(max_turns=1)
+    resolved_runtime_backend = resolve_agent_runtime_backend(runtime_backend)
+
+    # Resolve opencode_mode from config file if caller did not pass one.
+    # Controls _subagent envelope dispatch gate in every handler.
+    if opencode_mode is None:
+        from ouroboros.config import get_opencode_mode
+
+        opencode_mode = get_opencode_mode()
+
+    # Resolve a safe working directory once so all consumers agree.
+    # When the MCP server is spawned with cwd=/, Path.cwd() is unusable as a
+    # project root, so _safe_cwd() falls back to $HOME.
+    effective_cwd = _safe_cwd()
+
+    # Materialize the default runtime once at server creation so backend wiring
+    # is validated up front and composition-root tests can assert the selected
+    # runtime backend without waiting for a tool invocation.
+    create_agent_runtime(
+        backend=resolved_runtime_backend,
+        model=None,
+        cwd=effective_cwd,
+        llm_backend=llm_backend,
+    )
+
+    # Create shared LLM adapter for interview/seed paths.
+    # Evaluation constructs its own adapter with higher max_turns — see
+    # EvaluateHandler.handle in mcp/tools/evaluation_handlers.py.
+    llm_adapter = create_llm_adapter(
+        backend=llm_backend,
+        max_turns=1,
+        cwd=effective_cwd,
+    )
 
     # Create or use provided EventStore
     if event_store is None:
@@ -518,17 +1000,22 @@ def create_ouroboros_server(
         event_store = EventStore()
 
     # Create state directory for interviews
-    if state_dir is None:
-        state_dir = Path.home() / ".ouroboros" / "data"
-        state_dir.mkdir(parents=True, exist_ok=True)
+    state_dir_path = (
+        _default_interview_state_dir() if state_dir is None else Path(state_dir).expanduser()
+    )
+    state_dir_path.mkdir(parents=True, exist_ok=True)
 
     # Create core service instances
     interview_engine = InterviewEngine(
         llm_adapter=llm_adapter,
-        state_dir=state_dir,
+        state_dir=state_dir_path,
+        model=get_clarification_model(llm_backend),
     )
 
-    seed_generator = SeedGenerator(llm_adapter=llm_adapter)
+    seed_generator = SeedGenerator(
+        llm_adapter=llm_adapter,
+        model=get_clarification_model(llm_backend),
+    )
 
     # Create evolution engines for evolve_step
     from ouroboros.core.lineage import ACResult, EvaluationSummary
@@ -539,42 +1026,42 @@ def create_ouroboros_server(
     from ouroboros.verification.extractor import AssertionExtractor
     from ouroboros.verification.verifier import SpecVerifier
 
-    wonder_model = os.environ.get("OUROBOROS_WONDER_MODEL")  # None → use engine's fallback
-    reflect_model = os.environ.get("OUROBOROS_REFLECT_MODEL")  # None → use engine's fallback
+    def fresh_llm_adapter():
+        return create_llm_adapter(
+            backend=llm_backend if llm_backend is not None else None,
+            max_turns=1,
+            cwd=effective_cwd,
+        )
+
     wonder_engine = WonderEngine(
         llm_adapter=llm_adapter,
-        **({"model": wonder_model} if wonder_model else {}),
+        adapter_factory=fresh_llm_adapter,
+        adapter_backend=llm_backend,
     )
     reflect_engine = ReflectEngine(
         llm_adapter=llm_adapter,
-        **({"model": reflect_model} if reflect_model else {}),
+        adapter_factory=fresh_llm_adapter,
+        adapter_backend=llm_backend,
     )
 
     # Wire real execution/evaluation callables for evolve_step so that
     # generation quality is validated, not only ontology deltas.
     # Use Sonnet for execution (frugal) — Opus is overkill for code generation.
-    execution_model = os.environ.get("OUROBOROS_EXECUTION_MODEL", "claude-sonnet-4-6")
-    agent_adapter = ClaudeAgentAdapter(
-        permission_mode="acceptEdits",
-        model=execution_model,
-    )
+    execution_model = os.environ.get("OUROBOROS_EXECUTION_MODEL")
+    if execution_model is None and resolved_runtime_backend == "claude":
+        execution_model = "claude-sonnet-4-6"
     # Use stderr console: in MCP stdio mode, stdout is the JSON-RPC channel.
     # Any non-protocol output on stdout corrupts the MCP communication.
-    evolution_runner = OrchestratorRunner(
-        adapter=agent_adapter,
-        event_store=event_store,
-        console=Console(stderr=True),
-        debug=False,
-        enable_decomposition=True,
-    )
+    # Stage 1 (mechanical checks: lint/build/test) can be enabled via env var.
+    # Disabled by default to reduce latency per generation step.
+    evolve_stage1 = os.environ.get("OUROBOROS_EVOLVE_STAGE1", "false").lower() == "true"
     evolution_eval_pipeline = EvaluationPipeline(
         llm_adapter=llm_adapter,
-        # Stage 1 is intentionally disabled here to avoid running full
-        # mechanical checks on every generation step.
         config=PipelineConfig(
-            stage1_enabled=False,
+            stage1_enabled=evolve_stage1,
             stage2_enabled=True,
             stage3_enabled=False,
+            semantic=SemanticConfig(model=get_semantic_model(llm_backend)),
         ),
     )
     evolution_store_initialized = False
@@ -590,11 +1077,38 @@ def create_ouroboros_server(
                 await event_store.initialize()
                 evolution_store_initialized = True
 
-    async def _evolution_executor(seed: Any, *, parallel: bool = True) -> Any:
+    async def _evolution_executor(
+        seed: Any,
+        *,
+        parallel: bool = True,
+        execution_id: str | None = None,
+    ) -> Any:
         await _ensure_evolution_store_initialized()
+        task_cwd = evolutionary_loop.get_project_dir()
+        runner_adapter = create_agent_runtime(
+            backend=resolved_runtime_backend,
+            model=execution_model,
+            cwd=task_cwd or effective_cwd,
+            llm_backend=llm_backend,
+        )
+        _evo_mcp_manager = mcp_bridge.manager if mcp_bridge is not None else None
+        _evo_mcp_prefix = (
+            mcp_bridge.tool_prefix
+            if mcp_bridge is not None and hasattr(mcp_bridge, "tool_prefix")
+            else ""
+        )
+        evolution_runner = OrchestratorRunner(
+            adapter=runner_adapter,
+            event_store=event_store,
+            console=Console(stderr=True),
+            mcp_manager=_evo_mcp_manager,
+            mcp_tool_prefix=_evo_mcp_prefix,
+            debug=False,
+            enable_decomposition=True,
+        )
         return await evolution_runner.execute_seed(
             seed=seed,
-            execution_id=None,
+            execution_id=execution_id,
             parallel=parallel,
         )
 
@@ -616,6 +1130,7 @@ def create_ouroboros_server(
             return None
 
         seed_acs = getattr(seed, "acceptance_criteria", None) or ()
+        feedback_metadata = _extract_feedback_metadata_from_artifact(artifact)
 
         ac_results: list[ACResult] = []
         for ac_num_str, status, description in ac_line_matches:
@@ -651,30 +1166,30 @@ def create_ouroboros_server(
             drift_score=1.0 - score,
             failure_reason=failure_reason,
             ac_results=tuple(ac_results),
+            feedback_metadata=feedback_metadata,
         )
 
-    spec_extractor = AssertionExtractor(llm_adapter=llm_adapter)
+    spec_extractor = AssertionExtractor(
+        llm_adapter=llm_adapter,
+        model=get_assertion_extraction_model(llm_backend),
+    )
 
-    def _extract_project_dir(artifact: str) -> str | None:
-        """Extract project directory from execution output.
+    def _extract_project_dir(artifact: str, seed: Any = None) -> str | None:
+        """Resolve project directory from explicit config, seed context, or artifacts."""
+        configured_project_dir = evolutionary_loop.get_project_dir()
+        if configured_project_dir:
+            return configured_project_dir
 
-        Looks for Write/Edit file paths and walks up to find project root.
-        """
-        from pathlib import Path
-        import re
+        seed_project_dir = _project_dir_from_seed(seed)
+        if seed_project_dir:
+            return seed_project_dir
 
-        write_matches = re.findall(r"(?:Write|Edit): (/[^\s]+)", artifact)
-        if not write_matches:
-            return None
+        artifact_project_dir = _project_dir_from_artifact(artifact)
+        if artifact_project_dir:
+            return artifact_project_dir
 
-        for path_str in write_matches:
-            candidate = Path(path_str).parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    return str(candidate)
-                if candidate == candidate.parent:
-                    break
-                candidate = candidate.parent
+        if _looks_like_project_root(effective_cwd):
+            return str(effective_cwd)
 
         return None
 
@@ -688,7 +1203,7 @@ def create_ouroboros_server(
         Returns a corrected EvaluationSummary if discrepancies are detected,
         or None if no override is needed (verification passed or unavailable).
         """
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         if not project_dir:
             return None
 
@@ -807,7 +1322,7 @@ def create_ouroboros_server(
             current_ac = "Verify execution output meets requirements"
 
         # Collect file-based artifacts for richer evaluation
-        project_dir = _extract_project_dir(artifact)
+        project_dir = _extract_project_dir(artifact, seed=seed)
         artifact_bundle = ArtifactCollector().collect(artifact, project_dir)
 
         eval_context = EvaluationContext(
@@ -838,10 +1353,11 @@ def create_ouroboros_server(
             highest_stage_passed=max(1, result.highest_stage_completed),
             score=stage2.score if stage2 else None,
             drift_score=stage2.drift_score if stage2 else None,
+            reward_hacking_risk=stage2.reward_hacking_risk if stage2 else None,
             failure_reason=result.failure_reason,
         )
 
-    async def _evolution_validator(_seed: Any, execution_output: str | None) -> str:
+    async def _evolution_validator(seed: Any, execution_output: str | None) -> str:
         """Validate and reconcile code generated by parallel AC execution.
 
         After parallel ACs generate code independently, inconsistencies
@@ -855,21 +1371,15 @@ def create_ouroboros_server(
         import re
         import subprocess  # noqa: S404  # nosec
 
-        # Extract project directory from execution output
-        # The parallel executor writes to the project directory referenced in the seed
-        project_dir = None
-        write_matches = re.findall(r"Write: (/[^\s]+)", execution_output or "")
-        if write_matches:
-            paths = [Path(p) for p in write_matches]
-            # Walk up from the first written file to find a dir with pyproject.toml or setup.py
-            candidate = paths[0].parent
-            for _ in range(10):
-                if (candidate / "pyproject.toml").exists() or (candidate / "setup.py").exists():
-                    project_dir = str(candidate)
-                    break
-                candidate = candidate.parent
+        project_dir = _extract_project_dir(execution_output or "", seed=seed)
 
         if not project_dir:
+            log.warning(
+                "evolution.validation.skipped",
+                reason="could not determine project directory",
+                has_seed_metadata=_project_dir_from_seed(seed) is not None,
+                execution_output_length=len(execution_output) if execution_output else 0,
+            )
             return "Validation skipped: could not determine project directory"
 
         # Detect the correct Python binary (prefer project venv over system)
@@ -890,10 +1400,14 @@ def create_ouroboros_server(
 
         max_attempts = 3
         # Use Sonnet for validation fixes — import error resolution doesn't need Opus
-        validation_model = os.environ.get("OUROBOROS_VALIDATION_MODEL", "claude-sonnet-4-6")
-        validation_adapter = ClaudeAgentAdapter(
-            permission_mode="acceptEdits",
+        validation_model = os.environ.get("OUROBOROS_VALIDATION_MODEL")
+        if validation_model is None and resolved_runtime_backend == "claude":
+            validation_model = "claude-sonnet-4-6"
+        validation_adapter = create_agent_runtime(
+            backend=resolved_runtime_backend,
             model=validation_model,
+            cwd=project_dir,
+            llm_backend=llm_backend,
         )
 
         for attempt in range(1, max_attempts + 1):
@@ -957,7 +1471,7 @@ def create_ouroboros_server(
 
     evolutionary_loop = EvolutionaryLoop(
         event_store=event_store,
-        config=EvolutionaryLoopConfig(),
+        config=EvolutionaryLoopConfig(runtime_controls=get_runtime_controls_config()),
         wonder_engine=wonder_engine,
         reflect_engine=reflect_engine,
         seed_generator=seed_generator,
@@ -965,18 +1479,87 @@ def create_ouroboros_server(
         evaluator=_evolution_evaluator,
         validator=_evolution_validator,
     )
+    job_manager = JobManager(event_store)
 
     # Create tool registry for dependency injection
     registry = ToolRegistry()
 
     # Create and register tool handlers with injected dependencies
+    execute_seed = ExecuteSeedHandler(
+        event_store=event_store,
+        llm_adapter=llm_adapter,
+        agent_runtime_backend=resolved_runtime_backend,
+        opencode_mode=opencode_mode,
+        llm_backend=llm_backend,
+    )
+    evolve_step = EvolveStepHandler(
+        evolutionary_loop=evolutionary_loop,
+        event_store=event_store,
+        agent_runtime_backend=resolved_runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+    auto_mcp_manager = mcp_bridge.manager if mcp_bridge is not None else None
+    auto_mcp_prefix = (
+        mcp_bridge.tool_prefix
+        if mcp_bridge is not None and hasattr(mcp_bridge, "tool_prefix")
+        else ""
+    )
+
     tool_handlers = [
-        ExecuteSeedHandler(
+        execute_seed,
+        StartExecuteSeedHandler(
+            execute_handler=execute_seed,
             event_store=event_store,
-            llm_adapter=llm_adapter,
+            job_manager=job_manager,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        AutoHandler(
+            interview_handler=InterviewHandler(
+                event_store=event_store,
+                llm_adapter=llm_adapter,
+                llm_backend=llm_backend,
+                agent_runtime_backend=resolved_runtime_backend,
+                opencode_mode=opencode_mode,
+            ),
+            generate_seed_handler=GenerateSeedHandler(
+                event_store=event_store,
+                llm_adapter=llm_adapter,
+                llm_backend=llm_backend,
+                agent_runtime_backend=resolved_runtime_backend,
+                opencode_mode=opencode_mode,
+            ),
+            start_execute_seed_handler=StartExecuteSeedHandler(
+                execute_handler=execute_seed,
+                event_store=event_store,
+                job_manager=job_manager,
+                agent_runtime_backend=resolved_runtime_backend,
+                opencode_mode=opencode_mode,
+            ),
+            llm_backend=llm_backend,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
+            mcp_manager=auto_mcp_manager,
+            mcp_tool_prefix=auto_mcp_prefix,
         ),
         SessionStatusHandler(
             event_store=event_store,
+        ),
+        JobStatusHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        JobWaitHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        JobResultHandler(
+            event_store=event_store,
+            job_manager=job_manager,
+        ),
+        CancelJobHandler(
+            event_store=event_store,
+            job_manager=job_manager,
         ),
         QueryEventsHandler(
             event_store=event_store,
@@ -985,6 +1568,10 @@ def create_ouroboros_server(
             interview_engine=interview_engine,
             seed_generator=seed_generator,
             llm_adapter=llm_adapter,
+            llm_backend=llm_backend,
+            event_store=event_store,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
         ),
         MeasureDriftHandler(
             event_store=event_store,
@@ -992,14 +1579,37 @@ def create_ouroboros_server(
         InterviewHandler(
             interview_engine=interview_engine,
             event_store=event_store,
+            llm_adapter=llm_adapter,
+            llm_backend=llm_backend,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
         ),
+        PMInterviewHandler(
+            data_dir=state_dir_path,
+            llm_adapter=llm_adapter,
+            llm_backend=llm_backend,
+            event_store=event_store,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        BrownfieldHandler(_store=brownfield_store),
         EvaluateHandler(
             event_store=event_store,
-            llm_adapter=llm_adapter,
+            llm_backend=llm_backend,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
         ),
-        LateralThinkHandler(),
-        EvolveStepHandler(
-            evolutionary_loop=evolutionary_loop,
+        LateralThinkHandler(
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        evolve_step,
+        StartEvolveStepHandler(
+            evolve_handler=evolve_step,
+            event_store=event_store,
+            job_manager=job_manager,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
         ),
         LineageStatusHandler(
             event_store=event_store,
@@ -1010,9 +1620,25 @@ def create_ouroboros_server(
         ACDashboardHandler(
             event_store=event_store,
         ),
+        ACTreeHUDHandler(
+            event_store=event_store,
+        ),
         QAHandler(
             llm_adapter=llm_adapter,
+            llm_backend=llm_backend,
+            event_store=event_store,
+            agent_runtime_backend=resolved_runtime_backend,
+            opencode_mode=opencode_mode,
         ),
+        CancelExecutionHandler(
+            event_store=event_store,
+        ),
+    ]
+
+    resource_handlers = [
+        SeedsResourceHandler(),
+        SessionsResourceHandler(event_store=event_store),
+        EventsResourceHandler(event_store=event_store),
     ]
 
     # Create server adapter
@@ -1023,16 +1649,60 @@ def create_ouroboros_server(
         rate_limit_config=rate_limit_config,
     )
 
+    # Build the AgentRuntimeContext that #474 funnels through every
+    # handler. For now the context only exposes the EventStore, the
+    # backend labels, the optional MCP bridge, and a fresh ControlBus
+    # for #515. Subsequent migration slices move handler internals to
+    # consume context.mcp_bridge directly instead of self.mcp_manager.
+    control_bus = ControlBus()
+    agent_runtime_context = AgentRuntimeContext(
+        event_store=event_store,
+        runtime_backend=resolved_runtime_backend,
+        llm_backend=llm_backend,
+        mcp_bridge=mcp_bridge,
+        control=control_bus,
+    )
+    server.set_runtime_context(agent_runtime_context)
+
+    # Close the reactive control surface before stores/bridges it may
+    # reference from subscriber tasks.
+    server.register_owned_resource(control_bus)
+    server.register_owned_resource(event_store)
+    if brownfield_store is not None:
+        server.register_owned_resource(brownfield_store)
+
+    # Inject the bridge from the runtime context into every
+    # BridgeAwareMixin handler. ``inject_runtime_context`` is byte-
+    # equivalent to the legacy ``inject_bridge`` for the same bridge —
+    # the swap is purely about giving every handler a single funnel
+    # (the context) instead of the per-handler ``mcp_manager`` plumbing
+    # this PR series is replacing.
+    if mcp_bridge is not None:
+        from ouroboros.mcp.tools.bridge_mixin import inject_runtime_context
+
+        injected = [
+            type(h).__name__
+            for h in tool_handlers
+            if inject_runtime_context(h, agent_runtime_context)
+        ]
+        if injected:
+            log.info("mcp.bridge.injected", handlers=injected)
+        server.register_owned_resource(mcp_bridge)
+
     # Register all tools with the server
     for handler in tool_handlers:
         server.register_tool(handler)
         registry.register(handler, category="ouroboros")
+
+    for handler in resource_handlers:
+        server.register_resource(handler)
 
     log.info(
         "mcp.server.composition_root_complete",
         name=name,
         version=version,
         tools_registered=len(tool_handlers),
+        resources_registered=len(resource_handlers),
         tool_names=[h.definition.name for h in tool_handlers],
     )
 

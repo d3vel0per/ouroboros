@@ -83,7 +83,8 @@ class SessionSelectorScreen(Screen[None]):
                 table.add_row("[dim]No sessions found in the database.[/dim]")
                 return
 
-            # Deduplicate and collect session info
+            # Replay events chronologically to reconstruct session state.
+            # Events arrive ASC so later events naturally overwrite status.
             self._session_info = {}
             for event in sessions:
                 agg_id = event.aggregate_id
@@ -95,11 +96,20 @@ class SessionSelectorScreen(Screen[None]):
                         "timestamp": event.timestamp,
                         "status": "started",
                     }
+                # Always update seed_goal/execution_id when present
+                if event.data.get("seed_goal"):
+                    self._session_info[agg_id]["seed_goal"] = event.data["seed_goal"]
+                if event.data.get("execution_id"):
+                    self._session_info[agg_id]["execution_id"] = event.data["execution_id"]
+                # Track latest activity time for sorting
+                self._session_info[agg_id]["timestamp"] = event.timestamp
                 # Update status based on event type
                 if "completed" in event.type:
                     self._session_info[agg_id]["status"] = "completed"
                 elif "failed" in event.type:
                     self._session_info[agg_id]["status"] = "failed"
+                elif "cancelled" in event.type:
+                    self._session_info[agg_id]["status"] = "cancelled"
                 elif "paused" in event.type:
                     self._session_info[agg_id]["status"] = "paused"
 
@@ -126,6 +136,7 @@ class SessionSelectorScreen(Screen[None]):
                     "started": "[yellow]running[/yellow]",
                     "completed": "[green]done[/green]",
                     "failed": "[red]failed[/red]",
+                    "cancelled": "[yellow]cancelled[/yellow]",
                     "paused": "[cyan]paused[/cyan]",
                 }.get(status, status)
 
