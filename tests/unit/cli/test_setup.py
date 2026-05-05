@@ -211,7 +211,6 @@ class TestCodexSetup:
         assert "[profiles.ouroboros-deep]" in contents
         assert "[profiles.ouroboros-frontier]" in contents
 
-
     def test_register_codex_worker_profile_writes_section(self, tmp_path: Path) -> None:
         """First-time setup creates the [profiles.ouroboros-worker] block."""
         with patch("pathlib.Path.home", return_value=tmp_path):
@@ -403,7 +402,9 @@ class TestCodexSetup:
             patch("ouroboros.cli.commands.setup._install_codex_artifacts") as mock_install,
             patch("ouroboros.cli.commands.setup._register_codex_mcp_server") as mock_register,
             patch("ouroboros.cli.commands.setup._register_codex_default_profiles") as mock_profiles,
-            patch("ouroboros.cli.commands.setup._register_codex_worker_profile") as mock_worker_profile,
+            patch(
+                "ouroboros.cli.commands.setup._register_codex_worker_profile"
+            ) as mock_worker_profile,
             patch("ouroboros.cli.commands.setup.print_info") as mock_info,
         ):
             setup_cmd._setup_codex("/usr/local/bin/codex")

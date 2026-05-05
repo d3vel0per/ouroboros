@@ -1329,6 +1329,7 @@ class TestIntegration:
         frontier = config.economics.tiers["frontier"]
         assert frontier.cost_factor == 30
 
+
 class TestRuntimeProfileConfigAccess:
     def test_get_runtime_profile_defaults_to_none(self) -> None:
         """No env, no config — runtime_profile resolves to None."""
@@ -1376,4 +1377,3 @@ class TestRuntimeProfileConfigAccess:
         )
         with patch("ouroboros.config.loader.load_config", return_value=config):
             assert get_runtime_profile() is None
-

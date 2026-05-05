@@ -346,7 +346,6 @@ def _is_setup_managed_codex_mcp_entry(entry: dict[str, object]) -> bool:
     return len(args) >= 3 and args[-3:] == ["ouroboros", "mcp", "serve"]
 
 
-
 _CODEX_WORKER_PROFILE_SECTION = """# Ouroboros Agent OS runtime profile for Codex worker subprocesses.
 # Activated when ~/.ouroboros/config.yaml sets `orchestrator.runtime_profile.backend_profile: worker`
 # (or the OUROBOROS_RUNTIME_PROFILE=worker env var). Add per-worker Codex
@@ -427,6 +426,7 @@ def _upsert_codex_worker_profile_section(raw: str) -> tuple[str, bool]:
         output_lines.extend(section_lines)
 
     return "\n".join(output_lines).rstrip() + "\n", existed_before
+
 
 def _is_codex_ouroboros_table_header(line: str) -> bool:
     """Return True when the line starts the managed Codex MCP table."""
@@ -600,7 +600,6 @@ def _register_codex_default_profiles() -> None:
     print_success(f"Registered Codex task profiles in {codex_config}: {', '.join(added_profiles)}")
 
 
-
 def _register_codex_worker_profile() -> None:
     """Register the managed Codex worker profile in ~/.codex/config.toml."""
     import tomllib
@@ -628,6 +627,7 @@ def _register_codex_worker_profile() -> None:
         print_success(f"Updated Codex worker profile in {codex_config}")
     else:
         print_success(f"Registered Codex worker profile in {codex_config}")
+
 
 def _ensure_mapping_section(config_dict: dict, key: str) -> dict:
     """Ensure a top-level YAML section is a mapping before mutating it."""

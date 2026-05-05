@@ -658,6 +658,7 @@ class TestGetConfigDir:
         assert config_dir.parent == Path.home()
         assert config_dir.name == ".ouroboros"
 
+
 class TestRuntimeProfileConfig:
     def test_runtime_profile_backend_profile_accepts_future_values(self) -> None:
         profile = RuntimeProfileConfig(backend_profile="future-worker")
@@ -676,4 +677,3 @@ class TestRuntimeProfileConfig:
         config = OrchestratorConfig(runtime_profile="worker")
         assert config.runtime_profile is not None
         assert config.runtime_profile.backend_profile == "worker"
-
