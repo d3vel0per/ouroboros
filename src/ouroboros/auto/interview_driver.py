@@ -5,8 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+import inspect
 import re
 from typing import Protocol
+from uuid import uuid4
+
+import structlog
 
 from ouroboros.auto.answerer import (
     AutoAnswer,
@@ -20,6 +24,8 @@ from ouroboros.auto.ledger import LedgerStatus, SeedDraftLedger
 from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
 from ouroboros.auto.repo_context import repo_auto_answer_context
 from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore
+
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,8 +41,14 @@ class InterviewTurn:
 class InterviewBackend(Protocol):
     """Minimal backend interface needed by the auto interview driver."""
 
-    async def start(self, goal: str, *, cwd: str) -> InterviewTurn:
-        """Start an interview and return the first question."""
+    async def start(self, goal: str, *, cwd: str, interview_id: str | None = None) -> InterviewTurn:
+        """Start an interview and return the first question.
+
+        ``interview_id`` is an optional caller-supplied id.  Backends that
+        persist server-side state SHOULD honour it so a driver-level cancel
+        (e.g. ``asyncio.wait_for`` timeout) cannot leave the auto state with
+        an id that disagrees with the on-disk interview file.
+        """
 
     async def answer(self, session_id: str, answer: str) -> InterviewTurn:
         """Record an answer and return the next question or completion metadata."""
@@ -104,6 +116,12 @@ class AutoInterviewDriver:
         self._ensure_interview_phase(state)
         answer_context = self.context_provider(state.cwd)
         interview_tool_name = "interview.start"
+        # Pre-allocated interview id, kept local until we have evidence the
+        # backend actually persisted (or said it did).  Writing it onto
+        # ``state`` prematurely would point ``ooo auto --resume`` at a
+        # nonexistent session whenever the backend rejects the start
+        # outright (validation/config error).  See Q00/ouroboros#687.
+        preassigned_id: str | None = None
         try:
             if state.interview_session_id:
                 if state.pending_question:
@@ -123,23 +141,36 @@ class AutoInterviewDriver:
                     state.pending_question = turn.question
                     self._save(state)
             else:
+                preassigned_id = _generate_interview_id()
                 turn = _validate_turn(
                     await self._with_timeout(
-                        self.backend.start(state.goal, cwd=state.cwd),
+                        self.backend.start(state.goal, cwd=state.cwd, interview_id=preassigned_id),
                         state,
                         tool_name=interview_tool_name,
                     )
                 )
+                if turn.session_id != preassigned_id:
+                    # Misbehaving backend ignored the supplied id.  Trust
+                    # whatever id the backend actually returned; warn so
+                    # operators can spot the contract violation.
+                    log.warning(
+                        "auto.interview.backend_ignored_preassigned_id",
+                        preassigned_id=preassigned_id,
+                        backend_id=turn.session_id,
+                        auto_session_id=state.auto_session_id,
+                    )
                 state.interview_session_id = turn.session_id
                 state.pending_question = turn.question
                 self._save(state)
         except TimeoutError as exc:
+            self._record_evidence_based_session_id(state, exc, preassigned_id)
             state.mark_blocked(str(exc), tool_name=interview_tool_name)
             self._save(state)
             return AutoInterviewResult(
                 "blocked", state.interview_session_id, ledger, state.current_round, str(exc)
             )
         except Exception as exc:
+            self._record_evidence_based_session_id(state, exc, preassigned_id)
             action = "resume" if interview_tool_name == "interview.resume" else "start"
             blocker = f"interview {action} failed: {exc}"
             state.mark_blocked(blocker, tool_name=interview_tool_name)
@@ -300,6 +331,52 @@ class AutoInterviewDriver:
         # call site needing to remember to fire the callback.
         self._emit(state)
 
+    def _record_evidence_based_session_id(
+        self,
+        state: AutoPipelineState,
+        exc: BaseException,
+        preassigned_id: str | None,
+    ) -> None:
+        """Save an ``interview_session_id`` on auto state only with evidence.
+
+        Two evidence channels are accepted (Q00/ouroboros#687):
+
+        * ``PartialInterviewStartError`` carries a session id the handler
+          has explicitly confirmed as persisted.
+        * For ``asyncio.wait_for`` cancellations or other exceptions, the
+          driver may probe the backend via the optional
+          ``is_session_persisted`` method to see whether a file for the
+          pre-allocated id was written before the cancel.
+
+        Without one of these the auto state stays ``None`` so
+        ``ooo auto --resume`` cannot point at a nonexistent session.
+        """
+        if state.interview_session_id:
+            return
+        # Avoid coupling to the adapter module — local import keeps
+        # interview_driver importable on its own.
+        from ouroboros.auto.adapters import PartialInterviewStartError
+
+        if isinstance(exc, PartialInterviewStartError) and exc.session_id:
+            state.interview_session_id = exc.session_id
+            return
+        if not preassigned_id:
+            return
+        probe = getattr(self.backend, "is_session_persisted", None)
+        if probe is None:
+            return
+        try:
+            persisted = probe(preassigned_id)
+        except Exception as probe_exc:  # pragma: no cover - defensive
+            log.warning(
+                "auto.interview.persistence_probe_failed",
+                preassigned_id=preassigned_id,
+                error=str(probe_exc),
+            )
+            return
+        if persisted:
+            state.interview_session_id = preassigned_id
+
 
 class FunctionInterviewBackend:
     """Adapter for tests or local integrations built from callables."""
@@ -309,12 +386,18 @@ class FunctionInterviewBackend:
         start: Callable[[str, str], Awaitable[InterviewTurn]],
         answer: Callable[[str, str], Awaitable[InterviewTurn]],
         resume: Callable[[str], Awaitable[InterviewTurn]] | None = None,
+        is_session_persisted: Callable[[str], bool] | None = None,
     ) -> None:
         self._start = start
         self._answer = answer
         self._resume = resume
+        self._is_session_persisted = is_session_persisted
 
-    async def start(self, goal: str, *, cwd: str) -> InterviewTurn:
+    async def start(self, goal: str, *, cwd: str, interview_id: str | None = None) -> InterviewTurn:
+        # Forward ``interview_id`` only to callables that opt into the new
+        # contract; plain ``(goal, cwd)`` callables remain compatible.
+        if "interview_id" in inspect.signature(self._start).parameters:
+            return await self._start(goal, cwd, interview_id=interview_id)  # type: ignore[call-arg]
         return await self._start(goal, cwd)
 
     async def answer(self, session_id: str, answer: str) -> InterviewTurn:
@@ -325,6 +408,16 @@ class FunctionInterviewBackend:
             msg = "interview resume is unavailable because no pending question is persisted"
             raise RuntimeError(msg)
         return await self._resume(session_id)
+
+    def is_session_persisted(self, session_id: str) -> bool:
+        if self._is_session_persisted is None:
+            return False
+        return bool(self._is_session_persisted(session_id))
+
+
+def _generate_interview_id() -> str:
+    """Return a unique interview id matching the engine's plugin format."""
+    return f"interview_{uuid4().hex[:16]}"
 
 
 def _can_steer_with_gap_prompt(question: str) -> bool:

@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from ouroboros.auto.adapters import PartialInterviewStartError
 from ouroboros.auto.grading import GradeResult, SeedGrade
 from ouroboros.auto.interview_driver import (
     AutoInterviewDriver,
@@ -2558,3 +2559,182 @@ async def test_invalid_reconcile_on_complete_does_not_poison_future_resume(tmp_p
     assert plain_result.status == "complete"
     assert plain_result.blocker is None
     assert state.last_error is None
+
+
+# ---------------------------------------------------------------------------
+# Q00/ouroboros#687 — persist interview_session_id even when first-question
+# generation fails before the auto driver receives a turn.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_keeps_session_id_when_probe_confirms_persistence(
+    tmp_path,
+) -> None:
+    """Driver retains the pre-allocated id only when persistence is verifiable.
+
+    Models the issue's primary scenario: the driver's ``asyncio.wait_for``
+    cancels the backend mid-flight, but the engine has already persisted
+    the interview state.  The driver must consult ``is_session_persisted``
+    to confirm before saving the id on auto state.
+    """
+
+    received_ids: list[str | None] = []
+    persisted_ids: set[str] = set()
+
+    async def start(goal: str, cwd: str, *, interview_id: str | None = None) -> InterviewTurn:
+        received_ids.append(interview_id)
+        # Simulate engine.start_interview persisting before the cancel.
+        if interview_id:
+            persisted_ids.add(interview_id)
+        await asyncio.sleep(0.5)  # forces TimeoutError below
+        return InterviewTurn("never reached", interview_id or "fallback")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        raise AssertionError("answer must not run when start times out")
+
+    def is_persisted(session_id: str) -> bool:
+        return session_id in persisted_ids
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    store = AutoStore(tmp_path)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer, is_session_persisted=is_persisted),
+        store=store,
+        timeout_seconds=0.001,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.interview_session_id, "probe-confirmed id must be saved on auto state"
+    assert received_ids == [state.interview_session_id], (
+        "backend.start must receive the pre-allocated interview_id so the "
+        "persisted interview file matches auto state"
+    )
+
+    reloaded = store.load(state.auto_session_id)
+    assert reloaded is not None
+    assert reloaded.interview_session_id == state.interview_session_id
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_clears_session_id_when_backend_rejects_without_persistence(
+    tmp_path,
+) -> None:
+    """A plain rejection (validation/config error) must NOT pollute auto state.
+
+    Without an evidence channel (``PartialInterviewStartError`` carrying a
+    confirmed id, or a positive ``is_session_persisted`` probe) the driver
+    must leave ``interview_session_id`` unset so ``ooo auto --resume`` does
+    not chase a nonexistent interview file.
+    """
+
+    async def start(goal: str, cwd: str, *, interview_id: str | None = None) -> InterviewTurn:  # noqa: ARG001
+        raise RuntimeError("backend rejected start before persisting anything")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        raise AssertionError("answer must not run when start fails")
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    store = AutoStore(tmp_path)
+    # Probe always returns False — no on-disk evidence of persistence.
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer, is_session_persisted=lambda _id: False),
+        store=store,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    assert state.interview_session_id is None, (
+        "auto state must NOT retain the pre-allocated id without persistence evidence"
+    )
+    assert result.session_id is None
+
+    reloaded = store.load(state.auto_session_id)
+    assert reloaded is not None
+    assert reloaded.interview_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_persists_partial_session_id_on_start_failure(tmp_path) -> None:
+    """A handler-level partial-success error keeps the pre-allocated id on state."""
+
+    async def start(goal: str, cwd: str, *, interview_id: str | None = None) -> InterviewTurn:  # noqa: ARG001
+        # Real backends honour the supplied id; mirror that here.
+        assert interview_id, "driver must pre-allocate an id before backend.start"
+        raise PartialInterviewStartError(
+            "ouroboros_interview failed: Question generation failed: timed out",
+            session_id=interview_id,
+        )
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        raise AssertionError("answer must not be called when start fails")
+
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    store = AutoStore(tmp_path)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer),
+        store=store,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert result.status == "blocked"
+    assert state.phase == AutoPhase.BLOCKED
+    assert state.interview_session_id, "auto state must hold the pre-allocated session id"
+    assert result.session_id == state.interview_session_id
+
+    reloaded = store.load(state.auto_session_id)
+    assert reloaded is not None
+    assert reloaded.interview_session_id == state.interview_session_id
+
+
+@pytest.mark.asyncio
+async def test_interview_driver_resumes_existing_session_after_partial_failure(
+    tmp_path,
+) -> None:
+    """After a partial first-question failure resume must reuse the persisted id."""
+
+    persisted_session = "interview_partial_002"
+    state = AutoPipelineState(goal="Build a CLI", cwd=str(tmp_path))
+    state.transition(AutoPhase.INTERVIEW, "starting auto interview")
+    state.interview_session_id = persisted_session
+    state.pending_question = None
+
+    start_calls: list[tuple[str, str]] = []
+    resume_calls: list[str] = []
+
+    async def start(goal: str, cwd: str) -> InterviewTurn:
+        start_calls.append((goal, cwd))
+        raise AssertionError("start must not be called when a session is already persisted")
+
+    async def answer(session_id: str, text: str) -> InterviewTurn:  # noqa: ARG001
+        return InterviewTurn("done", session_id, seed_ready=True, completed=True)
+
+    async def resume(session_id: str) -> InterviewTurn:
+        resume_calls.append(session_id)
+        return InterviewTurn("Anything else?", session_id)
+
+    ledger = SeedDraftLedger.from_goal(state.goal)
+    _fill_ready(ledger)
+    driver = AutoInterviewDriver(
+        FunctionInterviewBackend(start, answer, resume),
+        store=AutoStore(tmp_path),
+        max_rounds=1,
+        timeout_seconds=1,
+    )
+
+    result = await driver.run(state, ledger)
+
+    assert resume_calls == [persisted_session]
+    assert not start_calls
+    assert result.session_id == persisted_session
+    assert state.interview_session_id == persisted_session
