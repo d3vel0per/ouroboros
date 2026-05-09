@@ -15,8 +15,11 @@ from ouroboros.auto.adapters import (
     load_seed,
     save_seed,
 )
+from ouroboros.auto.answerer import AutoAnswerContext
 from ouroboros.auto.interview_driver import AutoInterviewDriver
+from ouroboros.auto.ledger import REQUIRED_SECTIONS
 from ouroboros.auto.pipeline import AutoPipeline, AutoPipelineResult
+from ouroboros.auto.repo_context import repo_auto_answer_context
 from ouroboros.auto.resume_render import render_resume_lines
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.state import (
@@ -144,6 +147,18 @@ class AutoHandler:
                     ),
                     required=False,
                 ),
+                MCPToolParameter(
+                    "user_preferences",
+                    ToolInputType.OBJECT,
+                    (
+                        "Caller-supplied user preferences keyed by ledger section name "
+                        "(e.g. runtime_context, constraints, non_goals). The Driver "
+                        "tags matching answers with [from-auto][user_preference] in the "
+                        "ledger. Keys must be valid ledger section names; values must "
+                        "be non-empty strings."
+                    ),
+                    required=False,
+                ),
             ),
         )
 
@@ -188,6 +203,18 @@ class AutoHandler:
                 "pipeline_timeout_seconds cannot be changed on resume; the "
                 "original deadline is preserved across process restarts"
             )
+        # Distinguish "caller did not pass user_preferences" from "caller
+        # passed an empty mapping". Only validate/parse when the caller
+        # actually supplied the arg so a resume call can defer to persisted
+        # state without being forced to resupply.
+        user_preferences_supplied = (
+            "user_preferences" in arguments and arguments.get("user_preferences") is not None
+        )
+        supplied_user_preferences = (
+            _parse_user_preferences(arguments.get("user_preferences"))
+            if user_preferences_supplied
+            else {}
+        )
         if isinstance(resume, str) and resume:
             state = store.load(resume)
             cwd = state.cwd
@@ -201,6 +228,11 @@ class AutoHandler:
             max_interview_rounds = state.max_interview_rounds
             max_repair_rounds = state.max_repair_rounds
             skip_run = requested_skip_run or state.skip_run
+            # Resume contract: caller-supplied preferences override persisted
+            # ones; otherwise the original session's preferences are reused so
+            # the same input converges to the same Seed.
+            if user_preferences_supplied:
+                state.user_preferences = dict(supplied_user_preferences)
         else:
             goal = arguments.get("goal")
             if not isinstance(goal, str) or not goal.strip():
@@ -212,6 +244,7 @@ class AutoHandler:
             max_repair_rounds = _positive_int_arg(arguments, "max_repair_rounds", 5)
             skip_run = requested_skip_run
             state = AutoPipelineState(goal=goal.strip(), cwd=cwd)
+            state.user_preferences = dict(supplied_user_preferences)
             state.max_interview_rounds = max_interview_rounds
             state.max_repair_rounds = max_repair_rounds
             if pipeline_timeout_seconds is not None:
@@ -242,11 +275,13 @@ class AutoHandler:
             mcp_tool_prefix=self.mcp_tool_prefix,
         )
 
+        context_provider = _build_context_provider(dict(state.user_preferences))
         driver = AutoInterviewDriver(
             HandlerInterviewBackend(interview_handler, cwd=cwd),
             store=store,
             max_rounds=max_interview_rounds,
             timeout_seconds=state.phase_timeout_seconds(AutoPhase.INTERVIEW),
+            context_provider=context_provider,
         )
         pipeline = AutoPipeline(
             driver,
@@ -357,6 +392,50 @@ def _optional_pipeline_timeout(arguments: dict[str, Any]) -> float | None:
         )
         raise ValueError(msg)
     return timeout
+
+
+def _parse_user_preferences(value: object) -> dict[str, str]:
+    """Validate and normalise the optional ``user_preferences`` MCP arg.
+
+    Returns a dict keyed by ledger section names. Empty input yields an empty
+    dict. Any unknown section name or empty/non-string value is rejected with
+    ``ValueError`` so callers see a clear contract failure rather than a
+    silently-ignored preference.
+    """
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("user_preferences must be an object keyed by ledger section names")
+    if not value:
+        return {}
+    valid_sections = frozenset(REQUIRED_SECTIONS)
+    cleaned: dict[str, str] = {}
+    for raw_key, raw_val in value.items():
+        if not isinstance(raw_key, str):
+            raise ValueError("user_preferences keys must be strings")
+        if raw_key not in valid_sections:
+            raise ValueError(
+                f"user_preferences key '{raw_key}' is not a valid ledger section "
+                f"(allowed: {', '.join(sorted(valid_sections))})"
+            )
+        if not isinstance(raw_val, str) or not raw_val.strip():
+            raise ValueError(f"user_preferences['{raw_key}'] must be a non-empty string")
+        cleaned[raw_key] = raw_val.strip()
+    return cleaned
+
+
+def _build_context_provider(user_preferences: dict[str, str]):
+    """Return a context_provider that augments repo context with user preferences."""
+
+    def provider(cwd: str) -> AutoAnswerContext:
+        base = repo_auto_answer_context(cwd)
+        return AutoAnswerContext(
+            repo_facts=base.repo_facts,
+            evidence=base.evidence,
+            user_preferences=user_preferences,
+        )
+
+    return provider
 
 
 def _positive_int_arg(arguments: dict[str, Any], name: str, default: int) -> int:
