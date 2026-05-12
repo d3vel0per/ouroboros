@@ -9,6 +9,7 @@ import pytest
 from ouroboros.orchestrator.profile_loader import (
     ExecutionProfile,
     ProfileError,
+    VerifierCapability,
     available_profiles,
     load_profile,
 )
@@ -27,6 +28,7 @@ class TestBuiltinProfiles:
         assert profile.axis
         assert profile.min_unit
         assert profile.verifier_focus
+        assert isinstance(profile.verifier_capability, VerifierCapability)
 
     def test_available_lists_all_builtins(self) -> None:
         discovered = available_profiles()
@@ -37,14 +39,17 @@ class TestBuiltinProfiles:
         profile = load_profile("code")
         assert "tests_passed" in profile.evidence_schema.required
         assert "Read" in profile.suggested_tools
+        assert profile.verifier_capability is VerifierCapability.SUBPROCESS_TEST_RUNNER
 
     def test_research_profile_requires_triangulation(self) -> None:
         profile = load_profile("research")
         assert "triangulated_sources" in profile.evidence_schema.required
+        assert profile.verifier_capability is VerifierCapability.READ_ONLY_DISCOVERY
 
     def test_analysis_profile_requires_perspectives(self) -> None:
         profile = load_profile("analysis")
         assert "perspectives_compared" in profile.evidence_schema.required
+        assert profile.verifier_capability is VerifierCapability.READ_ONLY_DISCOVERY
 
 
 class TestSchemaValidation:
@@ -64,11 +69,22 @@ class TestSchemaValidation:
         with pytest.raises(ProfileError, match="schema validation"):
             load_profile("broken", profiles_dir=tmp_path)
 
+    def test_verifier_capability_is_required(self, tmp_path: Path) -> None:
+        self._write(
+            tmp_path,
+            "missing_capability",
+            "profile: missing_capability\naxis: x\nmin_unit: y\nverifier_focus: z\n",
+        )
+        with pytest.raises(ProfileError, match="verifier_capability"):
+            load_profile("missing_capability", profiles_dir=tmp_path)
+
     def test_extra_field_rejected(self, tmp_path: Path) -> None:
         self._write(
             tmp_path,
             "extra",
-            ("profile: extra\naxis: x\nmin_unit: y\nverifier_focus: z\nunknown_field: oops\n"),
+            (
+                "profile: extra\naxis: x\nmin_unit: y\nverifier_capability: read_only_discovery\nverifier_focus: z\nunknown_field: oops\n"
+            ),
         )
         with pytest.raises(ProfileError, match="schema validation"):
             load_profile("extra", profiles_dir=tmp_path)
@@ -77,7 +93,7 @@ class TestSchemaValidation:
         self._write(
             tmp_path,
             "alpha",
-            "profile: beta\naxis: x\nmin_unit: y\nverifier_focus: z\n",
+            "profile: beta\naxis: x\nmin_unit: y\nverifier_capability: read_only_discovery\nverifier_focus: z\n",
         )
         with pytest.raises(ProfileError, match="name mismatch"):
             load_profile("alpha", profiles_dir=tmp_path)
@@ -129,7 +145,7 @@ class TestIoErrorNormalization:
 
         path = tmp_path / "locked.yaml"
         path.write_text(
-            "profile: locked\naxis: x\nmin_unit: y\nverifier_focus: z\n",
+            "profile: locked\naxis: x\nmin_unit: y\nverifier_capability: read_only_discovery\nverifier_focus: z\n",
             encoding="utf-8",
         )
         path.chmod(0)
