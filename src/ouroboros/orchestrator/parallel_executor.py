@@ -224,27 +224,57 @@ def _runtime_messages_support_file_claim(
         resolved.relative_to(base)
     except ValueError:
         return False
-    if any(_runtime_message_supports_file_reference(value, message) for message in messages):
+    if any(
+        _runtime_message_supports_file_reference(value, message, messages=messages, index=index)
+        for index, message in enumerate(messages)
+    ):
         return True
     if not resolved.exists():
         return False
     basename = candidate.name.strip().lower()
     return bool(basename) and any(
-        _runtime_message_supports_file_reference(basename, message) for message in messages
+        _runtime_message_supports_file_reference(
+            basename,
+            message,
+            messages=messages,
+            index=index,
+            allow_bash_command_text=False,
+        )
+        for index, message in enumerate(messages)
     )
 
 
-def _runtime_message_supports_file_reference(reference: str, message: AgentMessage) -> bool:
+def _runtime_message_supports_file_reference(
+    reference: str,
+    message: AgentMessage,
+    *,
+    messages: tuple[AgentMessage, ...],
+    index: int,
+    allow_bash_command_text: bool = True,
+) -> bool:
     """Return True when one message plausibly reports touching a file reference."""
     normalized_reference = reference.strip().lower()
     if not normalized_reference:
         return False
-    text = _runtime_message_search_text(message)
-    reference_pattern = re.compile(rf"(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-])")
+    text = _runtime_message_file_proof_text(message)
+    if message.tool_name == "Bash":
+        return _text_supports_file_mutation_reference(text, normalized_reference) or (
+            allow_bash_command_text
+            and _bash_command_mutates_file_reference(message, normalized_reference)
+            and _runtime_message_has_following_success(messages, index)
+        )
+    if message.tool_name in {"Edit", "Write", "NotebookEdit"}:
+        return bool(text and _file_reference_pattern(normalized_reference).search(text))
+    return _text_supports_file_mutation_reference(text, normalized_reference)
+
+
+def _text_supports_file_mutation_reference(text: str, normalized_reference: str) -> bool:
+    """Return True when text pairs a file reference with mutation language."""
+    if not text:
+        return False
+    reference_pattern = _file_reference_pattern(normalized_reference)
     if not reference_pattern.search(text):
         return False
-    if message.tool_name in {"Edit", "Write", "NotebookEdit"}:
-        return True
     return bool(
         re.search(
             rf"(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-]).*\b("
@@ -255,6 +285,93 @@ def _runtime_message_supports_file_reference(reference: str, message: AgentMessa
             text,
         )
     )
+
+
+def _file_reference_pattern(normalized_reference: str) -> re.Pattern[str]:
+    """Return a conservative token pattern for a workspace-relative file reference."""
+    return re.compile(rf"(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-])")
+
+
+def _bash_command_mutates_file_reference(message: AgentMessage, normalized_reference: str) -> bool:
+    """Return True for explicit shell writes to the referenced file.
+
+    Bash command text is only trusted when the command itself carries mutation
+    semantics for the claimed file. This preserves direct shell-edit evidence
+    such as ``touch src/generated.py`` or ``printf ... > src/generated.py``
+    without allowing read-only probes like ``grep updated src/generated.py`` to
+    prove ``files_touched`` merely by containing a path and a mutation word.
+    """
+    tool_input = message.data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    normalized_command = command.strip().lower()
+    if not normalized_command:
+        return False
+    if not _file_reference_pattern(normalized_reference).search(normalized_command):
+        return False
+    quoted_reference = rf"['\"]?{re.escape(normalized_reference)}['\"]?"
+    if re.search(rf"(^|[\s;&|])(?:\d?>|&>|>>|\d>>)\s*{quoted_reference}", normalized_command):
+        return True
+    return bool(
+        re.search(
+            rf"(^|[\s;&|])(touch|truncate|tee)\b[^;&|]*\s{quoted_reference}(?=$|[\s;&|])",
+            normalized_command,
+        )
+        or re.search(
+            rf"(^|[\s;&|])(sed|perl)\b[^;&|]*\s-[^\s;&|]*i[^;&|]*\s"
+            rf"{quoted_reference}(?=$|[\s;&|])",
+            normalized_command,
+        )
+    )
+
+
+def _runtime_message_has_following_success(messages: tuple[AgentMessage, ...], index: int) -> bool:
+    """Return True when a tool-call message is followed by a successful result."""
+    for candidate in messages[index + 1 :]:
+        if candidate.type == "tool":
+            return False
+        if candidate.is_error:
+            return False
+        exit_code = candidate.data.get("exit_code")
+        if isinstance(exit_code, int):
+            return exit_code == 0
+        if candidate.data.get("subtype") == "success":
+            return True
+        text = "\n".join(
+            str(part)
+            for part in (
+                candidate.content,
+                candidate.data.get("result_preview"),
+                candidate.data.get("output"),
+                candidate.data.get("stdout"),
+            )
+            if isinstance(part, str)
+        ).lower()
+        if re.search(r"\b(exit\s*code\s*0|completed|succeeded|success)\b", text):
+            return True
+    return False
+
+
+def _runtime_message_file_proof_text(message: AgentMessage) -> str:
+    """Return text that can prove a file was touched by the current run.
+
+    For Bash tool invocations, command text is not proof by itself: read-only
+    commands such as ``grep updated src/app.py`` can contain both the claimed
+    path and mutation verbs. Trust Bash result/output fields instead. Dedicated
+    edit/write tools still expose their tool inputs because their tool identity
+    supplies the mutation semantics.
+    """
+    if message.tool_name == "Bash":
+        parts: list[str] = []
+        for key in ("result_preview", "output", "stdout", "stderr"):
+            value = message.data.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+        return "\n".join(parts).lower()
+    return _runtime_message_search_text(message)
 
 
 def _looks_like_test_command(command: str) -> bool:
