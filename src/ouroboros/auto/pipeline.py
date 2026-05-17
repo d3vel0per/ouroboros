@@ -756,6 +756,7 @@ class AutoPipeline:
                 self._save(state)
                 return self._result(state, ledger, blocker=state.last_error)
             state.seed_artifact = seed.to_dict()
+            state.seed_id = seed.metadata.seed_id
             state.repair_round = len(repairs)
             state.last_grade = review.grade_result.grade.value
             state.findings = [asdict(finding) for finding in review.findings]
@@ -2472,6 +2473,8 @@ class AutoPipeline:
         # resumed sessions. Existing non-default values are preserved.
         if state.seed_origin is SeedOrigin.NONE:
             state.seed_origin = SeedOrigin.AUTO_PIPELINE
+        state.seed_id = seed.metadata.seed_id
+        state.seed_artifact = seed.to_dict()
         return seed
 
     def _result(
