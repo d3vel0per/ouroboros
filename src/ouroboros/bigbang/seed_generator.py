@@ -20,7 +20,13 @@ import structlog
 import yaml
 
 from ouroboros.bigbang.ambiguity import AMBIGUITY_THRESHOLD, AmbiguityScore
-from ouroboros.bigbang.interview import InterviewState
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewState,
+    initial_context_summary_missing,
+    prompt_safe_initial_context,
+)
+from ouroboros.config import get_clarification_model
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.seed import (
     BrownfieldContext,
@@ -37,8 +43,6 @@ from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, Mess
 
 log = structlog.get_logger()
 
-# Default model moved to config.models.ClarificationConfig.default_model
-_FALLBACK_MODEL = "claude-opus-4-6"
 EXTRACTION_TEMPERATURE = 0.2
 _MAX_EXTRACTION_RETRIES = 1
 
@@ -70,13 +74,17 @@ class SeedGenerator:
     """
 
     llm_adapter: LLMAdapter
-    model: str = _FALLBACK_MODEL
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     temperature: float = EXTRACTION_TEMPERATURE
     max_tokens: int = 4096
     output_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "seeds")
 
     def __post_init__(self) -> None:
         """Ensure output directory exists."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_clarification_model()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     async def generate(
@@ -85,6 +93,8 @@ class SeedGenerator:
         ambiguity_score: AmbiguityScore,
         parent_seed: Seed | None = None,
         reflect_output: Any | None = None,
+        *,
+        force: bool = False,
     ) -> Result[Seed, ValidationError | ProviderError]:
         """Generate an immutable Seed from interview state or reflect output.
 
@@ -93,11 +103,19 @@ class SeedGenerator:
         - Gen 2+ (reflect_output provided): Use refined ACs and ontology mutations
           from ReflectEngine. Skip ambiguity gating.
 
+        When ``force=True``, the ambiguity threshold gate is bypassed but every
+        other validation (initial-context summary, extraction, build) still runs.
+        The real ``ambiguity_score.overall_score`` is recorded in metadata so
+        forced seeds carry truthful provenance.
+
         Args:
             state: Completed interview state.
             ambiguity_score: The ambiguity score for the interview.
             parent_seed: Optional parent seed for evolutionary lineage.
             reflect_output: Optional ReflectOutput for Gen 2+ evolution.
+            force: When True, bypass the ambiguity threshold gate. The real
+                score is still stamped into ``SeedMetadata.ambiguity_score``.
+                Defaults to False (gate enforced).
 
         Returns:
             Result containing the generated Seed or error.
@@ -112,8 +130,15 @@ class SeedGenerator:
             ambiguity_score=ambiguity_score.overall_score,
         )
 
-        # Gate on ambiguity score
-        if not ambiguity_score.is_ready_for_seed:
+        # Gate on ambiguity score (skipped when force=True)
+        if force:
+            log.warning(
+                "seed.generation.ambiguity_gate_bypassed",
+                interview_id=state.interview_id,
+                ambiguity_score=ambiguity_score.overall_score,
+                threshold=AMBIGUITY_THRESHOLD,
+            )
+        elif not ambiguity_score.is_ready_for_seed:
             log.warning(
                 "seed.generation.ambiguity_too_high",
                 interview_id=state.interview_id,
@@ -130,6 +155,15 @@ class SeedGenerator:
                         "threshold": AMBIGUITY_THRESHOLD,
                         "interview_id": state.interview_id,
                     },
+                )
+            )
+
+        if initial_context_summary_missing(state):
+            return Result.err(
+                ValidationError(
+                    "Initial context summary required before seed generation",
+                    field="initial_context",
+                    details={"interview_id": state.interview_id},
                 )
             )
 
@@ -309,8 +343,11 @@ class SeedGenerator:
             Message(role=MessageRole.USER, content=user_prompt),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="seed_generation",
+            model_is_explicit=self.model_is_explicit,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
@@ -413,9 +450,11 @@ PROJECT_TYPE: greenfield"""
         Returns:
             Formatted context string.
         """
-        parts = [f"Initial Context: {state.initial_context}"]
+        parts = [f"Initial Context: {prompt_safe_initial_context(state)}"]
 
         for round_data in state.rounds:
+            if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+                continue
             parts.append(f"\nQ: {round_data.question}")
             if round_data.user_response:
                 parts.append(f"A: {round_data.user_response}")

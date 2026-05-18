@@ -9,7 +9,8 @@ The scoring algorithm evaluates three key components:
 - Success Criteria Clarity (30%): How measurable the success criteria are
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 import json
 import re
 from typing import Any
@@ -17,16 +18,29 @@ from typing import Any
 from pydantic import BaseModel, Field
 import structlog
 
-from ouroboros.bigbang.interview import InterviewState
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewState,
+    initial_context_summary_missing,
+    prompt_safe_initial_context,
+)
+from ouroboros.config import get_clarification_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
-from ouroboros.providers.base import CompletionConfig, Message, MessageRole
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
 
 log = structlog.get_logger()
 
 # Threshold for allowing Seed generation (NFR6)
 AMBIGUITY_THRESHOLD = 0.2
+SEED_CLOSER_ACTIVATION_THRESHOLD = 0.25
+AUTO_COMPLETE_STREAK_REQUIRED = 2
+
+# Minimum per-dimension clarity required before interview auto-completion.
+GOAL_CLARITY_FLOOR = 0.75
+CONSTRAINT_CLARITY_FLOOR = 0.65
+SUCCESS_CRITERIA_CLARITY_FLOOR = 0.70
+BROWNFIELD_CONTEXT_CLARITY_FLOOR = 0.60
 
 # Weights for greenfield score components (3 dimensions)
 GOAL_CLARITY_WEIGHT = 0.40
@@ -39,13 +53,92 @@ BROWNFIELD_CONSTRAINT_CLARITY_WEIGHT = 0.25
 BROWNFIELD_SUCCESS_CRITERIA_CLARITY_WEIGHT = 0.25
 BROWNFIELD_CONTEXT_CLARITY_WEIGHT = 0.15
 
-DEFAULT_MODEL = "claude-opus-4-6"
-
 # Temperature for reproducible scoring
 SCORING_TEMPERATURE = 0.1
 
 # Maximum token limit (None = no limit, rely on model's context window)
 MAX_TOKEN_LIMIT: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# Ambiguity milestones — semantic labels for score ranges
+# ---------------------------------------------------------------------------
+
+
+class AmbiguityMilestone(StrEnum):
+    """Named milestones for ambiguity score ranges.
+
+    Each milestone represents a qualitative stage in the interview's progress
+    toward Seed-ready clarity.  Milestones are consumed by:
+    * ``format_score_display`` — human-readable progress label
+    * ``_build_ambiguity_snapshot_prompt`` (interview.py) — LLM context so the
+      question generator can adapt its strategy to the current stage
+    * MCP response ``meta`` — structured data for downstream tooling
+    """
+
+    INITIAL = "initial"
+    PROGRESS = "progress"
+    REFINED = "refined"
+    READY = "ready"
+
+
+# (upper_bound, milestone, description) — evaluated top-down; first match wins.
+MILESTONE_DEFINITIONS: tuple[tuple[float, AmbiguityMilestone, str], ...] = (
+    (
+        1.0,
+        AmbiguityMilestone.INITIAL,
+        "Core requirements identified. Major gaps in constraints and success criteria.",
+    ),
+    (
+        0.4,
+        AmbiguityMilestone.PROGRESS,
+        "Most requirements captured. Some details and edge cases missing.",
+    ),
+    (
+        0.3,
+        AmbiguityMilestone.REFINED,
+        "Success criteria partially defined. Edge cases and non-goals remain.",
+    ),
+    (
+        AMBIGUITY_THRESHOLD,
+        AmbiguityMilestone.READY,
+        "All criteria concrete and testable. Ready for Seed generation.",
+    ),
+)
+
+
+def get_milestone(score: float) -> tuple[AmbiguityMilestone, str]:
+    """Return the current milestone and its description for *score*.
+
+    Milestones are evaluated from the lowest threshold upward so the most
+    advanced matching milestone is returned.
+
+    >>> get_milestone(0.55)
+    (<AmbiguityMilestone.INITIAL: 'initial'>, 'Core requirements ...')
+    >>> get_milestone(0.15)
+    (<AmbiguityMilestone.READY: 'ready'>, 'All criteria ...')
+    """
+    # Walk from the most advanced milestone (lowest threshold) upward.
+    for threshold, milestone, description in reversed(MILESTONE_DEFINITIONS):
+        if score <= threshold:
+            return milestone, description
+    # score > 1.0 (shouldn't happen) — fall back to INITIAL.
+    return MILESTONE_DEFINITIONS[0][1], MILESTONE_DEFINITIONS[0][2]
+
+
+def get_next_milestone(
+    score: float,
+) -> tuple[float, AmbiguityMilestone, str] | None:
+    """Return the next milestone to reach, or ``None`` if already READY.
+
+    The "next" milestone is the most advanced one whose threshold is still
+    strictly below the current *score*.  We iterate top-down (highest
+    threshold first) and return the first entry the score hasn't yet reached.
+    """
+    for threshold, milestone, description in MILESTONE_DEFINITIONS:
+        if score > threshold:
+            return threshold, milestone, description
+    return None
 
 
 class ComponentScore(BaseModel):
@@ -115,6 +208,46 @@ class AmbiguityScore:
         return self.overall_score <= AMBIGUITY_THRESHOLD
 
 
+def get_completion_floor_failures(
+    score: AmbiguityScore,
+    *,
+    is_brownfield: bool,
+) -> list[str]:
+    """Return any unmet component floors for interview auto-completion."""
+    required_components: list[tuple[str, str, float]] = [
+        ("goal_clarity", "Goal Clarity", GOAL_CLARITY_FLOOR),
+        ("constraint_clarity", "Constraint Clarity", CONSTRAINT_CLARITY_FLOOR),
+        ("success_criteria_clarity", "Success Criteria Clarity", SUCCESS_CRITERIA_CLARITY_FLOOR),
+    ]
+    if is_brownfield:
+        required_components.append(
+            ("context_clarity", "Context Clarity", BROWNFIELD_CONTEXT_CLARITY_FLOOR)
+        )
+
+    failures: list[str] = []
+    for attribute_name, label, minimum_clarity in required_components:
+        component = getattr(score.breakdown, attribute_name)
+        if component is None:
+            failures.append(f"{label} missing (< {minimum_clarity:.2f})")
+            continue
+        if component.clarity_score < minimum_clarity:
+            failures.append(f"{label} {component.clarity_score:.2f} < {minimum_clarity:.2f}")
+
+    return failures
+
+
+def qualifies_for_seed_completion(
+    score: AmbiguityScore,
+    *,
+    is_brownfield: bool,
+) -> bool:
+    """Return True when ambiguity and all required component floors are satisfied."""
+    return score.is_ready_for_seed and not get_completion_floor_failures(
+        score,
+        is_brownfield=is_brownfield,
+    )
+
+
 @dataclass
 class AmbiguityScorer:
     """Scorer for calculating ambiguity of interview requirements.
@@ -134,7 +267,7 @@ class AmbiguityScorer:
         max_retries: Maximum retry attempts, or None for unlimited (default).
 
     Example:
-        scorer = AmbiguityScorer(llm_adapter=LiteLLMAdapter())
+        scorer = AmbiguityScorer(llm_adapter=adapter)
 
         result = await scorer.score(interview_state)
         if result.is_ok:
@@ -147,17 +280,25 @@ class AmbiguityScorer:
                 questions = scorer.generate_clarification_questions(ambiguity.breakdown)
     """
 
-    llm_adapter: LiteLLMAdapter
-    model: str = DEFAULT_MODEL
+    llm_adapter: LLMAdapter
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     temperature: float = SCORING_TEMPERATURE
     initial_max_tokens: int = 2048
     max_retries: int | None = 10  # Default to 10 retries (None = unlimited)
     max_format_error_retries: int = 5  # Stop after N format errors (non-truncation)
 
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_clarification_model()
+
     async def score(
         self,
         state: InterviewState,
         is_brownfield: bool = False,
+        additional_context: str = "",
     ) -> Result[AmbiguityScore, ProviderError]:
         """Calculate ambiguity score for interview state.
 
@@ -169,8 +310,17 @@ class AmbiguityScorer:
         Uses adaptive token allocation: starts with initial_max_tokens and
         doubles on parse failure, up to max_retries attempts.
 
+        Items explicitly deferred via ``additional_context`` (e.g. decide-later
+        items from a PM interview) are treated as **intentional deferrals** and
+        must not reduce the clarity score.  The LLM is instructed to score only
+        what is present and answerable, not penalise deliberate gaps.
+
         Args:
             state: The interview state to score.
+            is_brownfield: Whether this is a brownfield project.
+            additional_context: Extra context appended to the user prompt.
+                Useful for supplying decide-later items or other metadata
+                that should inform scoring without penalty.
 
         Returns:
             Result containing AmbiguityScore or ProviderError.
@@ -184,12 +334,23 @@ class AmbiguityScorer:
         # Use brownfield flag from state if available
         is_brownfield = is_brownfield or getattr(state, "is_brownfield", False)
 
+        if initial_context_summary_missing(state):
+            return Result.err(
+                ProviderError(
+                    "Initial context summary required before ambiguity scoring",
+                    details={"interview_id": state.interview_id},
+                )
+            )
+
         # Build the context from interview
         context = self._build_interview_context(state)
 
         # Create scoring prompt
         system_prompt = self._build_scoring_system_prompt(is_brownfield=is_brownfield)
-        user_prompt = self._build_scoring_user_prompt(context)
+        user_prompt = self._build_scoring_user_prompt(
+            context,
+            additional_context=additional_context,
+        )
 
         messages = [
             Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -200,6 +361,7 @@ class AmbiguityScorer:
         last_error: Exception | ProviderError | None = None
         last_response: str = ""
         attempt = 0
+        format_error_count = 0
 
         while True:
             # Check retry limit if set
@@ -208,8 +370,11 @@ class AmbiguityScorer:
 
             attempt += 1
 
+            assert self.model is not None
             config = CompletionConfig(
                 model=self.model,
+                role="ambiguity",
+                model_is_explicit=self.model_is_explicit,
                 temperature=self.temperature,
                 max_tokens=current_max_tokens,
             )
@@ -278,11 +443,22 @@ class AmbiguityScorer:
                     current_max_tokens = next_tokens
                 else:
                     # Format error without truncation - retry with same tokens
+                    format_error_count += 1
+                    if format_error_count >= self.max_format_error_retries:
+                        log.warning(
+                            "ambiguity.scoring.format_errors_exhausted",
+                            interview_id=state.interview_id,
+                            error=str(e),
+                            format_error_count=format_error_count,
+                            max_format_error_retries=self.max_format_error_retries,
+                        )
+                        break
                     log.warning(
                         "ambiguity.scoring.format_error_retrying",
                         interview_id=state.interview_id,
                         error=str(e),
                         attempt=attempt,
+                        format_error_count=format_error_count,
                         finish_reason=result.value.finish_reason,
                     )
 
@@ -310,9 +486,11 @@ class AmbiguityScorer:
         Returns:
             Formatted context string.
         """
-        parts = [f"Initial Context: {state.initial_context}"]
+        parts = [f"Initial Context: {prompt_safe_initial_context(state)}"]
 
         for round_data in state.rounds:
+            if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+                continue
             parts.append(f"\nQ: {round_data.question}")
             if round_data.user_response:
                 parts.append(f"A: {round_data.user_response}")
@@ -328,8 +506,13 @@ class AmbiguityScorer:
         Returns:
             System prompt string.
         """
+        deferral_instruction = """
+
+IMPORTANT: If the additional context lists "decide-later" or "deferred" items, these are INTENTIONAL deferrals — the team has deliberately chosen to postpone those decisions. Do NOT penalise the clarity score for intentionally deferred items. Score only what is present and answerable."""
+
         if is_brownfield:
-            return """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+            return (
+                """You are an expert requirements analyst. Evaluate the clarity of software requirements.
 
 Evaluate four components:
 1. Goal Clarity (35%): Is the goal specific and well-defined?
@@ -338,13 +521,18 @@ Evaluate four components:
 4. Context Clarity (15%): Is the existing codebase context clear? Are referenced codebases, patterns, and conventions well understood?
 
 Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+                + deferral_instruction
+                + """
 
 RESPOND ONLY WITH VALID JSON. No other text before or after.
 
 Required JSON format:
 {"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string", "context_clarity_score": 0.0, "context_clarity_justification": "string"}"""
+            )
 
-        return """You are an expert requirements analyst. Evaluate the clarity of software requirements.
+        return (
+            """You are an expert requirements analyst. Evaluate the clarity of software requirements.
 
 Evaluate three components:
 1. Goal Clarity (40%): Is the goal specific and well-defined?
@@ -352,28 +540,45 @@ Evaluate three components:
 3. Success Criteria Clarity (30%): Are success criteria measurable?
 
 Score each from 0.0 (unclear) to 1.0 (perfectly clear). Scores above 0.8 require very specific requirements.
+"""
+            + deferral_instruction
+            + """
 
 RESPOND ONLY WITH VALID JSON. No other text before or after.
 
 Required JSON format:
 {"goal_clarity_score": 0.0, "goal_clarity_justification": "string", "constraint_clarity_score": 0.0, "constraint_clarity_justification": "string", "success_criteria_clarity_score": 0.0, "success_criteria_clarity_justification": "string"}"""
+        )
 
-    def _build_scoring_user_prompt(self, context: str) -> str:
+    def _build_scoring_user_prompt(
+        self,
+        context: str,
+        additional_context: str = "",
+    ) -> str:
         """Build user prompt with interview context.
 
         Args:
             context: Formatted interview context.
+            additional_context: Extra context (e.g. decide-later items).
 
         Returns:
             User prompt string.
         """
-        return f"""Please evaluate the clarity of the following requirements conversation:
+        prompt = f"""Please evaluate the clarity of the following requirements conversation:
 
 ---
 {context}
----
+---"""
 
-Analyze each component and provide scores with justifications."""
+        if additional_context:
+            prompt += f"""
+
+Additional context (intentional deferrals — do not penalise):
+{additional_context}"""
+
+        prompt += "\n\nAnalyze each component and provide scores with justifications."
+
+        return prompt
 
     def _parse_scoring_response(
         self,
@@ -410,17 +615,14 @@ Analyze each component and provide scores with justifications."""
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON response: {e}") from e
 
-        # Validate all required fields are present
-        required_fields = [
+        # Numeric score fields must be present. Missing justifications are recoverable.
+        required_score_fields = [
             "goal_clarity_score",
-            "goal_clarity_justification",
             "constraint_clarity_score",
-            "constraint_clarity_justification",
             "success_criteria_clarity_score",
-            "success_criteria_clarity_justification",
         ]
 
-        for field_name in required_fields:
+        for field_name in required_score_fields:
             if field_name not in data:
                 raise ValueError(f"Missing required field: {field_name}")
 
@@ -428,6 +630,15 @@ Analyze each component and provide scores with justifications."""
         def clamp_score(value: Any) -> float:
             score = float(value)
             return max(0.0, min(1.0, score))
+
+        def justification_for(field_name: str, component_name: str) -> str:
+            value = data.get(field_name)
+            if value is None:
+                return f"{component_name} justification not provided by model."
+            text = str(value).strip()
+            if not text:
+                return f"{component_name} justification not provided by model."
+            return text
 
         # Select weights based on project type
         if is_brownfield:
@@ -446,7 +657,10 @@ Analyze each component and provide scores with justifications."""
                 name="Context Clarity",
                 clarity_score=clamp_score(data["context_clarity_score"]),
                 weight=BROWNFIELD_CONTEXT_CLARITY_WEIGHT,
-                justification=str(data.get("context_clarity_justification", "")),
+                justification=justification_for(
+                    "context_clarity_justification",
+                    "Context Clarity",
+                ),
             )
 
         return ScoreBreakdown(
@@ -454,19 +668,28 @@ Analyze each component and provide scores with justifications."""
                 name="Goal Clarity",
                 clarity_score=clamp_score(data["goal_clarity_score"]),
                 weight=goal_weight,
-                justification=str(data["goal_clarity_justification"]),
+                justification=justification_for(
+                    "goal_clarity_justification",
+                    "Goal Clarity",
+                ),
             ),
             constraint_clarity=ComponentScore(
                 name="Constraint Clarity",
                 clarity_score=clamp_score(data["constraint_clarity_score"]),
                 weight=constraint_weight,
-                justification=str(data["constraint_clarity_justification"]),
+                justification=justification_for(
+                    "constraint_clarity_justification",
+                    "Constraint Clarity",
+                ),
             ),
             success_criteria_clarity=ComponentScore(
                 name="Success Criteria Clarity",
                 clarity_score=clamp_score(data["success_criteria_clarity_score"]),
                 weight=criteria_weight,
-                justification=str(data["success_criteria_clarity_justification"]),
+                justification=justification_for(
+                    "success_criteria_clarity_justification",
+                    "Success Criteria Clarity",
+                ),
             ),
             context_clarity=context_clarity,
         )
@@ -542,18 +765,27 @@ def is_ready_for_seed(score: AmbiguityScore) -> bool:
 def format_score_display(score: AmbiguityScore) -> str:
     """Format ambiguity score for display after interview round.
 
+    Includes the current milestone label and, when the interview is not yet
+    Seed-ready, the next milestone target so users understand what remains.
+
     Args:
         score: The ambiguity score to format.
 
     Returns:
         Formatted string for display.
     """
+    milestone, milestone_desc = get_milestone(score.overall_score)
+    next_ms = get_next_milestone(score.overall_score)
+
     lines = [
-        f"Ambiguity Score: {score.overall_score:.2f}",
-        f"Ready for Seed: {'Yes' if score.is_ready_for_seed else 'No'}",
-        "",
-        "Component Breakdown:",
+        f"Ambiguity Score: {score.overall_score:.2f} [{milestone.value.upper()}]",
+        f"  {milestone_desc}",
     ]
+    if next_ms is not None:
+        lines.append(f"  Next: {next_ms[1].value} (<= {next_ms[0]:.1f})")
+    lines.append(f"Ready for Seed: {'Yes' if score.is_ready_for_seed else 'No'}")
+    lines.append("")
+    lines.append("Component Breakdown:")
 
     for component in score.breakdown.components:
         clarity_percent = component.clarity_score * 100

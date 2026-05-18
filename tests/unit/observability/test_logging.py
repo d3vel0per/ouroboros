@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 from typing import Any
 from unittest.mock import patch
+import warnings
 
 import pytest
 
@@ -175,6 +176,24 @@ class TestConfigureLogging:
         assert is_configured()
         # Log directory should not be created if file logging disabled
         # (Only if it doesn't already exist)
+
+    def test_configure_falls_back_when_file_handler_cannot_be_created(
+        self, temp_log_dir: Path, capsys: Any
+    ) -> None:
+        """configure_logging falls back to console logging on file errors."""
+        config = LoggingConfig(log_dir=temp_log_dir, enable_file_logging=True)
+
+        with patch(
+            "ouroboros.observability.logging.TimedRotatingFileHandler",
+            side_effect=PermissionError("denied"),
+        ):
+            configure_logging(config)
+
+        log = get_logger()
+        log.info("test.console.fallback")
+
+        captured = capsys.readouterr()
+        assert "test.console.fallback" in captured.err
 
 
 class TestGetLogger:
@@ -548,14 +567,17 @@ class TestExceptionLogging:
         configure_logging(config)
         log = get_logger()
 
-        try:
-            raise ValueError("test exception")
-        except ValueError:
-            log.exception("error.occurred")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                raise ValueError("test exception")
+            except ValueError:
+                log.exception("error.occurred")
 
         captured = capsys.readouterr()
         assert "error.occurred" in captured.err
         assert "ValueError" in captured.err or "test exception" in captured.err
+        assert not any("pretty exceptions" in str(w.message) for w in caught)
 
 
 class TestSensitiveDataMasking:

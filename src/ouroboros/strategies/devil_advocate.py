@@ -23,6 +23,7 @@ import hashlib
 import json
 from typing import TYPE_CHECKING
 
+from ouroboros.config import get_ontology_analysis_model
 from ouroboros.core.ontology_aspect import (
     AnalysisResult,
     OntologicalJoinPoint,
@@ -72,10 +73,18 @@ class DevilAdvocateStrategy:
     """
 
     llm_adapter: LLMAdapter
-    model: str = "claude-opus-4-6"
+    model: str | None = None
+    model_is_explicit: bool | None = None
     confidence_threshold: float = 0.7
     temperature: float = 0.3
     max_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller intent."""
+        if self.model_is_explicit is None:
+            self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_ontology_analysis_model()
 
     @property
     def join_point(self) -> OntologicalJoinPoint:
@@ -127,6 +136,7 @@ class DevilAdvocateStrategy:
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            model_is_explicit=self.model_is_explicit,
         )
 
         # Handle LLM failure

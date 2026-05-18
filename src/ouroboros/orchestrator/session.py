@@ -23,20 +23,33 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ouroboros.core.errors import PersistenceError
 from ouroboros.core.types import Result
-from ouroboros.events.base import BaseEvent
+from ouroboros.events.base import BaseEvent, sanitize_event_data_for_persistence
 from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
-    from ouroboros.persistence.event_store import EventStore
+    from ouroboros.persistence.event_store import EventStore, SessionActivitySnapshot
 
 log = get_logger(__name__)
+
+_PARALLEL_ACTIVITY_EVENT_TYPES = frozenset(
+    {
+        "execution.session.started",
+        "execution.session.resumed",
+        "execution.session.completed",
+        "execution.session.failed",
+        "execution.tool.started",
+        "execution.agent.thinking",
+        "execution.coordinator.tool.started",
+        "execution.coordinator.thinking",
+    }
+)
 
 
 # =============================================================================
@@ -51,6 +64,7 @@ class SessionStatus(StrEnum):
     PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # =============================================================================
@@ -113,6 +127,11 @@ class SessionTracker:
     def with_progress(self, update: dict[str, Any]) -> SessionTracker:
         """Return new tracker with updated progress.
 
+        The ``messages_processed`` counter is set from the update dict when
+        present, otherwise it is incremented by one.  This avoids the double-
+        increment that would occur when the caller also tracks a separate
+        counter and stores it in the update.
+
         Args:
             update: Progress data to merge.
 
@@ -120,10 +139,15 @@ class SessionTracker:
             New SessionTracker with merged progress.
         """
         merged_progress = {**self.progress, **update}
+        new_count = update.get("messages_processed")
+        if isinstance(new_count, int):
+            messages_processed = new_count
+        else:
+            messages_processed = self.messages_processed + 1
         return replace(
             self,
             progress=merged_progress,
-            messages_processed=self.messages_processed + 1,
+            messages_processed=messages_processed,
             last_message_time=datetime.now(UTC),
         )
 
@@ -190,6 +214,7 @@ class SessionRepository:
         - orchestrator.progress.updated: Progress update
         - orchestrator.session.completed: Session finished successfully
         - orchestrator.session.failed: Session failed
+        - orchestrator.session.cancelled: Session cancelled
         - orchestrator.session.paused: Session paused for resumption
     """
 
@@ -201,11 +226,348 @@ class SessionRepository:
         """
         self._event_store = event_store
 
+    @staticmethod
+    def _normalize_progress_payload(progress: dict[str, Any]) -> dict[str, Any]:
+        """Normalize persisted progress payloads for stable session reconstruction."""
+        sanitized_progress = sanitize_event_data_for_persistence(progress)
+        runtime = sanitized_progress.get("runtime")
+        if not isinstance(runtime, dict):
+            return sanitized_progress
+
+        backend = runtime.get("backend")
+        if backend != "opencode":
+            return sanitized_progress
+
+        sanitized_progress = dict(sanitized_progress)
+        normalized_runtime: dict[str, Any] = {}
+        for key in ("backend", "kind", "native_session_id", "cwd", "approval_mode"):
+            if key in runtime:
+                normalized_runtime[key] = runtime[key]
+
+        metadata = runtime.get("metadata")
+        if isinstance(metadata, dict):
+            normalized_metadata = sanitize_event_data_for_persistence(metadata)
+            normalized_metadata.pop("runtime_event_type", None)
+            normalized_runtime["metadata"] = normalized_metadata
+
+        sanitized_progress["runtime"] = normalized_runtime
+        return sanitized_progress
+
+    @staticmethod
+    def _coerce_runtime_status(value: object) -> SessionStatus | None:
+        """Map normalized runtime-status strings onto SessionStatus values."""
+        if not isinstance(value, str):
+            return None
+
+        normalized = value.strip().lower()
+        if normalized == "running":
+            return SessionStatus.RUNNING
+        if normalized == "paused":
+            return SessionStatus.PAUSED
+        if normalized == "completed":
+            return SessionStatus.COMPLETED
+        if normalized == "failed":
+            return SessionStatus.FAILED
+        if normalized == "cancelled":
+            return SessionStatus.CANCELLED
+        return None
+
+    @classmethod
+    def _status_from_event(
+        cls,
+        event_type: object,
+        event_data: object,
+    ) -> SessionStatus | None:
+        """Derive a session status from either terminal events or runtime progress."""
+        if event_type == "orchestrator.session.completed":
+            return SessionStatus.COMPLETED
+        if event_type == "orchestrator.session.failed":
+            return SessionStatus.FAILED
+        if event_type == "orchestrator.session.paused":
+            return SessionStatus.PAUSED
+        if event_type == "orchestrator.session.cancelled":
+            return SessionStatus.CANCELLED
+
+        if event_type not in {
+            "orchestrator.progress.updated",
+            "workflow.progress.updated",
+        } or not isinstance(
+            event_data,
+            dict,
+        ):
+            return None
+
+        progress = event_data.get("progress")
+        if isinstance(progress, dict):
+            status = cls._coerce_runtime_status(
+                progress.get("runtime_status") or event_data.get("runtime_status")
+            )
+            if status is not None:
+                return status
+
+        return cls._coerce_runtime_status(event_data.get("runtime_status"))
+
+    @staticmethod
+    def _workflow_is_incomplete(progress: dict[str, Any]) -> bool:
+        """Return True when workflow progress shows unfinished acceptance criteria."""
+        completed_count = progress.get("completed_count")
+        total_count = progress.get("total_count")
+        return (
+            isinstance(completed_count, int)
+            and isinstance(total_count, int)
+            and total_count > 0
+            and completed_count < total_count
+        )
+
+    @staticmethod
+    def _workflow_progress_from_event(event_data: object) -> dict[str, Any]:
+        """Normalize execution-scoped workflow progress into session progress fields."""
+        if not isinstance(event_data, dict):
+            return {}
+
+        progress: dict[str, Any] = {}
+        for key in (
+            "acceptance_criteria",
+            "completed_count",
+            "total_count",
+            "current_ac_index",
+            "current_phase",
+            "activity",
+            "activity_detail",
+            "elapsed_display",
+            "estimated_remaining",
+            "messages_count",
+            "tool_calls_count",
+            "estimated_tokens",
+            "estimated_cost_usd",
+            "last_update",
+        ):
+            value = event_data.get(key)
+            if value is not None:
+                progress[key] = value
+
+        messages_count = event_data.get("messages_count")
+        if isinstance(messages_count, int):
+            progress["messages_processed"] = messages_count
+
+        return progress
+
+    @staticmethod
+    def _pause_progress_from_event(event_data: object) -> dict[str, Any]:
+        """Normalize pause lifecycle metadata into session progress fields."""
+        if not isinstance(event_data, dict):
+            return {}
+
+        progress: dict[str, Any] = {"runtime_status": SessionStatus.PAUSED.value}
+        for key in ("pause_kind", "pause_seconds", "resume_after", "paused_at", "resume_hint"):
+            value = event_data.get(key)
+            if value is not None:
+                progress[key] = value
+
+        reason = event_data.get("reason")
+        if reason is not None:
+            progress["pause_reason"] = reason
+
+        return progress
+
+    @staticmethod
+    def _coerce_snapshot_datetime(value: object) -> datetime | None:
+        """Normalize timestamp values returned by snapshot queries."""
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=UTC)
+            return value
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                log.warning(
+                    "orchestrator.session.timestamp_parse_failed",
+                    value=value,
+                )
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=UTC)
+            return parsed
+        return None
+
+    @staticmethod
+    def _coerce_positive_seconds(value: object) -> int | None:
+        """Normalize persisted positive-second values from pause metadata."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int | float):
+            seconds = int(value)
+            return seconds if seconds > 0 else None
+        if isinstance(value, str) and value.strip():
+            try:
+                seconds = int(float(value.strip()))
+            except ValueError:
+                return None
+            return seconds if seconds > 0 else None
+        return None
+
+    @classmethod
+    def _usage_limit_pause_resume_after(cls, progress: dict[str, Any]) -> datetime | None:
+        """Return the resume time for usage-limit pauses, if metadata is valid."""
+        pause_kind = progress.get("pause_kind")
+        if not isinstance(pause_kind, str) or pause_kind.strip().lower() != "usage_limit":
+            return None
+
+        resume_after = cls._coerce_snapshot_datetime(progress.get("resume_after"))
+        if resume_after is not None:
+            return resume_after
+
+        paused_at = cls._coerce_snapshot_datetime(progress.get("paused_at"))
+        pause_seconds = cls._coerce_positive_seconds(progress.get("pause_seconds"))
+        if paused_at is None or pause_seconds is None:
+            return None
+
+        return paused_at + timedelta(seconds=pause_seconds)
+
+    @classmethod
+    def _usage_limit_pause_cleanup_deferred(
+        cls,
+        tracker: SessionTracker,
+        *,
+        now: datetime,
+        staleness_threshold: timedelta,
+    ) -> bool:
+        """Return True while quota pauses should be protected from orphan cleanup."""
+        if tracker.status != SessionStatus.PAUSED:
+            return False
+
+        resume_after = cls._usage_limit_pause_resume_after(tracker.progress)
+        if resume_after is None:
+            return False
+
+        return now <= resume_after + staleness_threshold
+
+    @classmethod
+    def _status_from_snapshot(cls, snapshot: SessionActivitySnapshot) -> SessionStatus:
+        """Derive session status from a snapshot row."""
+        status = cls._status_from_event(snapshot.status_event_type, {})
+        if status is not None:
+            return status
+
+        runtime_status = cls._coerce_runtime_status(snapshot.runtime_status)
+        if runtime_status is not None:
+            return runtime_status
+
+        return SessionStatus.RUNNING
+
+    async def _find_orphaned_sessions_via_snapshots(
+        self,
+        snapshots: list[SessionActivitySnapshot],
+        alive_sessions: set[str],
+        staleness_threshold: timedelta,
+        now: datetime,
+    ) -> list[SessionTracker]:
+        """Detect orphaned sessions from pre-aggregated session snapshots."""
+        orphaned: list[SessionTracker] = []
+
+        for snapshot in snapshots:
+            status = self._status_from_snapshot(snapshot)
+            if status not in (SessionStatus.RUNNING, SessionStatus.PAUSED):
+                continue
+
+            if snapshot.session_id in alive_sessions:
+                log.info(
+                    "orchestrator.orphan_detection.heartbeat_alive",
+                    session_id=snapshot.session_id,
+                )
+                continue
+
+            last_activity = self._coerce_snapshot_datetime(snapshot.last_activity)
+            if last_activity is None:
+                last_activity = self._coerce_snapshot_datetime(snapshot.start_time)
+            if last_activity is None:
+                continue
+
+            if (now - last_activity) <= staleness_threshold:
+                continue
+
+            result = await self.reconstruct_session(snapshot.session_id)
+            if result.is_ok:
+                if self._usage_limit_pause_cleanup_deferred(
+                    result.value,
+                    now=now,
+                    staleness_threshold=staleness_threshold,
+                ):
+                    continue
+                orphaned.append(result.value)
+
+        return orphaned
+
+    @staticmethod
+    def _merge_event_streams(
+        primary_events: list[BaseEvent],
+        related_events: list[BaseEvent],
+    ) -> list[BaseEvent]:
+        """Merge event streams by id and return them in replay order."""
+        seen_ids: set[str] = set()
+        merged: list[BaseEvent] = []
+
+        for event in [*primary_events, *related_events]:
+            if event.id in seen_ids:
+                continue
+            seen_ids.add(event.id)
+            merged.append(event)
+
+        merged.sort(
+            key=lambda event: (
+                event.timestamp or datetime.min.replace(tzinfo=UTC),
+                event.id,
+            ),
+        )
+        return merged
+
+    @staticmethod
+    def _merge_progress_payloads(
+        existing: dict[str, Any],
+        update: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Merge progress updates while preserving reconnectable OpenCode runtime state."""
+        merged = {**existing, **update}
+
+        existing_runtime = existing.get("runtime")
+        update_runtime = update.get("runtime")
+        if not isinstance(existing_runtime, dict) or not isinstance(update_runtime, dict):
+            return merged
+
+        if (
+            existing_runtime.get("backend") != "opencode"
+            or update_runtime.get("backend") != "opencode"
+        ):
+            return merged
+
+        merged_runtime = dict(existing_runtime)
+        for key, value in update_runtime.items():
+            if key == "metadata":
+                continue
+            if value is not None:
+                merged_runtime[key] = value
+
+        existing_metadata = existing_runtime.get("metadata")
+        update_metadata = update_runtime.get("metadata")
+        if isinstance(existing_metadata, dict) or isinstance(update_metadata, dict):
+            merged_metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
+            if isinstance(update_metadata, dict):
+                merged_metadata.update(
+                    {key: value for key, value in update_metadata.items() if value is not None}
+                )
+            if merged_metadata:
+                merged_runtime["metadata"] = merged_metadata
+
+        merged["runtime"] = merged_runtime
+        return merged
+
     async def create_session(
         self,
         execution_id: str,
         seed_id: str,
         session_id: str | None = None,
+        seed_goal: str | None = None,
     ) -> Result[SessionTracker, PersistenceError]:
         """Create a new session and persist start event.
 
@@ -213,21 +575,26 @@ class SessionRepository:
             execution_id: Workflow execution ID.
             seed_id: Seed ID being executed.
             session_id: Optional custom session ID.
+            seed_goal: Optional goal text to persist with the start event.
 
         Returns:
             Result containing new SessionTracker.
         """
         tracker = SessionTracker.create(execution_id, seed_id, session_id)
 
+        event_data = {
+            "execution_id": execution_id,
+            "seed_id": seed_id,
+            "start_time": tracker.start_time.isoformat(),
+        }
+        if seed_goal:
+            event_data["seed_goal"] = seed_goal
+
         event = BaseEvent(
             type="orchestrator.session.started",
             aggregate_type="session",
             aggregate_id=tracker.session_id,
-            data={
-                "execution_id": execution_id,
-                "seed_id": seed_id,
-                "start_time": tracker.start_time.isoformat(),
-            },
+            data=event_data,
         )
 
         try:
@@ -265,12 +632,13 @@ class SessionRepository:
         Returns:
             Result indicating success or failure.
         """
+        sanitized_progress = self._normalize_progress_payload(progress)
         event = BaseEvent(
             type="orchestrator.progress.updated",
             aggregate_type="session",
             aggregate_id=session_id,
             data={
-                "progress": progress,
+                "progress": sanitized_progress,
                 "timestamp": datetime.now(UTC).isoformat(),
             },
         )
@@ -383,6 +751,115 @@ class SessionRepository:
                 )
             )
 
+    async def mark_paused(
+        self,
+        session_id: str,
+        reason: str,
+        resume_hint: str | None = None,
+        *,
+        pause_seconds: int | None = None,
+        resume_after: datetime | None = None,
+        pause_kind: str | None = None,
+    ) -> Result[None, PersistenceError]:
+        """Mark session as paused and resumable.
+
+        Args:
+            session_id: Session being paused.
+            reason: Why the session was paused.
+            resume_hint: Optional retry guidance.
+
+        Returns:
+            Result indicating success or failure.
+        """
+        data: dict[str, Any] = {
+            "reason": reason,
+            "resume_hint": resume_hint,
+            "paused_at": datetime.now(UTC).isoformat(),
+        }
+        if pause_seconds is not None:
+            data["pause_seconds"] = pause_seconds
+        if resume_after is not None:
+            data["resume_after"] = resume_after.isoformat()
+        if pause_kind is not None:
+            data["pause_kind"] = pause_kind
+
+        event = BaseEvent(
+            type="orchestrator.session.paused",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data=data,
+        )
+
+        try:
+            await self._event_store.append(event)
+            log.info(
+                "orchestrator.session.paused",
+                session_id=session_id,
+                reason=reason,
+            )
+            return Result.ok(None)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.pause_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session paused: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
+    async def mark_cancelled(
+        self,
+        session_id: str,
+        reason: str,
+        cancelled_by: str = "user",
+    ) -> Result[None, PersistenceError]:
+        """Mark session as cancelled.
+
+        Args:
+            session_id: Session to cancel.
+            reason: Why the session was cancelled.
+            cancelled_by: Who/what initiated cancellation ("user", "auto_cleanup").
+
+        Returns:
+            Result indicating success or failure.
+        """
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id=session_id,
+            data={
+                "reason": reason,
+                "cancelled_by": cancelled_by,
+                "cancelled_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        try:
+            await self._event_store.append(event)
+            log.info(
+                "orchestrator.session.cancelled",
+                session_id=session_id,
+                reason=reason,
+                cancelled_by=cancelled_by,
+            )
+            return Result.ok(None)
+        except Exception as e:
+            log.exception(
+                "orchestrator.session.cancel_failed",
+                session_id=session_id,
+                error=str(e),
+            )
+            return Result.err(
+                PersistenceError(
+                    message=f"Failed to mark session cancelled: {e}",
+                    details={"session_id": session_id},
+                )
+            )
+
     async def reconstruct_session(
         self,
         session_id: str,
@@ -424,30 +901,105 @@ class SessionRepository:
                 )
 
             # Create initial tracker from start event
+            start_time = self._coerce_snapshot_datetime(start_event.data.get("start_time"))
+            if start_time is None:
+                start_time = self._coerce_snapshot_datetime(start_event.timestamp)
+            if start_time is None:
+                start_time = datetime.now(UTC)
+
             tracker = SessionTracker(
                 session_id=session_id,
                 execution_id=start_event.data.get("execution_id", ""),
                 seed_id=start_event.data.get("seed_id", ""),
                 status=SessionStatus.RUNNING,
-                start_time=datetime.fromisoformat(
-                    start_event.data.get("start_time", datetime.now(UTC).isoformat())
-                ),
+                start_time=start_time,
             )
+
+            execution_id = start_event.data.get("execution_id", "")
+            all_events = list(events)
+            query_related = getattr(self._event_store, "query_session_related_events", None)
+            if callable(query_related):
+                try:
+                    related_events = await query_related(
+                        session_id=session_id,
+                        execution_id=execution_id or None,
+                        limit=None,
+                    )
+                    if isinstance(related_events, list) and related_events:
+                        all_events = self._merge_event_streams(events, related_events)
+                except Exception:
+                    log.warning(
+                        "orchestrator.session.related_event_query_failed",
+                        session_id=session_id,
+                        execution_id=execution_id,
+                    )
 
             # Replay subsequent events
             messages_processed = 0
             last_progress: dict[str, Any] = {}
+            explicit_terminal_status: SessionStatus | None = None
 
-            for event in events:
+            for event in all_events:
                 if event.type == "orchestrator.progress.updated":
-                    messages_processed += 1
-                    last_progress = event.data.get("progress", {})
-                elif event.type == "orchestrator.session.completed":
-                    tracker = tracker.with_status(SessionStatus.COMPLETED)
-                elif event.type == "orchestrator.session.failed":
-                    tracker = tracker.with_status(SessionStatus.FAILED)
+                    progress_update = event.data.get("progress", {})
+                    if not isinstance(progress_update, dict):
+                        continue
+                    progress_update = self._normalize_progress_payload(progress_update)
+                    last_progress = self._merge_progress_payloads(last_progress, progress_update)
+                    persisted_messages = progress_update.get("messages_processed")
+                    if isinstance(persisted_messages, int):
+                        messages_processed = max(messages_processed, persisted_messages)
+                    else:
+                        messages_processed += 1
+                elif event.type == "workflow.progress.updated":
+                    workflow_progress = self._normalize_progress_payload(
+                        self._workflow_progress_from_event(event.data),
+                    )
+                    if workflow_progress:
+                        last_progress = self._merge_progress_payloads(
+                            last_progress,
+                            workflow_progress,
+                        )
+                        persisted_messages = workflow_progress.get("messages_processed")
+                        if isinstance(persisted_messages, int):
+                            messages_processed = max(messages_processed, persisted_messages)
                 elif event.type == "orchestrator.session.paused":
-                    tracker = tracker.with_status(SessionStatus.PAUSED)
+                    pause_progress = self._pause_progress_from_event(event.data)
+                    last_progress = self._merge_progress_payloads(
+                        last_progress,
+                        pause_progress,
+                    )
+                elif event.type in _PARALLEL_ACTIVITY_EVENT_TYPES:
+                    messages_processed += 1
+                status_update = self._status_from_event(event.type, event.data)
+                if status_update is not None:
+                    tracker = tracker.with_status(status_update)
+                    if status_update == SessionStatus.RUNNING:
+                        explicit_terminal_status = None
+                        for key in (
+                            "pause_kind",
+                            "pause_seconds",
+                            "resume_after",
+                            "resume_hint",
+                            "paused_at",
+                            "pause_reason",
+                        ):
+                            last_progress.pop(key, None)
+                    elif event.type in {
+                        "orchestrator.session.completed",
+                        "orchestrator.session.failed",
+                        "orchestrator.session.cancelled",
+                        "orchestrator.session.paused",
+                    }:
+                        explicit_terminal_status = status_update
+
+            # Sanitize stale runtime metadata when an explicit lifecycle event
+            # provides the authoritative session state. Progress events captured
+            # during execution may contain
+            # ``runtime_status: running`` which contradicts the authoritative
+            # terminal status and confuses downstream consumers (#188).
+            if explicit_terminal_status is not None and last_progress.get("runtime_status"):
+                last_progress["runtime_status"] = explicit_terminal_status.value
 
             # Apply accumulated progress
             tracker = replace(
@@ -455,6 +1007,21 @@ class SessionRepository:
                 progress=last_progress,
                 messages_processed=messages_processed,
             )
+
+            # Child AC runtime streams emit terminal runtime_status values into the
+            # shared session audit log. Those should not flip the parent session to
+            # completed/failed while workflow progress still shows unfinished ACs.
+            if (
+                explicit_terminal_status is None
+                and tracker.status
+                in {
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                    SessionStatus.CANCELLED,
+                }
+                and self._workflow_is_incomplete(last_progress)
+            ):
+                tracker = tracker.with_status(SessionStatus.RUNNING)
 
             log.info(
                 "orchestrator.session.reconstructed",
@@ -477,6 +1044,203 @@ class SessionRepository:
                     details={"session_id": session_id},
                 )
             )
+
+    async def find_orphaned_sessions(
+        self,
+        staleness_threshold: timedelta = timedelta(hours=1),
+    ) -> list[SessionTracker]:
+        """Find orphaned sessions that are still running but have gone stale.
+
+        A session is considered orphaned if:
+        1. Its current status is RUNNING (or PAUSED)
+        2. Its last activity timestamp (last event) is older than the staleness threshold
+        3. No active heartbeat exists for the session (runtime-agnostic check)
+
+        The heartbeat mechanism is extensible: any runtime (codex, claude_code,
+        or future runtimes) just needs to call write_heartbeat(session_id) during
+        execution. No process-name coupling required.
+
+        Args:
+            staleness_threshold: How long since last activity before a session
+                is considered orphaned. Defaults to 1 hour.
+
+        Returns:
+            List of SessionTracker instances for orphaned sessions.
+        """
+        from ouroboros.orchestrator.heartbeat import get_alive_sessions
+
+        alive_sessions = get_alive_sessions()
+        now = datetime.now(UTC)
+        orphaned: list[SessionTracker] = []
+
+        try:
+            get_snapshots = getattr(self._event_store, "get_session_activity_snapshots", None)
+            if callable(get_snapshots):
+                snapshots = await get_snapshots()
+                if isinstance(snapshots, list):
+                    orphaned = await self._find_orphaned_sessions_via_snapshots(
+                        snapshots,
+                        alive_sessions,
+                        staleness_threshold,
+                        now,
+                    )
+                    log.info(
+                        "orchestrator.orphan_detection.complete",
+                        total_sessions=len(snapshots),
+                        orphaned_count=len(orphaned),
+                        strategy="snapshot",
+                    )
+                    return orphaned
+
+            # Get all session start events to enumerate sessions
+            start_events = await self._event_store.get_all_sessions()
+
+            for start_event in start_events:
+                session_id = start_event.aggregate_id
+
+                # Replay all events for this session
+                try:
+                    events = await self._event_store.replay("session", session_id)
+                except Exception:
+                    log.warning(
+                        "orchestrator.orphan_detection.replay_failed",
+                        session_id=session_id,
+                    )
+                    continue
+
+                if not events:
+                    continue
+
+                # Determine current status by replaying events
+                status = SessionStatus.RUNNING
+                for event in events:
+                    status_update = self._status_from_event(event.type, event.data)
+                    if status_update is not None:
+                        status = status_update
+
+                # Only consider active sessions (RUNNING or PAUSED)
+                if status not in (SessionStatus.RUNNING, SessionStatus.PAUSED):
+                    continue
+
+                # Check the last event's timestamp for staleness
+                last_event = events[-1]
+                last_activity = last_event.timestamp
+                if last_activity is None:
+                    # If no timestamp, use start_time from event data as fallback
+                    start_time_str = start_event.data.get("start_time")
+                    if start_time_str:
+                        last_activity = self._coerce_snapshot_datetime(start_time_str)
+                    else:
+                        continue
+                if last_activity is None:
+                    continue
+
+                # Ensure timezone-aware comparison
+                if last_activity.tzinfo is None:
+                    last_activity = last_activity.replace(tzinfo=UTC)
+
+                if (now - last_activity) > staleness_threshold:
+                    # Skip if the session has an active heartbeat
+                    if session_id in alive_sessions:
+                        log.info(
+                            "orchestrator.orphan_detection.heartbeat_alive",
+                            session_id=session_id,
+                        )
+                        continue
+
+                    # Reconstruct full tracker for the orphaned session
+                    result = await self.reconstruct_session(session_id)
+                    if result.is_ok:
+                        if self._usage_limit_pause_cleanup_deferred(
+                            result.value,
+                            now=now,
+                            staleness_threshold=staleness_threshold,
+                        ):
+                            continue
+                        orphaned.append(result.value)
+
+            log.info(
+                "orchestrator.orphan_detection.complete",
+                total_sessions=len(start_events),
+                orphaned_count=len(orphaned),
+                strategy="replay",
+            )
+
+        except Exception as e:
+            log.exception(
+                "orchestrator.orphan_detection.failed",
+                error=str(e),
+            )
+
+        return orphaned
+
+    async def cancel_orphaned_sessions(
+        self,
+        staleness_threshold: timedelta = timedelta(hours=1),
+    ) -> list[SessionTracker]:
+        """Detect and cancel orphaned sessions.
+
+        This is the auto-cleanup routine intended to run during MCP server
+        startup. It finds all sessions that are still active (RUNNING/PAUSED)
+        but have had no activity for longer than the staleness threshold,
+        cancels each one, and logs the cancellations to stderr.
+
+        Args:
+            staleness_threshold: How long since last activity before a session
+                is considered orphaned. Defaults to 1 hour.
+
+        Returns:
+            List of SessionTracker instances that were cancelled.
+        """
+        import sys
+
+        orphaned = await self.find_orphaned_sessions(staleness_threshold)
+
+        if not orphaned:
+            log.info("orchestrator.auto_cleanup.no_orphans")
+            return []
+
+        cancelled: list[SessionTracker] = []
+
+        for tracker in orphaned:
+            result = await self.mark_cancelled(
+                session_id=tracker.session_id,
+                reason=(
+                    f"Auto-cancelled on startup: session was {tracker.status.value} "
+                    f"with no activity for over {staleness_threshold}"
+                ),
+                cancelled_by="auto_cleanup",
+            )
+
+            if result.is_ok:
+                cancelled.append(tracker)
+                # Log to stderr so it's visible in MCP stdio mode
+                print(
+                    f"[ouroboros] Auto-cancelled orphaned session "
+                    f"{tracker.session_id} (execution={tracker.execution_id}, "
+                    f"previous_status={tracker.status.value})",
+                    file=sys.stderr,
+                )
+                log.info(
+                    "orchestrator.auto_cleanup.cancelled",
+                    session_id=tracker.session_id,
+                    execution_id=tracker.execution_id,
+                    previous_status=tracker.status.value,
+                )
+            else:
+                log.warning(
+                    "orchestrator.auto_cleanup.cancel_failed",
+                    session_id=tracker.session_id,
+                    error=str(result.error),
+                )
+
+        log.info(
+            "orchestrator.auto_cleanup.complete",
+            orphaned_count=len(orphaned),
+            cancelled_count=len(cancelled),
+        )
+
+        return cancelled
 
 
 __all__ = [

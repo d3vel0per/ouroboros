@@ -9,16 +9,26 @@ from ouroboros.bigbang.ambiguity import (
     CONSTRAINT_CLARITY_WEIGHT,
     GOAL_CLARITY_WEIGHT,
     MAX_TOKEN_LIMIT,
+    MILESTONE_DEFINITIONS,
     SCORING_TEMPERATURE,
     SUCCESS_CRITERIA_CLARITY_WEIGHT,
+    AmbiguityMilestone,
     AmbiguityScore,
     AmbiguityScorer,
     ComponentScore,
     ScoreBreakdown,
     format_score_display,
+    get_milestone,
+    get_next_milestone,
     is_ready_for_seed,
 )
-from ouroboros.bigbang.interview import InterviewRound, InterviewState
+from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    InterviewRound,
+    InterviewState,
+    InterviewStatus,
+)
+from ouroboros.config.loader import get_clarification_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.providers.base import CompletionResponse, UsageInfo
@@ -305,7 +315,7 @@ class TestAmbiguityScorerInit:
         scorer = AmbiguityScorer(llm_adapter=mock_adapter)
 
         assert scorer.llm_adapter == mock_adapter
-        assert scorer.model == "claude-opus-4-6"
+        assert scorer.model == get_clarification_model()
         assert scorer.temperature == SCORING_TEMPERATURE
         assert scorer.initial_max_tokens == 2048
         assert scorer.max_retries == 10  # Default to 10 retries
@@ -397,6 +407,39 @@ class TestAmbiguityScorerScore:
         assert "Rate limit exceeded" in result.error.message
         # Should have retried 3 times
         assert mock_adapter.complete.call_count == 3
+
+    async def test_score_requires_summary_for_large_initial_context(self) -> None:
+        """score fails explicitly when long initial_context has no summary."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+        )
+
+        result = await scorer.score(state)
+
+        assert result.is_err
+        assert "summary required" in result.error.message
+        mock_adapter.complete.assert_not_called()
+
+    async def test_score_requires_summary_for_completed_large_initial_context(self) -> None:
+        """Completed long-context interviews still enforce summary before scoring."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_completed_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+            status=InterviewStatus.COMPLETED,
+        )
+
+        result = await scorer.score(state)
+
+        assert result.is_err
+        assert "summary required" in result.error.message
+        mock_adapter.complete.assert_not_called()
 
     async def test_score_provider_error_recovers_on_retry(self) -> None:
         """score recovers when provider error is transient."""
@@ -610,6 +653,51 @@ class TestAmbiguityScorerBuildInterviewContext:
         assert "Q: Question 2?" in context
         assert "A: Answer 2" in context
 
+    def test_context_uses_prompt_safe_initial_context_summary(self) -> None:
+        """_build_interview_context avoids oversized raw initial_context."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_large_context",
+            initial_context=("A" * 4_000) + "TAIL_MARKER",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response="Short project summary",
+            )
+        )
+
+        context = scorer._build_interview_context(state)
+
+        assert "Short project summary" in context
+        assert "TAIL_MARKER" not in context
+        assert INITIAL_CONTEXT_SUMMARY_QUESTION not in context
+
+    def test_context_caps_oversized_initial_context_summary(self) -> None:
+        """_build_interview_context does not serialize oversized summary rounds raw."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = InterviewState(
+            interview_id="test_large_summary",
+            initial_context=("A" * 4_000) + "RAW_TAIL",
+        )
+        state.rounds.append(
+            InterviewRound(
+                round_number=1,
+                question=INITIAL_CONTEXT_SUMMARY_QUESTION,
+                user_response=("B" * 4_000) + "SUMMARY_TAIL",
+            )
+        )
+
+        context = scorer._build_interview_context(state)
+
+        assert "Context truncated for prompt safety" in context
+        assert "RAW_TAIL" not in context
+        assert "SUMMARY_TAIL" not in context
+        assert INITIAL_CONTEXT_SUMMARY_QUESTION not in context
+
 
 class TestAmbiguityScorerParseResponse:
     """Test AmbiguityScorer._parse_scoring_response method."""
@@ -664,6 +752,68 @@ class TestAmbiguityScorerParseResponse:
 
         with pytest.raises(ValueError, match="Missing required field"):
             scorer._parse_scoring_response(response)
+
+    def test_parse_response_missing_success_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing success justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.9, "goal_clarity_justification": "Good goal.", '
+            '"constraint_clarity_score": 0.8, "constraint_clarity_justification": '
+            '"Clear constraints.", "success_criteria_clarity_score": 0.7}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response)
+
+        assert breakdown.success_criteria_clarity.clarity_score == 0.7
+        assert (
+            breakdown.success_criteria_clarity.justification
+            == "Success Criteria Clarity justification not provided by model."
+        )
+
+    def test_parse_response_missing_goal_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing goal justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.85, "constraint_clarity_score": 0.75, '
+            '"constraint_clarity_justification": "Good constraints.", '
+            '"success_criteria_clarity_score": 0.65, '
+            '"success_criteria_clarity_justification": "Clear criteria."}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response)
+
+        assert breakdown.goal_clarity.clarity_score == 0.85
+        assert (
+            breakdown.goal_clarity.justification
+            == "Goal Clarity justification not provided by model."
+        )
+
+    def test_parse_brownfield_response_missing_context_justification_uses_fallback(self) -> None:
+        """_parse_scoring_response tolerates missing brownfield context justification."""
+        mock_adapter = MagicMock()
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+
+        response = (
+            '{"goal_clarity_score": 0.9, "goal_clarity_justification": "Good goal.", '
+            '"constraint_clarity_score": 0.8, "constraint_clarity_justification": '
+            '"Clear constraints.", "success_criteria_clarity_score": 0.7, '
+            '"success_criteria_clarity_justification": "Clear criteria.", '
+            '"context_clarity_score": 0.6}'
+        )
+
+        breakdown = scorer._parse_scoring_response(response, is_brownfield=True)
+
+        assert breakdown.context_clarity is not None
+        assert breakdown.context_clarity.clarity_score == 0.6
+        assert breakdown.context_clarity.weight == 0.15
+        assert (
+            breakdown.context_clarity.justification
+            == "Context Clarity justification not provided by model."
+        )
 
     def test_parse_response_invalid_json(self) -> None:
         """_parse_scoring_response raises error for invalid JSON."""
@@ -918,7 +1068,7 @@ class TestFormatScoreDisplay:
     """Test format_score_display helper function."""
 
     def test_format_score_display_ready(self) -> None:
-        """format_score_display shows 'Yes' when ready for seed."""
+        """format_score_display shows 'Yes' and READY milestone when ready for seed."""
         breakdown = ScoreBreakdown(
             goal_clarity=ComponentScore(
                 name="Goal Clarity",
@@ -944,13 +1094,14 @@ class TestFormatScoreDisplay:
         output = format_score_display(score)
 
         assert "0.15" in output
+        assert "[READY]" in output
         assert "Ready for Seed: Yes" in output
         assert "Goal Clarity" in output
         assert "90% clear" in output
         assert "Well-defined goal." in output
 
     def test_format_score_display_not_ready(self) -> None:
-        """format_score_display shows 'No' when not ready for seed."""
+        """format_score_display shows 'No' and INITIAL milestone when not ready."""
         breakdown = ScoreBreakdown(
             goal_clarity=ComponentScore(
                 name="Goal Clarity",
@@ -976,7 +1127,9 @@ class TestFormatScoreDisplay:
         output = format_score_display(score)
 
         assert "0.50" in output
+        assert "[INITIAL]" in output
         assert "Ready for Seed: No" in output
+        assert "Next: progress" in output
 
     def test_format_score_display_includes_all_components(self) -> None:
         """format_score_display includes all component information."""
@@ -1087,3 +1240,349 @@ class TestMaxTokenLimit:
         assert configs[0].max_tokens == 4096
         assert configs[1].max_tokens == 8192  # Doubled
         assert configs[2].max_tokens == 16384  # Doubled again, no cap
+
+
+class TestAmbiguityScorerAdditionalContext:
+    """Test AmbiguityScorer.score() additional_context parameter."""
+
+    async def test_score_accepts_additional_context_param(self) -> None:
+        """score() accepts additional_context string parameter."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(
+                    content=create_valid_scoring_response(
+                        goal_score=0.9,
+                        constraint_score=0.85,
+                        success_score=0.8,
+                    )
+                )
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        result = await scorer.score(
+            state,
+            additional_context="Decide-later: What database should we use?",
+        )
+
+        assert result.is_ok
+        assert isinstance(result.value, AmbiguityScore)
+
+    async def test_score_additional_context_included_in_prompt(self) -> None:
+        """additional_context text appears in the user prompt sent to the LLM."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(
+            state,
+            additional_context="Decide-later items:\n- What caching strategy?\n- Which auth provider?",
+        )
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+
+        assert "What caching strategy?" in user_message
+        assert "Which auth provider?" in user_message
+        assert "intentional deferrals" in user_message
+
+    async def test_score_empty_additional_context_not_in_prompt(self) -> None:
+        """Empty additional_context does not add deferral section to prompt."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(state, additional_context="")
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+
+        assert "intentional deferrals" not in user_message
+
+    async def test_score_default_additional_context_is_empty(self) -> None:
+        """Default additional_context is empty string (backward compatible)."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        # Call without additional_context — should work as before
+        result = await scorer.score(state)
+
+        assert result.is_ok
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+        assert "intentional deferrals" not in user_message
+
+    async def test_score_system_prompt_contains_deferral_instruction(self) -> None:
+        """System prompt instructs LLM not to penalise intentional deferrals."""
+        mock_adapter = MagicMock()
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(content=create_valid_scoring_response())
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        await scorer.score(
+            state,
+            additional_context="Decide-later: What database?",
+        )
+
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        system_message = messages[0].content
+
+        assert "intentional deferrals" in system_message.lower() or "INTENTIONAL" in system_message
+        assert "penali" in system_message.lower()  # "penalise" or "penalize"
+
+    async def test_score_decide_later_items_no_penalty(self) -> None:
+        """Decide-later items passed as additional_context produce same score as without.
+
+        This verifies the *mechanism* — the scorer passes the decide-later context
+        to the LLM with the no-penalty instruction. The LLM's actual behaviour
+        is tested by the system prompt assertions above; here we verify the score
+        calculation itself is unaffected (no code-level penalty).
+        """
+        mock_adapter = MagicMock()
+        # Same high scores regardless of decide-later items
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                create_mock_completion_response(
+                    content=create_valid_scoring_response(
+                        goal_score=0.9,
+                        constraint_score=0.85,
+                        success_score=0.8,
+                    )
+                )
+            )
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        # Score without additional context
+        result_without = await scorer.score(state)
+        # Score with decide-later context
+        result_with = await scorer.score(
+            state,
+            additional_context="Decide-later items:\n- What database?\n- Which cloud provider?",
+        )
+
+        assert result_without.is_ok
+        assert result_with.is_ok
+        # The code-level calculation is identical — no programmatic penalty
+        assert result_without.value.overall_score == result_with.value.overall_score
+
+    async def test_score_additional_context_with_brownfield(self) -> None:
+        """additional_context works correctly with is_brownfield=True."""
+        mock_adapter = MagicMock()
+        import json
+
+        brownfield_response = json.dumps(
+            {
+                "goal_clarity_score": 0.9,
+                "goal_clarity_justification": "Clear goal.",
+                "constraint_clarity_score": 0.85,
+                "constraint_clarity_justification": "Clear constraints.",
+                "success_criteria_clarity_score": 0.8,
+                "success_criteria_clarity_justification": "Clear criteria.",
+                "context_clarity_score": 0.75,
+                "context_clarity_justification": "Good context.",
+            }
+        )
+        mock_adapter.complete = AsyncMock(
+            return_value=Result.ok(create_mock_completion_response(content=brownfield_response))
+        )
+
+        scorer = AmbiguityScorer(llm_adapter=mock_adapter)
+        state = create_interview_state_with_rounds()
+
+        result = await scorer.score(
+            state,
+            is_brownfield=True,
+            additional_context="Decide-later: Which deployment strategy?",
+        )
+
+        assert result.is_ok
+
+        # Verify both additional_context and brownfield context in prompt
+        call_args = mock_adapter.complete.call_args
+        messages = call_args[0][0]
+        user_message = messages[1].content
+        system_message = messages[0].content
+
+        assert "Which deployment strategy?" in user_message
+        assert "Context Clarity" in system_message
+
+
+class TestAmbiguityMilestone:
+    """Test AmbiguityMilestone enum and milestone helpers."""
+
+    def test_milestone_enum_values(self) -> None:
+        """AmbiguityMilestone has exactly four stages."""
+        assert AmbiguityMilestone.INITIAL == "initial"
+        assert AmbiguityMilestone.PROGRESS == "progress"
+        assert AmbiguityMilestone.REFINED == "refined"
+        assert AmbiguityMilestone.READY == "ready"
+        assert len(AmbiguityMilestone) == 4
+
+    def test_milestone_definitions_ordered_descending(self) -> None:
+        """MILESTONE_DEFINITIONS thresholds are in descending order."""
+        thresholds = [t for t, _, _ in MILESTONE_DEFINITIONS]
+        assert thresholds == sorted(thresholds, reverse=True)
+
+    def test_milestone_definitions_last_is_ambiguity_threshold(self) -> None:
+        """The lowest milestone threshold equals AMBIGUITY_THRESHOLD."""
+        assert MILESTONE_DEFINITIONS[-1][0] == AMBIGUITY_THRESHOLD
+
+
+class TestGetMilestone:
+    """Test get_milestone() for various score ranges."""
+
+    def test_high_ambiguity_returns_initial(self) -> None:
+        """Scores above 0.4 map to INITIAL."""
+        milestone, desc = get_milestone(0.7)
+        assert milestone == AmbiguityMilestone.INITIAL
+        assert "Core requirements" in desc
+
+    def test_score_0_5_returns_initial(self) -> None:
+        """Score exactly 0.5 maps to INITIAL (within the 0.4-1.0 band)."""
+        milestone, _ = get_milestone(0.5)
+        assert milestone == AmbiguityMilestone.INITIAL
+
+    def test_score_0_4_returns_progress(self) -> None:
+        """Score exactly 0.4 maps to PROGRESS."""
+        milestone, desc = get_milestone(0.4)
+        assert milestone == AmbiguityMilestone.PROGRESS
+        assert "Most requirements" in desc
+
+    def test_score_0_35_returns_progress(self) -> None:
+        """Score 0.35 (between 0.3 and 0.4) maps to PROGRESS."""
+        milestone, _ = get_milestone(0.35)
+        assert milestone == AmbiguityMilestone.PROGRESS
+
+    def test_score_0_3_returns_refined(self) -> None:
+        """Score exactly 0.3 maps to REFINED."""
+        milestone, desc = get_milestone(0.3)
+        assert milestone == AmbiguityMilestone.REFINED
+        assert "Success criteria" in desc
+
+    def test_score_0_25_returns_refined(self) -> None:
+        """Score 0.25 (between 0.2 and 0.3) maps to REFINED."""
+        milestone, _ = get_milestone(0.25)
+        assert milestone == AmbiguityMilestone.REFINED
+
+    def test_score_0_2_returns_ready(self) -> None:
+        """Score exactly at AMBIGUITY_THRESHOLD maps to READY."""
+        milestone, desc = get_milestone(0.2)
+        assert milestone == AmbiguityMilestone.READY
+        assert "Ready for Seed" in desc
+
+    def test_score_below_threshold_returns_ready(self) -> None:
+        """Score below threshold still maps to READY."""
+        milestone, _ = get_milestone(0.1)
+        assert milestone == AmbiguityMilestone.READY
+
+    def test_score_zero_returns_ready(self) -> None:
+        """Perfect clarity (0.0) maps to READY."""
+        milestone, _ = get_milestone(0.0)
+        assert milestone == AmbiguityMilestone.READY
+
+    def test_score_1_0_returns_initial(self) -> None:
+        """Maximum ambiguity (1.0) maps to INITIAL."""
+        milestone, _ = get_milestone(1.0)
+        assert milestone == AmbiguityMilestone.INITIAL
+
+
+class TestGetNextMilestone:
+    """Test get_next_milestone() for progression targets."""
+
+    def test_high_score_next_is_progress(self) -> None:
+        """From INITIAL (0.5), next milestone is PROGRESS (0.4)."""
+        result = get_next_milestone(0.5)
+        assert result is not None
+        threshold, milestone, _ = result
+        assert threshold == 0.4
+        assert milestone == AmbiguityMilestone.PROGRESS
+
+    def test_progress_score_next_is_refined(self) -> None:
+        """From PROGRESS (0.35), next milestone is REFINED (0.3)."""
+        result = get_next_milestone(0.35)
+        assert result is not None
+        threshold, milestone, _ = result
+        assert threshold == 0.3
+        assert milestone == AmbiguityMilestone.REFINED
+
+    def test_refined_score_next_is_ready(self) -> None:
+        """From REFINED (0.25), next milestone is READY (0.2)."""
+        result = get_next_milestone(0.25)
+        assert result is not None
+        threshold, milestone, _ = result
+        assert threshold == AMBIGUITY_THRESHOLD
+        assert milestone == AmbiguityMilestone.READY
+
+    def test_ready_score_returns_none(self) -> None:
+        """At READY (0.15), there is no next milestone."""
+        result = get_next_milestone(0.15)
+        assert result is None
+
+    def test_exactly_at_threshold_returns_none(self) -> None:
+        """At exactly AMBIGUITY_THRESHOLD, no next milestone."""
+        result = get_next_milestone(0.2)
+        assert result is None
+
+    def test_zero_returns_none(self) -> None:
+        """At perfect clarity, no next milestone."""
+        result = get_next_milestone(0.0)
+        assert result is None
+
+    def test_score_1_0_next_is_progress(self) -> None:
+        """From maximum ambiguity, next milestone is PROGRESS."""
+        result = get_next_milestone(1.0)
+        assert result is not None
+        _, milestone, _ = result
+        assert milestone == AmbiguityMilestone.PROGRESS
+
+    def test_boundary_0_41_next_is_progress(self) -> None:
+        """Score just above 0.4 points to PROGRESS as next."""
+        result = get_next_milestone(0.41)
+        assert result is not None
+        assert result[0] == 0.4
+
+    def test_boundary_0_31_next_is_refined(self) -> None:
+        """Score just above 0.3 points to REFINED as next."""
+        result = get_next_milestone(0.31)
+        assert result is not None
+        assert result[0] == 0.3
+
+    def test_boundary_0_21_next_is_ready(self) -> None:
+        """Score just above threshold points to READY as next."""
+        result = get_next_milestone(0.21)
+        assert result is not None
+        assert result[0] == AMBIGUITY_THRESHOLD

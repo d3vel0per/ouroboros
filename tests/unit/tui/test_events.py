@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from ouroboros.events.base import BaseEvent
 from ouroboros.tui.events import (
     ACUpdated,
@@ -12,7 +14,9 @@ from ouroboros.tui.events import (
     PauseRequested,
     PhaseChanged,
     ResumeRequested,
+    SubtaskUpdated,
     TUIState,
+    WorkflowProgressUpdated,
     create_message_from_event,
 )
 
@@ -314,6 +318,22 @@ class TestCreateMessageFromEvent:
         assert isinstance(msg, ExecutionUpdated)
         assert msg.status == "paused"
 
+    def test_execution_terminal_paused_event(self) -> None:
+        """Paused terminal events from execution stream should update execution status."""
+        event = BaseEvent(
+            type="execution.terminal",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={"session_id": "sess_123", "status": "paused"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_123"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "paused"
+
     def test_phase_completed_event(self) -> None:
         """Test converting phase.completed event."""
         event = BaseEvent(
@@ -353,21 +373,216 @@ class TestCreateMessageFromEvent:
         assert msg.combined_drift == 0.12
         assert msg.is_acceptable is True
 
+    def test_workflow_progress_event_preserves_last_update(self) -> None:
+        """Workflow progress events should retain the normalized latest artifact snapshot."""
+        event = BaseEvent(
+            type="workflow.progress.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "acceptance_criteria": [],
+                "completed_count": 1,
+                "total_count": 3,
+                "last_update": {
+                    "message_type": "tool_result",
+                    "content_preview": "Tool completed successfully.",
+                    "tool_name": "Edit",
+                    "ac_tracking": {"started": [], "completed": [1]},
+                },
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, WorkflowProgressUpdated)
+        assert msg.last_update == {
+            "message_type": "tool_result",
+            "content_preview": "Tool completed successfully.",
+            "tool_name": "Edit",
+            "ac_tracking": {"started": [], "completed": [1]},
+        }
+
     def test_ac_event(self) -> None:
         """Test converting AC-related events."""
         event = BaseEvent(
-            type="decomposition.ac.marked_atomic",
-            aggregate_type="execution",
-            aggregate_id="exec_123",
-            data={"ac_id": "ac_abc", "depth": 1, "is_atomic": True},
+            type="ac.marked_atomic",
+            aggregate_type="ac_decomposition",
+            aggregate_id="ac_abc",
+            data={"execution_id": "exec_123", "depth": 1, "is_atomic": True},
         )
 
         msg = create_message_from_event(event)
 
         assert isinstance(msg, ACUpdated)
+        assert msg.execution_id == "exec_123"
         assert msg.ac_id == "ac_abc"
         assert msg.status == "atomic"
         assert msg.is_atomic is True
+
+    def test_subtask_event_preserves_runtime_activity_payload(self) -> None:
+        """Live Sub-AC events should keep tool activity attached for the dashboard."""
+        event = BaseEvent(
+            type="execution.subtask.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "ac_index": 1,
+                "sub_task_index": 2,
+                "sub_task_id": "ac_1_sub_2",
+                "content": "Patch the event bridge",
+                "status": "executing",
+                "current_tool_activity": {
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+                "last_update": {
+                    "message_type": "tool",
+                    "tool_name": "Edit",
+                    "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+                },
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.current_tool_activity == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+        assert msg.last_update == {
+            "message_type": "tool",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": "src/ouroboros/tui/events.py"},
+        }
+
+    def test_node_event_preserves_hierarchical_identity(self) -> None:
+        """Generic node events should project through the same SubtaskUpdated bridge."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "identity_model": "execution_node_v1",
+                "node_id": "node_child",
+                "parent_node_id": "ac_0",
+                "display_path": "1.2",
+                "path": [0, 1],
+                "depth": 1,
+                "ordinal": 1,
+                "root_ac_index": 0,
+                "root_ac_number": 1,
+                "legacy_parent_node_id": "ac_0",
+                "legacy_parent_node_aliases": ["ac_1"],
+                "legacy_ac_index": 1,
+                "legacy_sub_task_index": 2,
+                "legacy_sub_task_id": "ac_1_sub_2",
+                "content": "Patch node event ownership",
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.node_id == "node_child"
+        assert msg.parent_node_id == "ac_0"
+        assert msg.display_path == "1.2"
+        assert msg.path == [0, 1]
+        assert msg.node_depth == 1
+        assert msg.ordinal == 1
+        assert msg.root_ac_index == 0
+        assert msg.root_ac_number == 1
+        assert msg.legacy_parent_node_id == "ac_0"
+        assert msg.legacy_parent_node_aliases == ["ac_1"]
+        assert msg.ac_index == 1
+        assert msg.sub_task_id == "ac_1_sub_2"
+
+    def test_node_event_uses_root_ac_number_for_subtask_bucket(self) -> None:
+        """Nested node events should group under their root AC, not synthetic indexes."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "identity_model": "execution_node_v1",
+                "node_id": "node_grandchild",
+                "parent_node_id": "node_child",
+                "display_path": "2.1.1",
+                "path": [1, 0, 0],
+                "depth": 2,
+                "ordinal": 0,
+                "root_ac_index": 1,
+                "root_ac_number": 2,
+                "legacy_ac_index": 101,
+                "ac_index": 101,
+                "legacy_sub_task_index": 1,
+                "legacy_sub_task_id": "ac_101_sub_1",
+                "content": "Nested child event",
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.ac_index == 2
+        assert msg.root_ac_index == 1
+        assert msg.root_ac_number == 2
+        assert msg.sub_task_id == "ac_101_sub_1"
+
+    def test_node_event_uses_root_ac_index_when_root_number_missing(self) -> None:
+        """Root AC index is enough to avoid synthetic nested bucket indexes."""
+        event = BaseEvent(
+            type="execution.node.updated",
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "node_id": "node_grandchild",
+                "parent_node_id": "node_child",
+                "depth": 2,
+                "root_ac_index": 1,
+                "ac_index": 101,
+                "legacy_ac_index": 101,
+                "legacy_sub_task_id": "ac_101_sub_1",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.ac_index == 2
+
+    @pytest.mark.parametrize(
+        "event_type",
+        ("execution.node.updated", "execution.subtask.updated"),
+    )
+    def test_subtask_events_prefer_full_content_over_truncated_label(
+        self,
+        event_type: str,
+    ) -> None:
+        """TUI detail consumers should keep full Sub-AC content when label is present."""
+        full_content = "Patch the event bridge and preserve the complete Sub-AC description."
+        event = BaseEvent(
+            type=event_type,
+            aggregate_type="execution",
+            aggregate_id="exec_123",
+            data={
+                "node_id": "node_child",
+                "parent_node_id": "node_parent",
+                "label": "Patch the event bridge and preserve...",
+                "content": full_content,
+                "status": "executing",
+            },
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, SubtaskUpdated)
+        assert msg.content == full_content
+        assert msg.content != "Patch the event bridge and preserve..."
 
     def test_cost_updated_event(self) -> None:
         """Test converting cost.updated event."""
@@ -405,6 +620,38 @@ class TestCreateMessageFromEvent:
         assert msg.total_tokens == 0
         assert msg.total_cost_usd == 0.0
         assert msg.tokens_this_phase == 0
+
+    def test_session_cancelled_event(self) -> None:
+        """Test converting session.cancelled event to ExecutionUpdated with cancelled status."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"execution_id": "exec_456", "reason": "user_request"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "exec_456"
+        assert msg.session_id == "sess_123"
+        assert msg.status == "cancelled"
+        assert msg.data["reason"] == "user_request"
+
+    def test_session_cancelled_event_without_execution_id(self) -> None:
+        """Test cancelled event falls back to aggregate_id when execution_id missing."""
+        event = BaseEvent(
+            type="orchestrator.session.cancelled",
+            aggregate_type="session",
+            aggregate_id="sess_123",
+            data={"reason": "stale_cleanup"},
+        )
+
+        msg = create_message_from_event(event)
+
+        assert isinstance(msg, ExecutionUpdated)
+        assert msg.execution_id == "sess_123"
+        assert msg.status == "cancelled"
 
     def test_unhandled_event_returns_none(self) -> None:
         """Test that unhandled event types return None."""

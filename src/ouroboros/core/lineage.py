@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ouroboros.core.seed import OntologyField, OntologySchema
 
@@ -40,6 +41,7 @@ class GenerationPhase(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
 
 
 class MutationAction(StrEnum):
@@ -59,6 +61,90 @@ class ACResult(BaseModel, frozen=True):
     score: float | None = None
     evidence: str = ""
     verification_method: str = "unknown"
+    ac_verdict_state: str = "evaluated"
+    final_verdict: str = ""
+    rendered_verdict: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_verdict(cls, data: dict) -> dict:  # type: ignore[override]
+        """Derive verdict fields from passed for legacy callers."""
+        if isinstance(data, dict):
+            passed = data.get("passed", False)
+            if not data.get("final_verdict"):
+                data["final_verdict"] = "pass" if passed else "fail"
+            # Normalize passed to match final_verdict (final_verdict wins)
+            fv = data["final_verdict"].lower()
+            data["passed"] = fv == "pass"
+            if not data.get("rendered_verdict"):
+                data["rendered_verdict"] = data["final_verdict"].upper()
+        return data
+
+    @property
+    def verdict_label(self) -> str:
+        """Canonical display label derived from final_verdict."""
+        return self.final_verdict.upper()
+
+    @property
+    def provisional_verdict(self) -> str:
+        """What the evaluator originally said before any override."""
+        # If overridden, the original was the opposite
+        if self.ac_verdict_state == "overridden":
+            return "fail" if self.final_verdict == "pass" else "pass"
+        return self.final_verdict
+
+    @property
+    def override_source(self) -> str | None:
+        """Which verifier overrode the provisional verdict."""
+        if self.ac_verdict_state == "overridden":
+            return self.verification_method
+        return None
+
+    @property
+    def override_reason(self) -> str | None:
+        """Why the override happened."""
+        if self.ac_verdict_state == "overridden":
+            return self.evidence
+        return None
+
+
+class TaskResult(BaseModel, frozen=True):
+    """Worker execution outcome for a task derived from an acceptance criterion.
+
+    This is intentionally separate from :class:`ACResult`: task completion
+    describes whether execution work finished, while AC results describe formal
+    evaluator/verifier verdicts about the produced artifact.
+    """
+
+    task_index: int
+    task_content: str
+    status: str
+    completed: bool
+    source_ac_index: int | None = None
+    evidence: str = ""
+    execution_method: str = "unknown"
+
+
+class FeedbackMetadata(BaseModel, frozen=True):
+    """Structured evaluation feedback that downstream loops can react to."""
+
+    code: str = Field(description="Stable machine-readable feedback identifier.")
+    severity: str = Field(
+        default="info",
+        description="Feedback severity (for example: info, warning, error).",
+    )
+    message: str = Field(description="Human-readable explanation of the feedback signal.")
+    source: str = Field(
+        default="evaluation",
+        description="Subsystem that emitted this feedback signal.",
+    )
+    details: dict[str, Any] = Field(
+        default_factory=dict,
+        description="JSON-safe structured payload with feedback-specific details.",
+    )
+
+
+_SEED_QUALITY_CANARY_CODES = frozenset({"decomposition_depth_warning"})
 
 
 class EvaluationSummary(BaseModel, frozen=True):
@@ -71,9 +157,94 @@ class EvaluationSummary(BaseModel, frozen=True):
     final_approved: bool
     highest_stage_passed: int = Field(ge=1, le=3)
     score: float | None = None
-    drift_score: float | None = None
+    drift_score: float | None = Field(
+        default=None,
+        description="Measures goal/constraint/ontology divergence from the seed intent (0.0-1.0). Distinct from reward_hacking_risk.",
+    )
+    reward_hacking_risk: float | None = Field(
+        default=None,
+        description="Suspicion that the artifact is optimized for evaluator, rubric, or test approval rather than solving the real task (0.0-1.0). Distinct from drift_score.",
+    )
     failure_reason: str | None = None
-    ac_results: tuple[ACResult, ...] = ()
+    ac_results: tuple[ACResult, ...] = Field(
+        default_factory=tuple,
+        description="Formal evaluator/verifier verdicts for acceptance criteria.",
+    )
+    task_results: tuple[TaskResult, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Worker execution outcomes for tasks/subtasks. Distinct from ac_results: "
+            "task completion is not acceptance approval."
+        ),
+    )
+    feedback_metadata: tuple[FeedbackMetadata, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Structured evaluation feedback signals for downstream loops, "
+            "including canaries such as decomposition-depth pressure."
+        ),
+    )
+    execution_completion_status: str = Field(
+        description="Whether execution finished successfully. Cross-reference with approval_status for full run verdict.",
+    )
+    approval_status: str = Field(
+        description="Whether the evaluation approved the artifact. Cross-reference with execution_completion_status for full run verdict.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_status_fields(cls, data: dict) -> dict:  # type: ignore[override]
+        """Derive status fields from final_approved for legacy callers."""
+        if isinstance(data, dict):
+            if "execution_completion_status" not in data:
+                data["execution_completion_status"] = "completed"
+            if "approval_status" not in data:
+                approved = data.get("final_approved", False)
+                data["approval_status"] = "approved" if approved else "rejected"
+        return data
+
+    @model_validator(mode="after")
+    def _reconcile_approval_with_ac_results(self) -> EvaluationSummary:
+        """Eagerly reconcile approval fields with AC results at construction time."""
+        if self.ac_results:
+            ac_passed = all(ac.passed for ac in self.ac_results)
+            execution_completed = self.execution_completion_status == "completed"
+            final_approved = ac_passed and execution_completed
+            expected_status = "approved" if final_approved else "rejected"
+            if self.approval_status != expected_status:
+                object.__setattr__(self, "approval_status", expected_status)
+            if self.final_approved != final_approved:
+                object.__setattr__(self, "final_approved", final_approved)
+        return self
+
+    @property
+    def run_verdict_passed(self) -> bool:
+        """Aggregate verdict incorporating execution status, approval, and AC results.
+
+        Priority: execution_completion_status > ac_results > approval_status > final_approved.
+        approval_status is already reconciled with AC results at construction time.
+        """
+        if self.execution_completion_status != "completed":
+            return False
+        if self.ac_results:
+            return all(ac.passed for ac in self.ac_results)
+        if self.approval_status != "approved":
+            return False
+        return self.final_approved
+
+    @property
+    def run_verdict(self) -> str:
+        """Human-readable aggregate verdict."""
+        return "PASS" if self.run_verdict_passed else "FAIL"
+
+    @property
+    def seed_quality_canary_feedback(self) -> tuple[FeedbackMetadata, ...]:
+        """Feedback signals that indicate seed-quality pressure in execution."""
+        return tuple(
+            feedback
+            for feedback in self.feedback_metadata
+            if feedback.code in _SEED_QUALITY_CANARY_CODES
+        )
 
 
 class FieldModification(BaseModel, frozen=True):
@@ -184,7 +355,34 @@ class GenerationRecord(BaseModel, frozen=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     seed_json: str | None = None
     execution_output: str | None = None
+    seed_quality_canary_feedback: tuple[FeedbackMetadata, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Subset of evaluation feedback that acts as a seed-quality canary, "
+            "such as recursive decomposition depth pressure."
+        ),
+    )
     failure_error: str | None = None
+    last_completed_phase: str | None = None
+    partial_state: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_seed_quality_canary_feedback(cls, data: Any) -> Any:
+        """Derive canary feedback from evaluation metadata when callers omit it."""
+        if not isinstance(data, dict):
+            return data
+        if data.get("seed_quality_canary_feedback"):
+            return data
+
+        eval_summary = data.get("evaluation_summary")
+        if isinstance(eval_summary, EvaluationSummary):
+            data["seed_quality_canary_feedback"] = eval_summary.seed_quality_canary_feedback
+        elif isinstance(eval_summary, dict):
+            data["seed_quality_canary_feedback"] = EvaluationSummary.model_validate(
+                eval_summary
+            ).seed_quality_canary_feedback
+        return data
 
 
 class RewindRecord(BaseModel, frozen=True):
@@ -200,6 +398,31 @@ class RewindRecord(BaseModel, frozen=True):
     discarded_generations: tuple[GenerationRecord, ...] = ()
 
 
+class ControlDirectiveEmission(BaseModel, frozen=True):
+    """One ``control.directive.emitted`` event folded onto a lineage.
+
+    Captures the audit-level "who/what/why/when" of a control-plane
+    decision so it appears in the lineage timeline alongside state events
+    (per RFC #476 M2 / sub-RFC #511). The full event row remains in the
+    EventStore; this projected view preserves the stable ControlContract
+    identity fields callers need for replay, idempotency inspection, and
+    future UI rendering without pretending to be the durable source of truth.
+    """
+
+    directive: str
+    reason: str
+    emitted_by: str
+    timestamp: datetime
+    schema_version: int | None = None
+    target_type: str | None = None
+    target_id: str | None = None
+    generation_number: int | None = None
+    phase: str | None = None
+    is_terminal: bool = False
+    parent_directive_id: str | None = None
+    idempotency_key: str | None = None
+
+
 class OntologyLineage(BaseModel, frozen=True):
     """Tracks O₁ → O₂ → O₃ evolution across generations.
 
@@ -213,6 +436,7 @@ class OntologyLineage(BaseModel, frozen=True):
     goal: str
     generations: tuple[GenerationRecord, ...] = Field(default_factory=tuple)
     rewind_history: tuple[RewindRecord, ...] = Field(default_factory=tuple)
+    directive_emissions: tuple[ControlDirectiveEmission, ...] = Field(default_factory=tuple)
     status: LineageStatus = LineageStatus.ACTIVE
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
@@ -227,12 +451,31 @@ class OntologyLineage(BaseModel, frozen=True):
         return self.generations[-1].ontology_snapshot if self.generations else None
 
     def with_generation(self, record: GenerationRecord) -> OntologyLineage:
-        """Return new lineage with appended generation."""
-        return self.model_copy(update={"generations": self.generations + (record,)})
+        """Return new lineage with appended or replaced generation.
+
+        If a generation with the same number already exists (e.g., from a
+        failed/interrupted attempt), it is replaced instead of duplicated.
+        """
+        existing = tuple(
+            g for g in self.generations if g.generation_number != record.generation_number
+        )
+        return self.model_copy(update={"generations": existing + (record,)})
 
     def with_status(self, status: LineageStatus) -> OntologyLineage:
         """Return new lineage with updated status."""
         return self.model_copy(update={"status": status})
+
+    def with_directive_emission(self, emission: ControlDirectiveEmission) -> OntologyLineage:
+        """Return new lineage with the directive emission appended.
+
+        Folds one ``control.directive.emitted`` event into the lineage's
+        timeline view. Existing emissions are preserved; ordering is
+        whatever the projector replayed (timestamp order from the
+        EventStore).
+        """
+        return self.model_copy(
+            update={"directive_emissions": self.directive_emissions + (emission,)}
+        )
 
     def rewind_to(self, generation_number: int) -> OntologyLineage:
         """Return lineage truncated to the given generation.

@@ -208,6 +208,153 @@ class TestCheckpointStore:
         )
 
 
+class TestCheckpointStorePathTraversal:
+    """Test that path traversal attacks via seed_id are blocked."""
+
+    def test_traversal_with_slashes_is_sanitized(self, checkpoint_store: CheckpointStore) -> None:
+        """seed_id with path separators is sanitized to underscores."""
+        cp = CheckpointData.create("x/../../PWNED", "phase1", {"a": 1})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+        # ".." removed -> "x/__/PWNED", slashes -> underscores -> "x___PWNED"
+        expected = checkpoint_store._base_path / "checkpoint_x___PWNED.json"
+        assert expected.exists()
+
+    def test_traversal_with_backslashes_is_sanitized(
+        self, checkpoint_store: CheckpointStore
+    ) -> None:
+        """seed_id with backslash separators is sanitized."""
+        cp = CheckpointData.create("x\\..\\..\\PWNED", "phase1", {"a": 1})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+        # ".." removed -> "x\\\\" , backslashes -> underscores -> "x___PWNED"
+        expected = checkpoint_store._base_path / "checkpoint_x___PWNED.json"
+        assert expected.exists()
+
+    def test_traversal_does_not_escape_base_dir(self, checkpoint_store: CheckpointStore) -> None:
+        """No checkpoint file is created outside the base directory."""
+        cp = CheckpointData.create("../../../etc/passwd", "phase1", {})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+        # Ensure nothing was written outside the checkpoint dir
+
+        for entry in checkpoint_store._base_path.parent.iterdir():
+            if entry != checkpoint_store._base_path:
+                assert "passwd" not in entry.name
+
+    def test_normal_seed_id_still_works(self, checkpoint_store: CheckpointStore) -> None:
+        """Normal seed_ids without traversal patterns work correctly."""
+        cp = CheckpointData.create("my-seed-123", "phase1", {"step": 1})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+
+        load_result = checkpoint_store.load("my-seed-123")
+        assert load_result.is_ok
+        assert load_result.value.seed_id == "my-seed-123"
+
+    def test_empty_seed_id_raises_value_error(self, checkpoint_store: CheckpointStore) -> None:
+        """Empty seed_id raises ValueError."""
+        with pytest.raises(ValueError, match="seed_id must not be empty"):
+            checkpoint_store._get_checkpoint_path("")
+
+    def test_null_byte_seed_id_raises_value_error(self, checkpoint_store: CheckpointStore) -> None:
+        """seed_id consisting only of null bytes raises ValueError."""
+        with pytest.raises(ValueError, match="empty after sanitization"):
+            checkpoint_store._get_checkpoint_path("\x00\x00")
+
+    def test_dot_dot_only_seed_id_raises_value_error(
+        self, checkpoint_store: CheckpointStore
+    ) -> None:
+        """seed_id that is purely '..' sequences raises ValueError."""
+        with pytest.raises(ValueError, match="empty after sanitization"):
+            checkpoint_store._get_checkpoint_path("..")
+
+    def test_seed_id_with_null_bytes_stripped(self, checkpoint_store: CheckpointStore) -> None:
+        """Null bytes are stripped but remaining content is preserved."""
+        cp = CheckpointData.create("seed\x00id", "phase1", {"a": 1})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+        expected = checkpoint_store._base_path / "checkpoint_seedid.json"
+        assert expected.exists()
+
+    def test_long_seed_id_is_truncated_within_filename_budget(
+        self, checkpoint_store: CheckpointStore
+    ) -> None:
+        """seed_id is capped so the full filename never exceeds 255 bytes."""
+        long_id = "a" * 300
+        path = checkpoint_store._get_checkpoint_path(long_id)
+        # The full basename must fit in 255 bytes for any rollback level
+        assert len(path.name) <= 255
+        # The sanitized seed portion is at most _MAX_SEED_LEN (237)
+        seed_part = path.name.removeprefix("checkpoint_").removesuffix(".json")
+        assert len(seed_part) <= CheckpointStore._MAX_SEED_LEN
+        # With rollback suffix the basename still fits
+        path_with_level = checkpoint_store._get_checkpoint_path(long_id, level=3)
+        assert len(path_with_level.name) <= 255
+
+    def test_long_seed_id_has_hash_suffix_for_collision_resistance(
+        self, checkpoint_store: CheckpointStore
+    ) -> None:
+        """Truncated seed ids include a hash suffix to avoid collisions."""
+        import hashlib
+
+        long_id = "a" * 300
+        sanitized = CheckpointStore._sanitize_seed_id(long_id)
+        # Must end with _<8-hex-char hash>
+        assert "_" in sanitized
+        hash_suffix = sanitized.rsplit("_", 1)[-1]
+        assert len(hash_suffix) == CheckpointStore._HASH_SUFFIX_LEN
+        # Verify the hash is derived from the full (pre-truncation) sanitized id
+        expected_hash = hashlib.sha256(long_id.encode()).hexdigest()[
+            : CheckpointStore._HASH_SUFFIX_LEN
+        ]
+        assert hash_suffix == expected_hash
+
+    def test_long_seed_id_write_and_read_roundtrip(self, checkpoint_store: CheckpointStore) -> None:
+        """Regression: a checkpoint with a very long seed_id can be written and read back."""
+        long_id = "b" * 300
+        cp = CheckpointData.create(long_id, "phase1", {"step": 42})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+
+        # The file must actually exist on disk
+        path = checkpoint_store._get_checkpoint_path(long_id)
+        assert path.exists(), f"checkpoint file was not created: {path}"
+        assert len(path.name) <= 255
+
+        # Read it back via load (which re-sanitizes the seed_id identically)
+        load_result = checkpoint_store.load(long_id)
+        assert load_result.is_ok
+        assert load_result.value.phase == "phase1"
+        assert load_result.value.state == {"step": 42}
+
+    def test_long_seed_id_different_ids_do_not_collide(
+        self, checkpoint_store: CheckpointStore
+    ) -> None:
+        """Two long seed_ids that share a 228-char prefix map to different files."""
+        prefix = "x" * 228
+        id_a = prefix + "a" * 72
+        id_b = prefix + "b" * 72
+        path_a = checkpoint_store._get_checkpoint_path(id_a)
+        path_b = checkpoint_store._get_checkpoint_path(id_b)
+        assert path_a != path_b, "distinct long seed_ids must not collide"
+
+    def test_load_with_traversal_seed_id(self, checkpoint_store: CheckpointStore) -> None:
+        """load() with a traversal seed_id is safely handled."""
+        # Save with a traversal-attempt seed_id
+        cp = CheckpointData.create("x/../secret", "phase1", {"a": 1})
+        result = checkpoint_store.save(cp)
+        assert result.is_ok
+
+        # Load with the same traversal-attempt seed_id -- sanitized consistently
+        load_result = checkpoint_store.load("x/../secret")
+        assert load_result.is_ok
+        assert load_result.value.phase == "phase1"
+        # File lives inside the base directory with sanitized name
+        expected = checkpoint_store._base_path / "checkpoint_x__secret.json"
+        assert expected.exists()
+
+
 class TestCheckpointStoreRollback:
     """Test checkpoint rollback functionality."""
 

@@ -202,6 +202,10 @@ class TestConsensusEvaluator:
         assert consensus.approved is True
         assert consensus.majority_ratio == 1.0
         assert len(consensus.votes) == 3
+        configs = [call.args[1] for call in mock_llm.complete.call_args_list]
+        assert [config.model for config in configs] == ["m1", "m2", "m3"]
+        assert all(config.role == "consensus_vote" for config in configs)
+        assert all(config.model_is_explicit for config in configs)
 
     @pytest.mark.asyncio
     async def test_consensus_rejected(
@@ -512,12 +516,10 @@ class TestDeliberativeConfig:
     def test_default_values(self) -> None:
         """Verify default configuration."""
         config = DeliberativeConfig()
-        assert (
-            "claude" in config.advocate_model.lower()
-            or "anthropic" in config.advocate_model.lower()
-        )
-        assert "gpt" in config.devil_model.lower() or "openai" in config.devil_model.lower()
-        assert "gemini" in config.judge_model.lower() or "google" in config.judge_model.lower()
+        # Models may resolve to "default" sentinel on codex backends
+        assert config.advocate_model
+        assert config.devil_model
+        assert config.judge_model
 
     def test_custom_models(self) -> None:
         """Create config with custom models."""
@@ -572,6 +574,22 @@ class TestDeliberativeConsensus:
             confidence=0.85,
         )
         return strategy
+
+    def test_default_devil_strategy_model_is_not_explicit(self, mock_llm: AsyncMock) -> None:
+        """Implicit DeliberativeConfig devil model should still allow role profile routing."""
+        evaluator = DeliberativeConsensus(mock_llm, config=DeliberativeConfig())
+
+        assert evaluator._devil_strategy.model_is_explicit is False
+
+    def test_custom_devil_strategy_model_is_explicit(self, mock_llm: AsyncMock) -> None:
+        """Caller-pinned deliberative devil models remain authoritative."""
+        evaluator = DeliberativeConsensus(
+            mock_llm,
+            config=DeliberativeConfig(devil_model="custom-devil"),
+        )
+
+        assert evaluator._devil_strategy.model_is_explicit is True
+        assert evaluator._devil_strategy.model == "custom-devil"
 
     @pytest.mark.asyncio
     async def test_deliberation_approved(

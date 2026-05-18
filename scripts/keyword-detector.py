@@ -14,15 +14,37 @@ Output: Modified prompt with skill suggestion appended
 
 import json
 from pathlib import Path
+import re
 import sys
 
+
+def _configure_utf8_stdio() -> None:
+    """Keep hook output safe on non-UTF-8 Windows locales."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if encoding and encoding.lower().replace("-", "") != "utf8" and reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_stdio()
+
 # Skills that work without MCP setup (bypass the setup gate)
-SETUP_BYPASS_SKILLS = ["/ouroboros:setup", "/ouroboros:help"]
+# qa has a built-in fallback that adopts the qa-judge agent directly
+# resume-session reads the EventStore directly — its purpose is recovering after
+# an MCP disconnect, so the no-MCP path is exactly when the user needs it.
+SETUP_BYPASS_SKILLS = [
+    "/ouroboros:setup",
+    "/ouroboros:help",
+    "/ouroboros:qa",
+    "/ouroboros:resume-session",
+]
 
 # Keyword → skill mapping
 # "ooo <cmd>" prefix always works; natural language keywords also supported
 KEYWORD_MAP = [
     # ooo prefix shortcuts (checked first for priority)
+    {"patterns": ["ooo auto"], "skill": "/ouroboros:auto"},
     {"patterns": ["ooo interview", "ooo socratic"], "skill": "/ouroboros:interview"},
     {"patterns": ["ooo seed", "ooo crystallize"], "skill": "/ouroboros:seed"},
     {"patterns": ["ooo run", "ooo execute"], "skill": "/ouroboros:run"},
@@ -35,8 +57,28 @@ KEYWORD_MAP = [
     {"patterns": ["ooo welcome"], "skill": "/ouroboros:welcome"},
     {"patterns": ["ooo setup"], "skill": "/ouroboros:setup"},
     {"patterns": ["ooo help"], "skill": "/ouroboros:help"},
-    {"patterns": ["ooo qa"], "skill": "/ouroboros:qa"},
+    {"patterns": ["ooo pm", "ooo prd"], "skill": "/ouroboros:pm"},
+    {"patterns": ["ooo qa", "qa check", "quality check"], "skill": "/ouroboros:qa"},
+    {"patterns": ["ooo cancel", "ooo abort"], "skill": "/ouroboros:cancel"},
+    {"patterns": ["ooo update", "ooo upgrade"], "skill": "/ouroboros:update"},
+    {"patterns": ["ooo brownfield"], "skill": "/ouroboros:brownfield"},
+    {"patterns": ["ooo publish"], "skill": "/ouroboros:publish"},
+    # Canonical form only. The short `ooo resume` alias was rejected because
+    # word-boundary matching would route prose like "please ooo resume work on
+    # this" to /ouroboros:resume-session, and skills/resume-session/SKILL.md
+    # explicitly chose the hyphenated name to avoid /resume collision.
+    {"patterns": ["ooo resume-session"], "skill": "/ouroboros:resume-session"},
     # Natural language triggers
+    # PM triggers must precede generic interview to avoid "pm interview" being shadowed
+    {
+        "patterns": [
+            "write prd",
+            "pm interview",
+            "product requirements",
+            "create prd",
+        ],
+        "skill": "/ouroboros:pm",
+    },
     {
         "patterns": [
             "interview me",
@@ -90,6 +132,26 @@ KEYWORD_MAP = [
     },
     {"patterns": ["ouroboros setup", "setup ouroboros"], "skill": "/ouroboros:setup"},
     {"patterns": ["ouroboros help"], "skill": "/ouroboros:help"},
+    {
+        "patterns": ["update ouroboros", "upgrade ouroboros"],
+        "skill": "/ouroboros:update",
+    },
+    {
+        "patterns": [
+            "cancel execution",
+            "stop job",
+            "kill stuck",
+            "abort execution",
+        ],
+        "skill": "/ouroboros:cancel",
+    },
+    {
+        "patterns": [
+            "brownfield defaults",
+            "brownfield scan",
+        ],
+        "skill": "/ouroboros:brownfield",
+    },
 ]
 
 
@@ -105,15 +167,58 @@ def is_mcp_configured() -> bool:
 
 
 def is_first_time() -> bool:
-    """Check if this is the user's first interaction (welcome not yet completed)."""
+    """Check if this is the user's first interaction.
+
+    Older onboarding flows wrote ``welcomeShown`` or other preference keys without
+    ``welcomeCompleted``. Treat any valid existing prefs as a non-first-run state
+    so upgrades do not repeatedly auto-trigger the welcome experience.
+    """
     try:
         prefs_path = Path.home() / ".ouroboros" / "prefs.json"
         if not prefs_path.exists():
             return True
         prefs = json.loads(prefs_path.read_text())
-        return not prefs.get("welcomeCompleted", False)
+        if not isinstance(prefs, dict):
+            return True
+        if prefs.get("welcomeCompleted") or prefs.get("welcomeShown"):
+            return False
+        return not bool(prefs)
     except Exception:
         return True
+
+
+def _word_boundary_match(pattern: str, text: str) -> bool:
+    """Match ``pattern`` against ``text`` with strong end-of-token boundaries.
+
+    The naive ``(?:^|\\b)pattern(?:\\b|$)`` form mis-matches when the
+    pattern ends in a hyphenated token. ``\\b`` triggers on any
+    word-character ↔ non-word-character transition, so a pattern like
+    ``"ooo resume-session"`` matched ``"ooo resume-session-extra"``
+    because ``\\b`` fired between ``n`` and the trailing ``-``. The
+    detector then routed legitimately-different commands (e.g. a future
+    ``ooo resume-session-cleanup``) to ``/ouroboros:resume-session``.
+
+    Tighten both sides:
+
+    * Leading boundary: start-of-string OR a non-word, non-hyphen
+      character before the pattern. Prevents ``myooo auto`` from
+      matching ``ooo auto`` (the ``\\b`` form already did this; we
+      preserve that) AND prevents a leading hyphen from forming a
+      false token break.
+    * Trailing boundary: end-of-string OR a non-word, non-hyphen
+      character. The non-hyphen requirement is what actually fixes the
+      bug: now ``ooo resume-session-extra`` no longer matches
+      ``ooo resume-session`` because the trailing ``-`` is rejected as
+      a boundary.
+
+    The pattern itself can still legitimately *contain* a hyphen
+    (``"ooo resume-session"`` matches ``"ooo resume-session"`` because
+    ``re.escape`` quotes the inner ``-`` literally and the boundary
+    only inspects the character that comes AFTER the match).
+    """
+    boundary_lead = r"(?:^|[^\w-])"
+    boundary_trail = r"(?:$|[^\w-])"
+    return bool(re.search(boundary_lead + re.escape(pattern) + boundary_trail, text))
 
 
 def detect_keywords(text: str) -> dict:
@@ -122,7 +227,7 @@ def detect_keywords(text: str) -> dict:
 
     for entry in KEYWORD_MAP:
         for pattern in entry["patterns"]:
-            if pattern in lower:
+            if _word_boundary_match(pattern, lower):
                 return {
                     "detected": True,
                     "keyword": pattern,

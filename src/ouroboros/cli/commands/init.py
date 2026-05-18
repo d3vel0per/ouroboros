@@ -5,20 +5,19 @@ Supports both LiteLLM (external API) and Claude Code (Max Plan) modes.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from enum import Enum, auto
 from pathlib import Path
 from typing import Annotated
 
 import click
-from prompt_toolkit import PromptSession
-from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from rich.prompt import Confirm, Prompt
 import typer
+import yaml
 
 from ouroboros.bigbang.ambiguity import AmbiguityScorer
 from ouroboros.bigbang.interview import (
     MIN_ROUNDS_BEFORE_EARLY_EXIT,
-    SOFT_LIMIT_WARNING_THRESHOLD,
     InterviewEngine,
     InterviewState,
     InterviewStatus,
@@ -26,9 +25,30 @@ from ouroboros.bigbang.interview import (
 from ouroboros.bigbang.seed_generator import SeedGenerator
 from ouroboros.cli.formatters import console
 from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
+from ouroboros.cli.formatters.prompting import multiline_prompt_async
+from ouroboros.config import get_clarification_model, get_llm_backend
+from ouroboros.core.errors import ProviderError
+from ouroboros.core.hitl_contract import (
+    HumanInputKind,
+    HumanInputRequest,
+    HumanInputResponse,
+    HumanInputResponseKind,
+    HumanInputRiskClass,
+    HumanInputSource,
+)
+from ouroboros.core.initial_context import (
+    load_pm_seed_as_context as _load_pm_seed_as_context_result,
+)
+from ouroboros.core.initial_context import (
+    resolve_initial_context_input,
+)
+from ouroboros.events.hitl import (
+    create_hitl_answered_event,
+    create_hitl_requested_event,
+)
 from ouroboros.observability import LoggingConfig, configure_logging
+from ouroboros.providers import create_llm_adapter, resolve_llm_backend
 from ouroboros.providers.base import LLMAdapter
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
 
 
 class SeedGenerationResult(Enum):
@@ -37,6 +57,30 @@ class SeedGenerationResult(Enum):
     SUCCESS = auto()
     CANCELLED = auto()
     CONTINUE_INTERVIEW = auto()
+
+
+class AgentRuntimeBackend(str, Enum):  # noqa: UP042
+    """Supported orchestrator runtime backends for workflow handoff."""
+
+    CLAUDE = "claude"
+    CODEX = "codex"
+    OPENCODE = "opencode"
+    HERMES = "hermes"
+    GEMINI = "gemini"
+    KIRO = "kiro"
+    COPILOT = "copilot"
+
+
+class LLMBackend(str, Enum):  # noqa: UP042
+    """Supported interview/seed LLM backends."""
+
+    CLAUDE_CODE = "claude_code"
+    LITELLM = "litellm"
+    CODEX = "codex"
+    COPILOT = "copilot"
+    OPENCODE = "opencode"
+    GEMINI = "gemini"
+    KIRO = "kiro"
 
 
 class _DefaultStartGroup(typer.core.TyperGroup):
@@ -81,6 +125,10 @@ def _make_message_callback(debug: bool):
             display = first_line[:100] + "..." if len(first_line) > 100 else first_line
             if display:
                 console.print(f"  [dim]💭 {display}[/dim]")
+        elif msg_type == "tool_started":
+            # External chat renderers and debug terminals can show tool/MCP progress
+            # before completion when providers stream start events.
+            console.print(f"  [cyan]▶ {content}[/cyan]")
         elif msg_type == "tool":
             # Tool info now includes details like "Read: /path/to/file"
             console.print(f"  [yellow]🔧 {content}[/yellow]")
@@ -88,81 +136,134 @@ def _make_message_callback(debug: bool):
     return callback
 
 
-async def _multiline_prompt_async(prompt_text: str) -> str:
-    """Get multiline input with proper paste handling.
+def _resolve_init_llm_backend(use_orchestrator: bool, backend: str | None = None) -> str:
+    """Resolve the interview LLM backend for ``init start``.
 
-    Behavior:
-    - Enter: Submit input
-    - Ctrl+J: Insert newline
-    - Paste: Multiline text is preserved (via bracketed paste mode)
-
-    Args:
-        prompt_text: The prompt to display.
-
-    Returns:
-        The user's input (may contain newlines from paste).
-
-    Raises:
-        EOFError: If end-of-file is reached (e.g., stdin closed).
-        KeyboardInterrupt: If user presses Ctrl+C.
+    Explicit ``--llm-backend`` wins. ``--orchestrator`` remains a
+    compatibility shortcut for Claude Code. Without either flag, respect the
+    persisted ``llm.backend`` config instead of forcing LiteLLM.
     """
-    bindings = KeyBindings()
-
-    @bindings.add("c-j")
-    def insert_newline(event: KeyPressEvent) -> None:
-        event.current_buffer.insert_text("\n")
-
-    @bindings.add("c-m")
-    def submit(event: KeyPressEvent) -> None:
-        event.current_buffer.validate_and_handle()
-
-    console.print(f"[bold green]{prompt_text}[/] [dim](Enter: submit, Ctrl+J: newline)[/]")
-
-    session: PromptSession[str] = PromptSession(
-        message="> ",
-        multiline=True,
-        prompt_continuation="  ",
-        key_bindings=bindings,
-    )
-
-    return await session.prompt_async()
+    if backend:
+        return backend
+    if use_orchestrator:
+        return "claude_code"
+    return get_llm_backend()
 
 
 def _get_adapter(
     use_orchestrator: bool,
+    backend: str | None = None,
     for_interview: bool = False,
     debug: bool = False,
 ) -> LLMAdapter:
     """Get the appropriate LLM adapter.
 
     Args:
-        use_orchestrator: If True, use Claude Code (Max Plan). Otherwise LiteLLM.
+        use_orchestrator: If True, default to Claude Code for compatibility.
+        backend: Optional explicit LLM backend override.
         for_interview: If True, enable Read/Glob/Grep tools for codebase exploration.
         debug: If True, show streaming messages (thinking, tool use).
 
     Returns:
         LLM adapter instance.
     """
-    if use_orchestrator:
-        from ouroboros.providers.claude_code_adapter import ClaudeCodeAdapter
+    resolved_backend = _resolve_init_llm_backend(use_orchestrator, backend)
 
-        if for_interview:
-            # Interview mode: permissive - allow MCP, read tools, etc.
-            # Only dangerous tools (Write, Edit, Bash, Task) are blocked
-            return ClaudeCodeAdapter(
-                permission_mode="bypassPermissions",  # Auto-approve tool use
-                allowed_tools=None,  # Permissive mode: MCP + read-only tools
-                max_turns=5,  # Allow more turns for MCP tool use
-                on_message=_make_message_callback(debug),
-            )
-        return ClaudeCodeAdapter()
-    else:
-        return LiteLLMAdapter()
+    if for_interview:
+        # Interview mode: request the interview-specific permission policy and
+        # debug/tool callback behavior across all backends that support it.
+        return create_llm_adapter(
+            backend=resolved_backend,
+            use_case="interview",
+            allowed_tools=None,
+            max_turns=5,
+            on_message=_make_message_callback(debug),
+            cwd=Path.cwd(),
+        )
+
+    return create_llm_adapter(backend=resolved_backend, cwd=Path.cwd())
+
+
+def _interview_hitl_request(
+    state: InterviewState,
+    *,
+    round_number: int,
+    question: str,
+    created_at: datetime | None = None,
+) -> HumanInputRequest:
+    return HumanInputRequest(
+        request_id=f"hitl_interview_{state.interview_id}_{round_number}",
+        session_id=state.interview_id,
+        run_id=state.interview_id,
+        invocation_id=f"interview-round-{round_number}",
+        created_by="ouroboros.init",
+        kind=HumanInputKind.FREE_TEXT,
+        source=HumanInputSource.INTERVIEW,
+        risk_class=HumanInputRiskClass.LOW,
+        question=question,
+        resume_target=f"init:interview:{state.interview_id}:round:{round_number}",
+        title=f"Interview round {round_number}",
+        surface="cli.init.interview",
+        created_at=created_at or datetime.now(UTC),
+    )
+
+
+def _interview_hitl_response(
+    request: HumanInputRequest,
+    response: str,
+    *,
+    received_at: datetime | None = None,
+) -> HumanInputResponse:
+    return HumanInputResponse(
+        request_id=request.request_id,
+        session_id=request.session_id,
+        run_id=request.run_id,
+        invocation_id=request.invocation_id,
+        actor="local-user",
+        response_kind=HumanInputResponseKind.TEXT,
+        text=response,
+        surface="cli.init.interview",
+        received_at=received_at or datetime.now(UTC),
+    )
+
+
+async def _append_hitl_events(event_store, events: list) -> bool:
+    if event_store is None:
+        return True
+    try:
+        await event_store.append_batch(events)
+    except Exception as exc:  # noqa: BLE001 - HITL telemetry must not block CLI init.
+        print_warning(f"HITL telemetry persistence failed; continuing without it: {exc}")
+        return False
+    return True
+
+
+async def _get_init_event_store():
+    from ouroboros.persistence.event_store import EventStore
+
+    event_store = None
+    try:
+        db_path = Path.home() / ".ouroboros" / "ouroboros.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        event_store = EventStore(f"sqlite+aiosqlite:///{db_path}")
+        await event_store.initialize()
+    except Exception as exc:  # noqa: BLE001 - init interview must not depend on telemetry.
+        if event_store is not None:
+            try:
+                await event_store.close()
+            except Exception:
+                pass
+        print_warning(f"HITL telemetry is unavailable; continuing without it: {exc}")
+        return None
+    return event_store
 
 
 async def _run_interview_loop(
     engine: InterviewEngine,
     state: InterviewState,
+    *,
+    event_store=None,
+    disabled_event_stores: set[int] | None = None,
 ) -> InterviewState:
     """Run the interview question loop until completion or user exit.
 
@@ -200,14 +301,19 @@ async def _run_interview_loop(
         console.print(f"[bold yellow]Q:[/] {question}")
         console.print()
 
+        hitl_request = _interview_hitl_request(state, round_number=current_round, question=question)
+
         # Get user response (multiline-safe for paste)
-        response = await _multiline_prompt_async("Your response")
+        response = await multiline_prompt_async("Your response")
 
         if not response.strip():
             print_error("Response cannot be empty. Please try again.")
             continue
 
-        # Record response
+        # Record and save the accepted response before best-effort HITL telemetry
+        # touches SQLite. CLI init's durable interview state must not wait behind
+        # telemetry locks/retries; HITL events are emitted only after the
+        # interview transition is durably saved.
         record_result = await engine.record_response(state, response, question)
         if record_result.is_err:
             print_error(f"Failed to record response: {record_result.error.message}")
@@ -219,18 +325,24 @@ async def _run_interview_loop(
         save_result = await engine.save_state(state)
         if save_result.is_err:
             print_error(f"Warning: Failed to save state: {save_result.error.message}")
+        elif not await _append_hitl_events(
+            event_store,
+            [
+                create_hitl_requested_event(hitl_request),
+                create_hitl_answered_event(
+                    hitl_request,
+                    _interview_hitl_response(hitl_request, response),
+                ),
+            ],
+        ):
+            if disabled_event_stores is not None and event_store is not None:
+                disabled_event_stores.add(id(event_store))
+            event_store = None
 
         console.print()
 
         # Tiered confirmation logic
         if current_round >= MIN_ROUNDS_BEFORE_EARLY_EXIT:
-            # Show warning for rounds beyond soft limit
-            if current_round >= SOFT_LIMIT_WARNING_THRESHOLD:
-                print_warning(
-                    f"Round {current_round}: Diminishing returns expected. "
-                    "Consider generating Seed to check ambiguity score."
-                )
-
             should_continue = Confirm.ask(
                 "Continue with more questions?",
                 default=True,
@@ -251,6 +363,8 @@ async def _run_interview(
     state_dir: Path | None = None,
     use_orchestrator: bool = False,
     debug: bool = False,
+    workflow_runtime_backend: str | None = None,
+    llm_backend: str | None = None,
 ) -> None:
     """Run the interview process.
 
@@ -259,12 +373,20 @@ async def _run_interview(
         resume_id: Optional interview ID to resume.
         state_dir: Optional custom state directory.
         use_orchestrator: If True, use Claude Code (Max Plan) instead of LiteLLM.
+        workflow_runtime_backend: Optional agent runtime backend for the workflow handoff.
+        llm_backend: Optional LLM backend override for interview and seed generation.
     """
     # Initialize components
-    llm_adapter = _get_adapter(use_orchestrator, for_interview=True, debug=debug)
+    llm_adapter = _get_adapter(
+        use_orchestrator,
+        backend=llm_backend,
+        for_interview=True,
+        debug=debug,
+    )
     engine = InterviewEngine(
         llm_adapter=llm_adapter,
         state_dir=state_dir or Path.home() / ".ouroboros" / "data",
+        model=get_clarification_model(llm_backend),
     )
 
     # Load or start interview
@@ -289,70 +411,102 @@ async def _run_interview(
     console.print()
 
     # Run initial interview loop
-    state = await _run_interview_loop(engine, state)
+    event_store = await _get_init_event_store()
+    disabled_event_stores: set[int] = set()
 
-    # Outer loop for retry on high ambiguity
-    while True:
-        # Interview complete
+    try:
+        loop_event_store = None if event_store is None else event_store
+        state = await _run_interview_loop(
+            engine,
+            state,
+            event_store=loop_event_store,
+            disabled_event_stores=disabled_event_stores,
+        )
+
+        # Outer loop for retry on high ambiguity
+        while True:
+            # Interview complete
+            console.print()
+            print_success("Interview completed!")
+            console.print(f"[muted]Total rounds: {len(state.rounds)}[/]")
+            console.print(f"[muted]Interview ID: {state.interview_id}[/]")
+
+            # Save final state
+            save_result = await engine.save_state(state)
+            if save_result.is_ok:
+                console.print(f"[muted]State saved to: {save_result.value}[/]")
+
+            console.print()
+
+            # Ask if user wants to proceed to Seed generation
+            should_generate_seed = Confirm.ask(
+                "[bold cyan]Proceed to generate Seed specification?[/]",
+                default=True,
+            )
+
+            if not should_generate_seed:
+                console.print(
+                    "[muted]You can resume later with:[/] "
+                    f"[bold]ouroboros init start --resume {state.interview_id}[/]"
+                )
+                return
+
+            # Generate Seed
+            seed_path, result = await _generate_seed_from_interview(state, llm_adapter, llm_backend)
+
+            if result == SeedGenerationResult.CONTINUE_INTERVIEW:
+                # Re-open interview for more questions
+                console.print()
+                print_info("Continuing interview to reduce ambiguity...")
+                state.status = InterviewStatus.IN_PROGRESS
+                await engine.save_state(state)  # Save status change immediately
+
+                # Continue interview loop (reusing the same helper)
+                loop_event_store = (
+                    None
+                    if event_store is None or id(event_store) in disabled_event_stores
+                    else event_store
+                )
+                state = await _run_interview_loop(
+                    engine,
+                    state,
+                    event_store=loop_event_store,
+                    disabled_event_stores=disabled_event_stores,
+                )
+                continue
+
+            if result == SeedGenerationResult.CANCELLED:
+                return
+
+            # Success - proceed to workflow
+            break
+
+        # Ask if user wants to start workflow
         console.print()
-        print_success("Interview completed!")
-        console.print(f"[muted]Total rounds: {len(state.rounds)}[/]")
-        console.print(f"[muted]Interview ID: {state.interview_id}[/]")
-
-        # Save final state
-        save_result = await engine.save_state(state)
-        if save_result.is_ok:
-            console.print(f"[muted]State saved to: {save_result.value}[/]")
-
-        console.print()
-
-        # Ask if user wants to proceed to Seed generation
-        should_generate_seed = Confirm.ask(
-            "[bold cyan]Proceed to generate Seed specification?[/]",
+        should_start_workflow = Confirm.ask(
+            "[bold cyan]Start workflow now?[/]",
             default=True,
         )
 
-        if not should_generate_seed:
-            console.print(
-                "[muted]You can resume later with:[/] "
-                f"[bold]ouroboros init start --resume {state.interview_id}[/]"
+        if should_start_workflow:
+            await _start_workflow(
+                seed_path,
+                use_orchestrator,
+                runtime_backend=workflow_runtime_backend,
             )
-            return
 
-        # Generate Seed
-        seed_path, result = await _generate_seed_from_interview(state, llm_adapter)
-
-        if result == SeedGenerationResult.CONTINUE_INTERVIEW:
-            # Re-open interview for more questions
-            console.print()
-            print_info("Continuing interview to reduce ambiguity...")
-            state.status = InterviewStatus.IN_PROGRESS
-            await engine.save_state(state)  # Save status change immediately
-
-            # Continue interview loop (reusing the same helper)
-            state = await _run_interview_loop(engine, state)
-            continue
-
-        if result == SeedGenerationResult.CANCELLED:
-            return
-
-        # Success - proceed to workflow
-        break
-
-    # Ask if user wants to start workflow
-    console.print()
-    should_start_workflow = Confirm.ask(
-        "[bold cyan]Start workflow now?[/]",
-        default=True,
-    )
-
-    if should_start_workflow:
-        await _start_workflow(seed_path, use_orchestrator)
+    finally:
+        if event_store is not None:
+            try:
+                await event_store.close()
+            except Exception:
+                pass
 
 
 async def _generate_seed_from_interview(
     state: InterviewState,
     llm_adapter: LLMAdapter,
+    llm_backend: str | None = None,
 ) -> tuple[Path | None, SeedGenerationResult]:
     """Generate Seed from completed interview.
 
@@ -368,7 +522,10 @@ async def _generate_seed_from_interview(
 
     # Step 1: Calculate ambiguity score
     with console.status("[cyan]Calculating ambiguity score...[/]", spinner="dots"):
-        scorer = AmbiguityScorer(llm_adapter=llm_adapter)
+        scorer = AmbiguityScorer(
+            llm_adapter=llm_adapter,
+            model=get_clarification_model(llm_backend),
+        )
         score_result = await scorer.score(state)
 
     if score_result.is_err:
@@ -404,24 +561,22 @@ async def _generate_seed_from_interview(
 
     # Step 2: Generate Seed
     with console.status("[cyan]Generating Seed from interview...[/]", spinner="dots"):
-        generator = SeedGenerator(llm_adapter=llm_adapter)
-        # For forced generation, we need to bypass the threshold check
-        if ambiguity_score.is_ready_for_seed:
-            seed_result = await generator.generate(state, ambiguity_score)
-        else:
-            # TODO: Add force=True parameter to SeedGenerator.generate() instead of this hack
-            # Creating a modified score to bypass threshold check
-            from ouroboros.bigbang.ambiguity import AmbiguityScore as AmbScore
-
-            FORCED_SCORE_VALUE = 0.19  # Just under threshold (0.2)
-            forced_score = AmbScore(
-                overall_score=FORCED_SCORE_VALUE,
-                breakdown=ambiguity_score.breakdown,
-            )
-            seed_result = await generator.generate(state, forced_score)
+        generator = SeedGenerator(
+            llm_adapter=llm_adapter,
+            model=get_clarification_model(llm_backend),
+        )
+        seed_result = await generator.generate(
+            state,
+            ambiguity_score,
+            force=not ambiguity_score.is_ready_for_seed,
+        )
 
     if seed_result.is_err:
-        print_error(f"Failed to generate Seed: {seed_result.error.message}")
+        error = seed_result.error
+        if isinstance(error, ProviderError):
+            print_error(f"Failed to generate Seed: {error.format_details()}")
+        else:
+            print_error(f"Failed to generate Seed: {error.message}")
         return None, SeedGenerationResult.CANCELLED
 
     seed = seed_result.value
@@ -439,7 +594,10 @@ async def _generate_seed_from_interview(
 
 
 async def _start_workflow(
-    seed_path: Path, use_orchestrator: bool = False, parallel: bool = True
+    seed_path: Path,
+    use_orchestrator: bool = False,
+    parallel: bool = True,
+    runtime_backend: str | None = None,
 ) -> None:
     """Start workflow from generated seed.
 
@@ -447,6 +605,7 @@ async def _start_workflow(
         seed_path: Path to the seed YAML file.
         use_orchestrator: Whether to use Claude Code orchestrator.
         parallel: Execute independent ACs in parallel. Default: True.
+        runtime_backend: Optional runtime backend for orchestrator execution.
     """
     console.print()
     console.print("[bold cyan]Starting workflow...[/]")
@@ -456,7 +615,12 @@ async def _start_workflow(
         from ouroboros.cli.commands.run import _run_orchestrator
 
         try:
-            await _run_orchestrator(seed_path, resume_session=None, parallel=parallel)
+            await _run_orchestrator(
+                seed_path,
+                resume_session=None,
+                parallel=parallel,
+                runtime_backend=runtime_backend,
+            )
         except typer.Exit:
             pass  # Normal exit
         except KeyboardInterrupt:
@@ -465,6 +629,164 @@ async def _start_workflow(
         # Standard workflow (placeholder for now)
         print_info(f"Would execute workflow from: {seed_path}")
         print_info("Standard workflow execution not yet implemented.")
+
+
+def _find_pm_seeds(seeds_dir: Path | None = None) -> list[Path]:
+    """Find all pm_seed YAML files in the seeds directory.
+
+    Args:
+        seeds_dir: Directory to scan. Defaults to ~/.ouroboros/seeds/.
+
+    Returns:
+        List of paths to pm_seed files (JSON or YAML), sorted by modification time (newest first).
+    """
+    seeds_dir = seeds_dir or Path.home() / ".ouroboros" / "seeds"
+    if not seeds_dir.is_dir():
+        return []
+    # Support both JSON (new) and YAML (legacy) PM seed formats
+    pm_seeds = sorted(
+        list(seeds_dir.glob("pm_seed_*.json")) + list(seeds_dir.glob("pm_seed_*.yaml")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return pm_seeds
+
+
+def _has_dev_seed(seeds_dir: Path | None = None) -> bool:
+    """Check if any dev seed (non-PM) exists in the seeds directory.
+
+    Looks for seed.json or any YAML seed file that is NOT a pm_seed.
+
+    Args:
+        seeds_dir: Directory to check. Defaults to ~/.ouroboros/seeds/.
+
+    Returns:
+        True if a dev seed file exists.
+    """
+    seeds_dir = seeds_dir or Path.home() / ".ouroboros" / "seeds"
+    if not seeds_dir.is_dir():
+        return False
+    # Check for seed.json
+    if (seeds_dir / "seed.json").exists():
+        return True
+    # Check for any non-pm seed YAML files
+    return any(not yaml_file.name.startswith("pm_seed_") for yaml_file in seeds_dir.glob("*.yaml"))
+
+
+def _display_pm_seed_info(seed_path: Path) -> dict[str, str]:
+    """Read and display summary info for a PM seed file.
+
+    Args:
+        seed_path: Path to the pm_seed YAML file.
+
+    Returns:
+        Dict with 'name', 'goal', and 'pm_id' extracted from the file.
+        Falls back to defaults if the file is malformed.
+    """
+    try:
+        with open(seed_path) as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise ValueError("PM seed file is not a YAML mapping")
+        name = data.get("product_name", "") or "Unnamed"
+        goal = data.get("goal", "") or "No goal specified"
+        pm_id = data.get("pm_id", seed_path.stem)
+    except (yaml.YAMLError, OSError, ValueError, AttributeError):
+        name = seed_path.stem
+        goal = "No goal specified"
+        pm_id = seed_path.stem
+    return {"name": name, "goal": goal, "pm_id": pm_id}
+
+
+def _notify_pm_seed_detected(pm_seeds: list[Path]) -> None:
+    """Display a prominent notification that PM seed(s) were auto-detected.
+
+    Shows a bordered panel with seed details so the user clearly sees
+    that PM output is available for use as dev interview context.
+
+    Args:
+        pm_seeds: List of detected PM seed file paths.
+    """
+    console.print()
+    console.print("[bold cyan]╔══════════════════════════════════════════════╗[/]")
+    console.print(
+        "[bold cyan]║[/]  [bold yellow]PM Seed Auto-Detected[/]                      [bold cyan]║[/]"
+    )
+    console.print("[bold cyan]╚══════════════════════════════════════════════╝[/]")
+    console.print()
+
+    for seed_path in pm_seeds:
+        info = _display_pm_seed_info(seed_path)
+        goal_display = info["goal"][:80] + "..." if len(info["goal"]) > 80 else info["goal"]
+        console.print(f"  [bold]{info['name']}[/] [dim]({info['pm_id']})[/]")
+        console.print(f"  [dim]{goal_display}[/]")
+        console.print()
+
+    console.print(
+        "[dim]A PM seed contains product requirements from a prior PM interview.\n"
+        "Using it as initial context gives the dev interview a head start.[/]"
+    )
+    console.print()
+
+
+def _prompt_pm_seed_selection(pm_seeds: list[Path]) -> Path | None:
+    """Prompt user to select a PM seed to use as initial context.
+
+    Shows a notification banner, lists available seeds, and asks the user
+    to pick one or skip. For a single seed, offers a simple yes/no confirmation.
+
+    Args:
+        pm_seeds: List of available PM seed paths.
+
+    Returns:
+        Selected PM seed path, or None if user declines.
+    """
+    _notify_pm_seed_detected(pm_seeds)
+
+    if len(pm_seeds) == 1:
+        # Single seed — simple yes/no confirmation
+        use_it = Confirm.ask(
+            "[yellow]Use this PM seed as initial context for the dev interview?[/]",
+            default=True,
+        )
+        return pm_seeds[0] if use_it else None
+
+    # Multiple seeds — numbered selection
+    console.print("[bold]Available PM seeds:[/]")
+    console.print()
+    for i, seed_path in enumerate(pm_seeds, 1):
+        info = _display_pm_seed_info(seed_path)
+        goal_display = info["goal"][:80] + "..." if len(info["goal"]) > 80 else info["goal"]
+        console.print(f"  [cyan]{i}[/] - [bold]{info['name']}[/] ({info['pm_id']})")
+        console.print(f"      {goal_display}")
+    console.print("  [cyan]0[/] - Skip (start fresh interview)")
+    console.print()
+
+    choice = Prompt.ask(
+        "[yellow]Select PM seed[/]",
+        choices=[str(i) for i in range(len(pm_seeds) + 1)],
+        default="1",
+    )
+
+    idx = int(choice)
+    if idx == 0:
+        return None
+    return pm_seeds[idx - 1]
+
+
+def _load_pm_seed_as_context(seed_path: Path) -> str:
+    """Load a PM seed YAML and convert to initial_context string.
+
+    Args:
+        seed_path: Path to the pm_seed YAML file.
+
+    Returns:
+        YAML-formatted string for use as dev interview initial_context.
+    """
+    result = _load_pm_seed_as_context_result(seed_path)
+    if result.is_err:
+        raise ValueError(str(result.error))
+    return result.value
 
 
 @app.command()
@@ -499,6 +821,28 @@ def start(
             help="Use Claude Code (Max Plan) instead of LiteLLM. No API key required.",
         ),
     ] = False,
+    runtime: Annotated[
+        AgentRuntimeBackend | None,
+        typer.Option(
+            "--runtime",
+            help=(
+                "Agent runtime backend for the workflow execution step after seed generation "
+                "(claude, codex, opencode, hermes, gemini, copilot, or kiro)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
+    llm_backend: Annotated[
+        LLMBackend | None,
+        typer.Option(
+            "--llm-backend",
+            help=(
+                "LLM backend for interview, ambiguity scoring, and seed generation "
+                "(claude_code, litellm, codex, copilot, opencode, or gemini)."
+            ),
+            case_sensitive=False,
+        ),
+    ] = None,
     debug: Annotated[
         bool,
         typer.Option(
@@ -518,23 +862,63 @@ def start(
 
         ouroboros init start --orchestrator "Build a REST API"
 
+        ouroboros init start --orchestrator --runtime codex "Build a REST API"
+
+        ouroboros init start --llm-backend codex "Build a REST API"
+
         ouroboros init start --resume interview_20260116_120000
 
         ouroboros init start
     """
     # Get initial context if not provided
-    if not resume and not context:
-        console.print("[bold cyan]Welcome to Ouroboros Interview![/]")
-        console.print()
-        console.print(
-            "This interactive process will help refine your ideas into clear requirements.",
-        )
-        console.print(
-            "You control when to stop - no arbitrary round limit.",
-        )
-        console.print()
+    if not resume:
+        # Auto-detect PM seeds and offer to use as context
+        seeds_dir = Path.home() / ".ouroboros" / "seeds"
+        if not _has_dev_seed(seeds_dir):
+            pm_seeds = _find_pm_seeds(seeds_dir)
+            if pm_seeds:
+                if context:
+                    # User provided context but PM seed exists — notify and ask
+                    _notify_pm_seed_detected(pm_seeds)
+                    use_pm = Confirm.ask(
+                        "[yellow]Use PM seed instead of the provided context?[/]",
+                        default=False,
+                    )
+                    if use_pm:
+                        selected = (
+                            _prompt_pm_seed_selection(pm_seeds)
+                            if len(pm_seeds) > 1
+                            else pm_seeds[0]
+                        )
+                        if selected:
+                            context = _load_pm_seed_as_context(selected)
+                            print_success(f"Using PM seed: {selected.name}")
+                else:
+                    # No context provided — offer PM seed as primary option
+                    selected = _prompt_pm_seed_selection(pm_seeds)
+                    if selected:
+                        context = _load_pm_seed_as_context(selected)
+                        print_success(f"Using PM seed: {selected.name}")
 
-        context = asyncio.run(_multiline_prompt_async("What would you like to build?"))
+        if not context:
+            console.print("[bold cyan]Welcome to Ouroboros Interview![/]")
+            console.print()
+            console.print(
+                "This interactive process will help refine your ideas into clear requirements.",
+            )
+            console.print(
+                "You control when to stop - no arbitrary round limit.",
+            )
+            console.print()
+
+            context = asyncio.run(multiline_prompt_async("What would you like to build?"))
+
+        if context:
+            resolved_context = resolve_initial_context_input(context, cwd=Path.cwd())
+            if resolved_context.is_err:
+                print_error(str(resolved_context.error))
+                raise typer.Exit(code=1)
+            context = resolved_context.value
 
     if not resume and not context:
         print_error("Initial context is required when not resuming.")
@@ -545,15 +929,43 @@ def start(
         configure_logging(LoggingConfig(log_level="DEBUG"))
         print_info("Debug mode enabled - showing verbose logs")
 
+    if runtime and not orchestrator:
+        print_warning(
+            "--runtime only affects the workflow execution step when --orchestrator is enabled."
+        )
+
     # Show mode info
-    if orchestrator:
+    selected_llm_backend = _resolve_init_llm_backend(
+        orchestrator,
+        llm_backend.value if llm_backend else None,
+    )
+    resolved_llm_backend = resolve_llm_backend(selected_llm_backend)
+    if resolved_llm_backend == "claude_code":
         print_info("Using Claude Code (Max Plan) - no API key required")
-    else:
+    elif resolved_llm_backend == "litellm":
         print_info("Using LiteLLM - API key required")
+    else:
+        print_info(f"Using {resolved_llm_backend} interview backend")
+
+    if orchestrator and runtime:
+        print_info(f"Workflow runtime backend: {runtime.value}")
+
+    if llm_backend:
+        print_info(f"Interview LLM backend: {llm_backend.value}")
 
     # Run interview
     try:
-        asyncio.run(_run_interview(context or "", resume, state_dir, orchestrator, debug))
+        asyncio.run(
+            _run_interview(
+                context or "",
+                resume,
+                state_dir,
+                orchestrator,
+                debug,
+                runtime.value if runtime else None,
+                llm_backend.value if llm_backend else None,
+            )
+        )
     except KeyboardInterrupt:
         console.print()
         print_info("Interview interrupted. Progress has been saved.")
@@ -577,7 +989,7 @@ def list_interviews(
     ] = None,
 ) -> None:
     """List all interview sessions."""
-    llm_adapter = LiteLLMAdapter()
+    llm_adapter = create_llm_adapter(backend="litellm")
     engine = InterviewEngine(
         llm_adapter=llm_adapter,
         state_dir=state_dir or Path.home() / ".ouroboros" / "data",

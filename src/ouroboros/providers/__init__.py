@@ -1,8 +1,8 @@
 """LLM provider adapters for Ouroboros.
 
 This module provides unified access to LLM providers through the LLMAdapter
-protocol. The default adapter is AnthropicAdapter (direct Claude API calls).
-LiteLLMAdapter is available for multi-provider routing via OpenRouter.
+protocol, plus factory helpers for selecting local Claude Code or LiteLLM-backed
+providers from configuration.
 """
 
 from ouroboros.providers.anthropic_adapter import AnthropicAdapter
@@ -14,7 +14,41 @@ from ouroboros.providers.base import (
     MessageRole,
     UsageInfo,
 )
-from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+from ouroboros.providers.factory import (
+    create_llm_adapter,
+    resolve_llm_backend,
+    resolve_llm_permission_mode,
+)
+
+
+def __getattr__(name: str) -> object:
+    """Lazy import for optional adapters to avoid hard dependency on optional packages."""
+    if name == "LiteLLMAdapter":
+        from ouroboros.providers.litellm_adapter import LiteLLMAdapter
+
+        return LiteLLMAdapter
+    if name == "CodexCliLLMAdapter":
+        from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
+
+        return CodexCliLLMAdapter
+    if name == "CopilotCliLLMAdapter":
+        from ouroboros.providers.copilot_cli_adapter import CopilotCliLLMAdapter
+
+        return CopilotCliLLMAdapter
+    if name == "OpenCodeLLMAdapter":
+        from ouroboros.providers.opencode_adapter import OpenCodeLLMAdapter
+
+        return OpenCodeLLMAdapter
+    if name == "HermesCliLLMAdapter":
+        from ouroboros.providers.hermes_cli_adapter import HermesCliLLMAdapter
+
+        return HermesCliLLMAdapter
+    if name == "GooseCliLLMAdapter":
+        from ouroboros.providers.goose_cli_adapter import GooseCliLLMAdapter
+
+        return GooseCliLLMAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Protocol
@@ -27,5 +61,14 @@ __all__ = [
     "UsageInfo",
     # Implementations (AnthropicAdapter is the recommended default)
     "AnthropicAdapter",
+    "CodexCliLLMAdapter",
+    "CopilotCliLLMAdapter",
+    "OpenCodeLLMAdapter",
+    "HermesCliLLMAdapter",
+    "GooseCliLLMAdapter",
     "LiteLLMAdapter",
+    # Factory helpers
+    "create_llm_adapter",
+    "resolve_llm_backend",
+    "resolve_llm_permission_mode",
 ]

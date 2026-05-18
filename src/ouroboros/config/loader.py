@@ -8,30 +8,210 @@ Functions:
     load_credentials: Load credentials from ~/.ouroboros/credentials.yaml
     create_default_config: Create default configuration files
     ensure_config_dir: Ensure ~/.ouroboros/ directory exists
-    get_cli_path: Get CLI path from env var or config
+    get_agent_runtime_backend: Get orchestrator runtime backend from env var or config
+    get_runtime_profile: Get orchestrator backend profile (e.g. "worker") from env var or config
+    get_agent_permission_mode: Get orchestrator permission mode from env var or config
+    get_llm_backend: Get LLM-only backend from env var or config
+    get_llm_permission_mode: Get LLM-only permission mode from env var or config
+    get_clarification_model: Get clarification model from env var or config
+    get_qa_model: Get QA model from env var or config
+    get_dependency_analysis_model: Get dependency analysis model from env var or config
+    get_ontology_analysis_model: Get ontology analysis model from env var or config
+    get_context_compression_model: Get context compression model from env var or config
+    get_atomicity_model: Get atomicity model from env var or config
+    get_decomposition_model: Get decomposition model from env var or config
+    get_double_diamond_model: Get Double Diamond model from env var or config
+    get_wonder_model: Get Wonder model from env var or config
+    get_reflect_model: Get Reflect model from env var or config
+    get_semantic_model: Get semantic evaluation model from env var or config
+    get_assertion_extraction_model: Get verification assertion extraction model
+    get_consensus_models: Get consensus model roster from env var or config
+    get_consensus_advocate_model: Get deliberative advocate model from env var or config
+    get_consensus_devil_model: Get deliberative devil model from env var or config
+    get_consensus_judge_model: Get deliberative judge model from env var or config
+    get_cli_path: Get Claude CLI path from env var or config
+    get_codex_cli_path: Get Codex CLI path from env var or config
+    get_opencode_cli_path: Get OpenCode CLI path from env var or config
+    get_hermes_cli_path: Get Hermes CLI path from env var or config
+    get_goose_cli_path: Get Goose CLI path from env var or config
 """
 
+import ast
+import math
 import os
 from pathlib import Path
+import shutil
 import stat
 from typing import Any
 
-from dotenv import load_dotenv
 from pydantic import ValidationError as PydanticValidationError
 import yaml
 
-# Load .env file from current directory and ~/.ouroboros/
-load_dotenv()  # Current directory .env
-load_dotenv(Path.home() / ".ouroboros" / ".env")  # Global .env
-
+from ouroboros.backends import get_backend_capability
 from ouroboros.config.models import (  # noqa: E402
     CredentialsConfig,
     OuroborosConfig,
+    RuntimeControlsConfig,
     get_config_dir,
     get_default_config,
     get_default_credentials,
 )
 from ouroboros.core.errors import ConfigError  # noqa: E402
+
+_CODEX_LLM_BACKENDS = frozenset({"codex", "codex_cli", "opencode", "opencode_cli"})
+_KIRO_LLM_BACKENDS = frozenset({"kiro", "kiro_cli"})
+_COPILOT_LLM_BACKENDS = frozenset({"copilot", "copilot_cli"})
+_HERMES_LLM_BACKENDS = frozenset({"hermes", "hermes_cli"})
+_OPENCODE_BACKENDS = frozenset({"opencode", "opencode_cli"})
+_CODEX_DEFAULT_MODEL = "default"
+_KIRO_DEFAULT_MODEL = "default"
+_COPILOT_DEFAULT_MODEL = "default"
+_HERMES_DEFAULT_MODEL = "default"
+_PLACEHOLDER_API_KEY_PREFIX = "YOUR_"
+_PLACEHOLDER_API_KEY_SUFFIX = "_API_KEY"
+_DEFAULT_MAX_PARALLEL_WORKERS = 3
+_DEFAULT_CONSENSUS_MODELS = (
+    "openrouter/openai/gpt-4o",
+    "openrouter/anthropic/claude-opus-4-6",
+    "openrouter/google/gemini-2.5-pro",
+)
+_DEFAULT_CONSENSUS_ADVOCATE_MODEL = "openrouter/anthropic/claude-opus-4-6"
+_DEFAULT_CONSENSUS_DEVIL_MODEL = "openrouter/openai/gpt-4o"
+_DEFAULT_CONSENSUS_JUDGE_MODEL = "openrouter/google/gemini-2.5-pro"
+_DEFAULT_USAGE_LIMIT_PAUSE_HOURS = 5.0
+_SECONDS_PER_HOUR = 3600
+_USAGE_LIMIT_PAUSE_CONFIG_KEY = "orchestrator.usage_limit_pause_hours"
+_RUNTIME_CONTROL_ENV_KEYS = {
+    "OUROBOROS_MCP_TOOL_TIMEOUT_SECONDS": "mcp_tool_timeout_seconds",
+    "OUROBOROS_GENERATION_IDLE_TIMEOUT_SECONDS": "generation_idle_timeout_seconds",
+    "OUROBOROS_GENERATION_NO_PROGRESS_TIMEOUT_SECONDS": ("generation_no_progress_timeout_seconds"),
+    "OUROBOROS_GENERATION_SAFETY_TIMEOUT_SECONDS": "generation_safety_timeout_seconds",
+    "OUROBOROS_WATCHDOG_POLL_SECONDS": "watchdog_poll_seconds",
+}
+
+
+def _parse_env_value(raw_value: str) -> str:
+    candidate = raw_value.strip()
+    if not candidate:
+        return ""
+
+    if candidate[0] in {'"', "'"} and candidate[-1:] == candidate[0]:
+        try:
+            parsed = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            return candidate[1:-1]
+        return str(parsed)
+
+    comment_index = candidate.find(" #")
+    if comment_index != -1:
+        candidate = candidate[:comment_index]
+    return candidate.rstrip()
+
+
+def _is_placeholder_api_key(value: str) -> bool:
+    """Treat common template placeholders as unset."""
+    candidate = value.strip()
+    return bool(
+        candidate
+        and candidate.startswith(_PLACEHOLDER_API_KEY_PREFIX)
+        and candidate.endswith(_PLACEHOLDER_API_KEY_SUFFIX)
+    )
+
+
+# Environment variables that determine HOW Ouroboros executes work. This
+# is the single authoritative trust boundary: a cloned repository's `.env`
+# must not be able to change which binary runs or whether the user's
+# approval gate applies. Three classes, all remote-code-execution sinks
+# when sourced from an untrusted location:
+#   1. Explicit CLI path overrides fed straight into a subprocess.
+#   2. Runtime/backend selectors that pick which adapter (and therefore
+#      which executable) is spawned — a selector can route to a backend
+#      whose CLI then resolves via a weak shutil.which / bare-name lookup.
+#   3. Permission-mode overrides — setting acceptEdits/bypassPermissions
+#      silently removes the human approval gate, letting a malicious repo
+#      auto-approve arbitrary tool calls (effectively RCE).
+# These keys are only honored from trusted sources (the real process
+# environment, ~/.ouroboros/.env, ~/.ouroboros/config.yaml), never from
+# the project-directory .env that travels with a cloned repo. Trusted .env
+# files still follow the loader's normal "do not override an already-set
+# real process environment value" precedence. Enforcing this here — at the
+# .env load — keeps the policy in one place rather than split across
+# downstream sinks.
+_UNTRUSTED_ENV_DENYLIST = frozenset(
+    {
+        # Search PATH used by shutil.which()/bare executable spawning.
+        "PATH",
+        # Explicit executable-path overrides.
+        "OUROBOROS_CLI_PATH",
+        "OUROBOROS_CODEX_CLI_PATH",
+        "OUROBOROS_COPILOT_CLI_PATH",
+        "OUROBOROS_KIRO_CLI_PATH",
+        "OUROBOROS_OPENCODE_CLI_PATH",
+        "OUROBOROS_HERMES_CLI_PATH",
+        "OUROBOROS_GOOSE_CLI_PATH",
+        "OUROBOROS_GEMINI_CLI_PATH",
+        # Bare provider aliases (no OUROBOROS_ prefix) that adapters also
+        # honor and then execute. Any new such alias MUST be added here:
+        # `opencode_config._configured_opencode_cli_path` reads
+        # OPENCODE_CLI_PATH and runs it via subprocess.run.
+        "OPENCODE_CLI_PATH",
+        # Runtime/backend selectors — choose which adapter is spawned.
+        "OUROBOROS_AGENT_RUNTIME",
+        "OUROBOROS_RUNTIME",
+        "OUROBOROS_LLM_BACKEND",
+        # Permission-mode overrides — must not silently disable the
+        # user's approval gate from an untrusted repo.
+        "OUROBOROS_AGENT_PERMISSION_MODE",
+        "OUROBOROS_LLM_PERMISSION_MODE",
+        "OUROBOROS_OPENCODE_PERMISSION_MODE",
+    }
+)
+
+
+def _is_untrusted_env_denied_key(key: str) -> bool:
+    """Return whether an untrusted .env key may alter execution routing."""
+    return key.upper() in _UNTRUSTED_ENV_DENYLIST
+
+
+def _load_env_file(path: Path, *, trusted: bool = False) -> None:
+    if not path.is_file():
+        return
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not key or any(ch.isspace() for ch in key):
+            continue
+
+        if not trusted and _is_untrusted_env_denied_key(key):
+            # Untrusted project-directory .env must not redirect which
+            # binary Ouroboros executes (remote code execution guard).
+            continue
+
+        parsed_value = _parse_env_value(raw_value)
+        if not parsed_value or _is_placeholder_api_key(parsed_value):
+            continue
+
+        current_value = os.environ.get(key)
+        if current_value is None or _is_placeholder_api_key(current_value):
+            os.environ[key] = parsed_value
+
+
+# The project-directory .env travels with whatever repository the user
+# cloned and is therefore untrusted; ~/.ouroboros/.env lives in the user's
+# home and is trusted. The trust flag gates execution-redirecting keys above.
+# `_load_env_file` defaults to trusted=False (fail-closed) so any future
+# caller is safe-by-default; trust must be opted into explicitly.
+_load_env_file(Path(".env"), trusted=False)
+_load_env_file(Path.home() / ".ouroboros" / ".env", trusted=True)
 
 
 def ensure_config_dir() -> Path:
@@ -190,16 +370,26 @@ def load_config(config_path: Path | None = None) -> OuroborosConfig:
         return OuroborosConfig.model_validate(config_dict)
     except PydanticValidationError as e:
         # Format validation errors for clarity
+        validation_errors = e.errors()
         error_messages = []
-        for error in e.errors():
+        config_keys = []
+        for error in validation_errors:
             loc = ".".join(str(x) for x in error["loc"])
             msg = error["msg"]
             error_messages.append(f"  - {loc}: {msg}")
+            if loc:
+                config_keys.append(loc)
+
+        config_key = config_keys[0] if len(validation_errors) == 1 and config_keys else None
 
         raise ConfigError(
             "Configuration validation failed:\n" + "\n".join(error_messages),
+            config_key=config_key,
             config_file=str(config_path),
-            details={"validation_errors": e.errors()},
+            details={
+                "validation_errors": validation_errors,
+                "config_keys": config_keys,
+            },
         ) from e
 
 
@@ -296,8 +486,99 @@ def credentials_file_secure(credentials_path: Path | None = None) -> bool:
     return (file_mode & 0o777) == 0o600
 
 
+def _runtime_controls_error(error: ConfigError) -> bool:
+    """Return True when a config validation error concerns runtime_controls."""
+    if error.config_key and error.config_key.startswith("runtime_controls"):
+        return True
+    config_keys = error.details.get("config_keys") if isinstance(error.details, dict) else None
+    return isinstance(config_keys, list) and any(
+        str(config_key).startswith("runtime_controls") for config_key in config_keys
+    )
+
+
+def _parse_runtime_control_number(
+    raw_value: str,
+    *,
+    config_key: str,
+    allow_float: bool = False,
+    allow_zero: bool = True,
+) -> int | float:
+    """Parse a runtime-control value from an environment variable."""
+    candidate = raw_value.strip()
+    try:
+        parsed = float(candidate) if allow_float else int(candidate)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{config_key} must be a {'positive number' if allow_float else 'non-negative integer'}",
+            config_key=config_key,
+            details={"value": raw_value},
+        ) from exc
+
+    if allow_float:
+        if parsed < 0 or (not allow_zero and parsed == 0):
+            raise ConfigError(
+                f"{config_key} must be {'greater than 0' if not allow_zero else 'greater than or equal to 0'}",
+                config_key=config_key,
+                details={"value": raw_value},
+            )
+        return parsed
+
+    if parsed < 0:
+        raise ConfigError(
+            f"{config_key} must be greater than or equal to 0",
+            config_key=config_key,
+            details={"value": raw_value},
+        )
+    return parsed
+
+
+def get_runtime_controls_config() -> RuntimeControlsConfig:
+    """Get progress-aware runtime controls from config and environment.
+
+    Priority:
+        1. Dedicated environment variable overrides
+        2. Legacy OUROBOROS_GENERATION_TIMEOUT as the no-progress timeout
+        3. config.yaml runtime_controls section
+        4. built-in defaults
+
+    The legacy generation timeout maps to semantic no-material-progress
+    detection, not to the MCP adapter wall-clock timeout.
+    """
+    try:
+        controls = load_config().runtime_controls
+    except ConfigError as exc:
+        if _runtime_controls_error(exc):
+            raise
+        controls = RuntimeControlsConfig()
+
+    updates: dict[str, float] = {}
+    for env_key, field_name in _RUNTIME_CONTROL_ENV_KEYS.items():
+        env_value = os.environ.get(env_key, "").strip()
+        if not env_value:
+            continue
+        updates[field_name] = _parse_runtime_control_number(
+            env_value,
+            config_key=env_key,
+            allow_float=True,
+            allow_zero=field_name != "watchdog_poll_seconds",
+        )
+
+    legacy_generation_timeout = os.environ.get("OUROBOROS_GENERATION_TIMEOUT", "").strip()
+    if legacy_generation_timeout and "generation_no_progress_timeout_seconds" not in updates:
+        updates["generation_no_progress_timeout_seconds"] = _parse_runtime_control_number(
+            legacy_generation_timeout,
+            config_key="OUROBOROS_GENERATION_TIMEOUT",
+            allow_float=True,
+        )
+
+    if not updates:
+        return controls
+
+    return RuntimeControlsConfig.model_validate({**controls.model_dump(), **updates})
+
+
 def get_cli_path() -> str | None:
-    """Get CLI path from environment variable or config file.
+    """Get Claude CLI path from environment variable or config file.
 
     Priority:
         1. OUROBOROS_CLI_PATH environment variable
@@ -323,3 +604,971 @@ def get_cli_path() -> str | None:
 
     # 3. Default: None (SDK uses bundled CLI)
     return None
+
+
+def get_agent_runtime_backend() -> str:
+    """Get orchestrator runtime backend from environment variable or config.
+
+    Priority:
+        1. OUROBOROS_AGENT_RUNTIME environment variable
+        2. OUROBOROS_RUNTIME environment variable
+        3. config.yaml orchestrator.runtime_backend
+        4. "claude"
+
+    Returns:
+        Normalized runtime backend name.
+    """
+    env_backend = os.environ.get("OUROBOROS_AGENT_RUNTIME", "").strip().lower()
+    if env_backend:
+        return env_backend
+
+    env_runtime = os.environ.get("OUROBOROS_RUNTIME", "").strip().lower()
+    if env_runtime:
+        return env_runtime
+
+    try:
+        config = load_config()
+        return config.orchestrator.runtime_backend
+    except ConfigError:
+        return "claude"
+
+
+def get_runtime() -> str:
+    """Alias for get_agent_runtime_backend."""
+    return get_agent_runtime_backend()
+
+
+def _uses_opencode_backend(backend: str | None) -> bool:
+    """Return True when a backend name resolves to an OpenCode runtime."""
+    return (backend or "").strip().lower() in _OPENCODE_BACKENDS
+
+
+def get_agent_permission_mode(backend: str | None = None) -> str:
+    """Get orchestrator agent permission mode from environment variable or config.
+
+    Priority:
+        1. OUROBOROS_AGENT_PERMISSION_MODE environment variable
+        2. OUROBOROS_OPENCODE_PERMISSION_MODE for OpenCode runtimes
+        3. config.yaml orchestrator.opencode_permission_mode for OpenCode runtimes
+        4. config.yaml orchestrator.permission_mode
+        5. backend default ("bypassPermissions" for OpenCode, otherwise "acceptEdits")
+    """
+    env_mode = os.environ.get("OUROBOROS_AGENT_PERMISSION_MODE", "").strip()
+    if env_mode:
+        return env_mode
+
+    if _uses_opencode_backend(backend):
+        opencode_env_mode = os.environ.get("OUROBOROS_OPENCODE_PERMISSION_MODE", "").strip()
+        if opencode_env_mode:
+            return opencode_env_mode
+
+    try:
+        config = load_config()
+        if _uses_opencode_backend(backend):
+            return config.orchestrator.opencode_permission_mode
+        return config.orchestrator.permission_mode
+    except ConfigError:
+        return "bypassPermissions" if _uses_opencode_backend(backend) else "acceptEdits"
+
+
+def _parse_max_parallel_workers(value: Any, *, config_key: str) -> int:
+    """Parse a worker-cap setting without validating unrelated config keys."""
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"{config_key} must be a positive integer",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    try:
+        parsed = int(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"{config_key} must be a positive integer",
+            config_key=config_key,
+            details={"value": value},
+        ) from exc
+
+    if isinstance(value, float) and not value.is_integer():
+        raise ConfigError(
+            f"{config_key} must be a positive integer",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    if not math.isfinite(parsed):
+        raise ConfigError(
+            f"{config_key} must be finite",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    if parsed <= 0:
+        raise ConfigError(
+            f"{config_key} must be greater than 0",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    return parsed
+
+
+def _parse_positive_float(value: Any, *, config_key: str) -> float:
+    """Parse a positive float setting without silently accepting booleans."""
+    if isinstance(value, bool):
+        raise ConfigError(
+            f"{config_key} must be a positive number",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(
+            f"{config_key} must be a positive number",
+            config_key=config_key,
+            details={"value": value},
+        ) from exc
+
+    if not math.isfinite(parsed):
+        raise ConfigError(
+            f"{config_key} must be finite",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    if parsed <= 0:
+        raise ConfigError(
+            f"{config_key} must be greater than 0",
+            config_key=config_key,
+            details={"value": value},
+        )
+
+    return parsed
+
+
+def get_usage_limit_pause_seconds() -> int:
+    """Get the default pause window for provider usage/quota limits.
+
+    Priority:
+        1. OUROBOROS_USAGE_LIMIT_PAUSE_HOURS environment variable
+        2. config.yaml orchestrator.usage_limit_pause_hours
+        3. built-in default (5 hours)
+    """
+    env_value = os.environ.get("OUROBOROS_USAGE_LIMIT_PAUSE_HOURS", "").strip()
+    if env_value:
+        hours = _parse_positive_float(
+            env_value,
+            config_key="OUROBOROS_USAGE_LIMIT_PAUSE_HOURS",
+        )
+        return max(1, int(hours * _SECONDS_PER_HOUR))
+
+    config_path = get_config_dir() / "config.yaml"
+    if not config_path.exists():
+        # No config file means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+
+    try:
+        with config_path.open() as f:
+            config_dict = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(
+            f"Failed to parse configuration file: {e}",
+            config_file=str(config_path),
+            details={"yaml_error": str(e)},
+        ) from e
+    except OSError as e:
+        raise ConfigError(
+            f"Failed to read configuration file: {e}",
+            config_file=str(config_path),
+            details={"os_error": str(e), "error_type": type(e).__name__},
+        ) from e
+
+    if config_dict is None:
+        # Empty config means no pause-window override; use the built-in default.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(config_dict, dict):
+        raise ConfigError(
+            "Configuration file must contain a mapping",
+            config_file=str(config_path),
+            details={"value_type": type(config_dict).__name__},
+        )
+
+    orchestrator_config = config_dict.get("orchestrator")
+    if orchestrator_config is None:
+        # Missing orchestrator section means no pause-window override.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+    if not isinstance(orchestrator_config, dict):
+        raise ConfigError(
+            "orchestrator must be a mapping",
+            config_key="orchestrator",
+            config_file=str(config_path),
+            details={"value": orchestrator_config},
+        )
+    if "usage_limit_pause_hours" not in orchestrator_config:
+        # Missing pause-window key means no override; invalid values still raise below.
+        return int(_DEFAULT_USAGE_LIMIT_PAUSE_HOURS * _SECONDS_PER_HOUR)
+
+    hours = _parse_positive_float(
+        orchestrator_config["usage_limit_pause_hours"],
+        config_key=_USAGE_LIMIT_PAUSE_CONFIG_KEY,
+    )
+    return max(1, int(hours * _SECONDS_PER_HOUR))
+
+
+def get_max_parallel_workers() -> int:
+    """Get the default AC worker cap from environment variable or config.
+
+    Priority:
+        1. OUROBOROS_MAX_PARALLEL_WORKERS environment variable
+        2. config.yaml orchestrator.max_parallel_workers
+        3. built-in default (3)
+    """
+    env_value = os.environ.get("OUROBOROS_MAX_PARALLEL_WORKERS", "").strip()
+    if env_value:
+        return _parse_max_parallel_workers(
+            env_value,
+            config_key="OUROBOROS_MAX_PARALLEL_WORKERS",
+        )
+
+    config_path = get_config_dir() / "config.yaml"
+    if not config_path.exists():
+        # No config file means no worker-cap override; use the built-in default.
+        return _DEFAULT_MAX_PARALLEL_WORKERS
+
+    try:
+        with config_path.open() as f:
+            config_dict = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ConfigError(
+            f"Failed to parse configuration file: {e}",
+            config_file=str(config_path),
+            details={"yaml_error": str(e)},
+        ) from e
+    except OSError as e:
+        raise ConfigError(
+            f"Failed to read configuration file: {e}",
+            config_file=str(config_path),
+            details={"os_error": str(e), "error_type": type(e).__name__},
+        ) from e
+
+    if config_dict is None:
+        # Empty config means no worker-cap override; use the built-in default.
+        return _DEFAULT_MAX_PARALLEL_WORKERS
+    if not isinstance(config_dict, dict):
+        raise ConfigError(
+            "Configuration file must contain a mapping",
+            config_file=str(config_path),
+            details={"value_type": type(config_dict).__name__},
+        )
+
+    orchestrator_config = config_dict.get("orchestrator")
+    if orchestrator_config is None:
+        # Missing orchestrator section means no worker-cap override.
+        return _DEFAULT_MAX_PARALLEL_WORKERS
+    if not isinstance(orchestrator_config, dict):
+        raise ConfigError(
+            "orchestrator must be a mapping",
+            config_key="orchestrator",
+            config_file=str(config_path),
+            details={"value": orchestrator_config},
+        )
+    if "max_parallel_workers" not in orchestrator_config:
+        # Missing worker-cap key means no override; invalid values still raise below.
+        return _DEFAULT_MAX_PARALLEL_WORKERS
+
+    return _parse_max_parallel_workers(
+        orchestrator_config["max_parallel_workers"],
+        config_key="orchestrator.max_parallel_workers",
+    )
+
+
+def get_runtime_profile() -> str | None:
+    """Get the orchestrator backend profile from env var or config file.
+
+    Priority:
+        1. OUROBOROS_RUNTIME_PROFILE environment variable
+        2. config.yaml orchestrator.runtime_profile.backend_profile
+        3. None (no profile — backends keep their default user-config behavior)
+
+    Returns:
+        The backend profile name (e.g. ``"worker"``) or None.
+    """
+    env_value = os.environ.get("OUROBOROS_RUNTIME_PROFILE", "").strip()
+    if env_value:
+        return env_value
+
+    try:
+        config = load_config()
+        profile = config.orchestrator.runtime_profile
+        if profile is not None and profile.backend_profile:
+            return profile.backend_profile
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_codex_cli_path() -> str | None:
+    """Get Codex CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_CODEX_CLI_PATH environment variable
+        2. config.yaml orchestrator.codex_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Returns:
+        Path to Codex CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_CODEX_CLI_PATH", "").strip()
+    if env_path:
+        return str(Path(env_path).expanduser())
+
+    try:
+        config = load_config()
+        if config.orchestrator.codex_cli_path:
+            return config.orchestrator.codex_cli_path
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_copilot_cli_path() -> str | None:
+    """Get GitHub Copilot CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_COPILOT_CLI_PATH environment variable
+        2. config.yaml orchestrator.copilot_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Stale env var / config values that don't point to an executable are
+    treated as missing so setup discovery can fall back to PATH instead of
+    persisting an unusable explicit path.
+
+    Returns:
+        Path to Copilot CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_COPILOT_CLI_PATH", "").strip()
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if shutil.which(resolved):
+            return resolved
+
+    try:
+        config = load_config()
+        copilot_path = getattr(config.orchestrator, "copilot_cli_path", None)
+        if copilot_path:
+            resolved = str(Path(copilot_path).expanduser())
+            if shutil.which(resolved):
+                return resolved
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_kiro_cli_path() -> str | None:
+    """Get Kiro CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_KIRO_CLI_PATH environment variable
+        2. config.yaml orchestrator.kiro_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Stale env var / config values that don't point to an executable are
+    treated as missing so setup discovery can fall back to PATH instead of
+    persisting an unusable explicit path.
+
+    Returns:
+        Path to Kiro CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_KIRO_CLI_PATH", "").strip()
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if shutil.which(resolved):
+            return resolved
+
+    try:
+        config = load_config()
+        if config.orchestrator.kiro_cli_path:
+            resolved = str(Path(config.orchestrator.kiro_cli_path).expanduser())
+            if shutil.which(resolved):
+                return resolved
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_opencode_cli_path() -> str | None:
+    """Get OpenCode CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_OPENCODE_CLI_PATH environment variable
+        2. config.yaml orchestrator.opencode_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Returns:
+        Path to OpenCode CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_OPENCODE_CLI_PATH", "").strip()
+    if env_path:
+        return str(Path(env_path).expanduser())
+
+    try:
+        config = load_config()
+        if config.orchestrator.opencode_cli_path:
+            return config.orchestrator.opencode_cli_path
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_hermes_cli_path() -> str | None:
+    """Get Hermes CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_HERMES_CLI_PATH environment variable
+        2. config.yaml orchestrator.hermes_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Returns:
+        Path to Hermes CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_HERMES_CLI_PATH", "").strip()
+    if env_path:
+        return str(Path(env_path).expanduser())
+
+    try:
+        config = load_config()
+        hermes_path = getattr(config.orchestrator, "hermes_cli_path", None)
+        if hermes_path:
+            return hermes_path
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_goose_cli_path() -> str | None:
+    """Get Goose CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_GOOSE_CLI_PATH environment variable
+        2. config.yaml orchestrator.goose_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Stale env var / config values that don't point to an executable are
+    treated as missing so callers can fall back to PATH discovery instead
+    of persisting an unusable path.
+
+    Returns:
+        Path to Goose CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_GOOSE_CLI_PATH", "").strip()
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if shutil.which(resolved):
+            return resolved
+
+    try:
+        config = load_config()
+        goose_path = getattr(config.orchestrator, "goose_cli_path", None)
+        if goose_path:
+            resolved = str(Path(goose_path).expanduser())
+            if shutil.which(resolved):
+                return resolved
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_opencode_mode() -> str | None:
+    """Get configured OpenCode integration mode from config file.
+
+    Priority:
+        1. config.yaml orchestrator.opencode_mode
+        2. None (no explicit mode — runtime gate requires "plugin" to dispatch)
+
+    No environment override by design. Users switch by re-running
+    ``ouroboros setup --opencode-mode=<plugin|subprocess>``.
+
+    Returns:
+        "plugin", "subprocess", or None.
+    """
+    try:
+        config = load_config()
+        return config.orchestrator.opencode_mode
+    except ConfigError:
+        return None
+
+
+def get_gemini_cli_path() -> str | None:
+    """Get Gemini CLI path from environment variable or config file.
+
+    Priority:
+        1. OUROBOROS_GEMINI_CLI_PATH environment variable
+        2. config.yaml orchestrator.gemini_cli_path
+        3. None (resolve from PATH at runtime)
+
+    Stale env var / config values that don't point to an executable are
+    treated as missing so callers fall back to PATH discovery instead of
+    persisting an unusable path. Mirrors the strictness of `shutil.which`
+    used for the other runtime backends in the setup detection path.
+
+    Returns:
+        Path to Gemini CLI binary or None.
+    """
+    env_path = os.environ.get("OUROBOROS_GEMINI_CLI_PATH", "").strip()
+    if env_path:
+        resolved = str(Path(env_path).expanduser())
+        if shutil.which(resolved):
+            return resolved
+
+    try:
+        config = load_config()
+        gemini_path = getattr(config.orchestrator, "gemini_cli_path", None)
+        if gemini_path:
+            resolved = str(Path(gemini_path).expanduser())
+            if shutil.which(resolved):
+                return resolved
+    except ConfigError:
+        pass
+
+    return None
+
+
+def get_llm_backend() -> str:
+    """Get default LLM backend from environment variable or config.
+
+    Priority:
+        1. OUROBOROS_LLM_BACKEND environment variable
+        2. OUROBOROS_RUNTIME environment variable, when it names a runtime
+           that also implements the LLM adapter contract
+        3. config.yaml llm.backend
+        4. "claude_code"
+
+    Returns:
+        Normalized LLM backend name.
+    """
+    env_backend = os.environ.get("OUROBOROS_LLM_BACKEND", "").strip().lower()
+    if env_backend:
+        return env_backend
+
+    env_runtime = os.environ.get("OUROBOROS_RUNTIME", "").strip().lower()
+    env_runtime_capability = get_backend_capability(env_runtime)
+    if env_runtime_capability is not None and env_runtime_capability.supports_llm:
+        if env_runtime in {"claude_code"}:
+            return "claude_code"
+        return env_runtime_capability.name
+
+    try:
+        config = load_config()
+        return config.llm.backend
+    except ConfigError:
+        return "claude_code"
+
+
+def get_llm_permission_mode(backend: str | None = None) -> str:
+    """Get default LLM permission mode from environment variable or config.
+
+    Priority:
+        1. OUROBOROS_LLM_PERMISSION_MODE environment variable
+        2. OUROBOROS_OPENCODE_PERMISSION_MODE for OpenCode adapters
+        3. config.yaml llm.opencode_permission_mode for OpenCode adapters
+        4. config.yaml llm.permission_mode
+        5. backend default ("acceptEdits" for OpenCode, otherwise "default")
+    """
+    env_mode = os.environ.get("OUROBOROS_LLM_PERMISSION_MODE", "").strip()
+    if env_mode:
+        return env_mode
+
+    if _uses_opencode_backend(backend):
+        opencode_env_mode = os.environ.get("OUROBOROS_OPENCODE_PERMISSION_MODE", "").strip()
+        if opencode_env_mode:
+            return opencode_env_mode
+
+    try:
+        config = load_config()
+        if _uses_opencode_backend(backend):
+            return config.llm.opencode_permission_mode
+        return config.llm.permission_mode
+    except ConfigError:
+        return "acceptEdits" if _uses_opencode_backend(backend) else "default"
+
+
+def _resolve_llm_backend_for_models(backend: str | None = None) -> str:
+    """Resolve the effective backend name for backend-aware model defaults."""
+    return (backend or get_llm_backend()).strip().lower()
+
+
+def _default_model_for_backend(
+    default_model: str,
+    *,
+    backend: str | None = None,
+) -> str:
+    """Map generic defaults to a backend-safe sentinel when needed."""
+    resolved = _resolve_llm_backend_for_models(backend)
+    if resolved in _CODEX_LLM_BACKENDS:
+        return _CODEX_DEFAULT_MODEL
+    if resolved in _KIRO_LLM_BACKENDS:
+        return _KIRO_DEFAULT_MODEL
+    if resolved in _COPILOT_LLM_BACKENDS:
+        return _COPILOT_DEFAULT_MODEL
+    if resolved in _HERMES_LLM_BACKENDS:
+        return _HERMES_DEFAULT_MODEL
+    return default_model
+
+
+def _default_models_for_backend(
+    default_models: tuple[str, ...],
+    *,
+    backend: str | None = None,
+) -> tuple[str, ...]:
+    """Map a tuple of default models to backend-safe defaults."""
+    return tuple(_default_model_for_backend(model, backend=backend) for model in default_models)
+
+
+def _normalize_configured_model_for_backend(
+    configured_model: str,
+    *,
+    default_model: str,
+    backend: str | None = None,
+) -> str:
+    """Normalize config-backed models while preserving backend-safe defaults."""
+    candidate = configured_model.strip()
+    if not candidate:
+        return _default_model_for_backend(default_model, backend=backend)
+
+    resolved = _resolve_llm_backend_for_models(backend)
+    if resolved in _CODEX_LLM_BACKENDS and candidate == default_model:
+        return _CODEX_DEFAULT_MODEL
+    if resolved in _KIRO_LLM_BACKENDS and candidate == default_model:
+        return _KIRO_DEFAULT_MODEL
+    if resolved in _COPILOT_LLM_BACKENDS and candidate == default_model:
+        return _COPILOT_DEFAULT_MODEL
+    if resolved in _HERMES_LLM_BACKENDS and candidate == default_model:
+        return _HERMES_DEFAULT_MODEL
+
+    return candidate
+
+
+def _normalize_configured_models_for_backend(
+    configured_models: tuple[str, ...] | list[str],
+    *,
+    default_models: tuple[str, ...],
+    backend: str | None = None,
+) -> tuple[str, ...]:
+    """Normalize config-backed model rosters while preserving explicit overrides."""
+    normalized = tuple(model.strip() for model in configured_models if model.strip())
+    if not normalized:
+        return _default_models_for_backend(default_models, backend=backend)
+
+    if (
+        _resolve_llm_backend_for_models(backend)
+        in (_CODEX_LLM_BACKENDS | _COPILOT_LLM_BACKENDS | _HERMES_LLM_BACKENDS)
+        and normalized == default_models
+    ):
+        return _default_models_for_backend(default_models, backend=backend)
+
+    return normalized
+
+
+def _parse_model_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated model list from an environment variable."""
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def get_clarification_model(backend: str | None = None) -> str:
+    """Get clarification model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_CLARIFICATION_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.clarification.default_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_qa_model(backend: str | None = None) -> str:
+    """Get QA model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_QA_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.llm.qa_model,
+            default_model="claude-sonnet-4-20250514",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-sonnet-4-20250514", backend=backend)
+
+
+def get_dependency_analysis_model(backend: str | None = None) -> str:
+    """Get dependency analysis model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_DEPENDENCY_ANALYSIS_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.llm.dependency_analysis_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_ontology_analysis_model(backend: str | None = None) -> str:
+    """Get ontology analysis model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_ONTOLOGY_ANALYSIS_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.llm.ontology_analysis_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_context_compression_model(backend: str | None = None) -> str:
+    """Get workflow context compression model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_CONTEXT_COMPRESSION_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.llm.context_compression_model,
+            default_model="gpt-4",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("gpt-4", backend=backend)
+
+
+def get_atomicity_model(backend: str | None = None) -> str:
+    """Get atomicity analysis model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_ATOMICITY_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.execution.atomicity_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_decomposition_model(backend: str | None = None) -> str:
+    """Get AC decomposition model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_DECOMPOSITION_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.execution.decomposition_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_double_diamond_model(backend: str | None = None) -> str:
+    """Get Double Diamond default model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_DOUBLE_DIAMOND_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.execution.double_diamond_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_wonder_model(backend: str | None = None) -> str:
+    """Get Wonder model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_WONDER_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.resilience.wonder_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_reflect_model(backend: str | None = None) -> str:
+    """Get Reflect model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_REFLECT_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.resilience.reflect_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_semantic_model(backend: str | None = None) -> str:
+    """Get semantic evaluation model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_SEMANTIC_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.evaluation.semantic_model,
+            default_model="claude-opus-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-opus-4-6", backend=backend)
+
+
+def get_assertion_extraction_model(backend: str | None = None) -> str:
+    """Get verification assertion extraction model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_ASSERTION_EXTRACTION_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.evaluation.assertion_extraction_model,
+            default_model="claude-sonnet-4-6",
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend("claude-sonnet-4-6", backend=backend)
+
+
+def get_mechanical_detector_model(backend: str | None = None) -> str:
+    """Resolve the model used by the mechanical.toml AI detector.
+
+    Mirrors the assertion-extraction model resolution: env var override,
+    then ``OuroborosConfig.evaluation.assertion_extraction_model`` with
+    backend-safe fallback to the Codex ``"default"`` sentinel for
+    Codex/OpenCode backends.
+    """
+    env_model = os.environ.get("OUROBOROS_DETECTOR_MODEL", "").strip()
+    if env_model:
+        return env_model
+    return get_assertion_extraction_model(backend=backend)
+
+
+def get_consensus_models(backend: str | None = None) -> tuple[str, ...]:
+    """Get consensus stage model roster from environment variable or config."""
+    env_models = os.environ.get("OUROBOROS_CONSENSUS_MODELS", "").strip()
+    if env_models:
+        parsed = _parse_model_list(env_models)
+        if parsed:
+            return parsed
+
+    try:
+        config = load_config()
+        if config.consensus.models:
+            return _normalize_configured_models_for_backend(
+                config.consensus.models,
+                default_models=_DEFAULT_CONSENSUS_MODELS,
+                backend=backend,
+            )
+    except ConfigError:
+        pass
+
+    return _default_models_for_backend(_DEFAULT_CONSENSUS_MODELS, backend=backend)
+
+
+def get_consensus_advocate_model(backend: str | None = None) -> str:
+    """Get deliberative advocate model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_CONSENSUS_ADVOCATE_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.consensus.advocate_model,
+            default_model=_DEFAULT_CONSENSUS_ADVOCATE_MODEL,
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend(_DEFAULT_CONSENSUS_ADVOCATE_MODEL, backend=backend)
+
+
+def get_consensus_devil_model(backend: str | None = None) -> str:
+    """Get deliberative devil model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_CONSENSUS_DEVIL_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.consensus.devil_model,
+            default_model=_DEFAULT_CONSENSUS_DEVIL_MODEL,
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend(_DEFAULT_CONSENSUS_DEVIL_MODEL, backend=backend)
+
+
+def get_consensus_judge_model(backend: str | None = None) -> str:
+    """Get deliberative judge model from environment variable or config."""
+    env_model = os.environ.get("OUROBOROS_CONSENSUS_JUDGE_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    try:
+        config = load_config()
+        return _normalize_configured_model_for_backend(
+            config.consensus.judge_model,
+            default_model=_DEFAULT_CONSENSUS_JUDGE_MODEL,
+            backend=backend,
+        )
+    except ConfigError:
+        return _default_model_for_backend(_DEFAULT_CONSENSUS_JUDGE_MODEL, backend=backend)

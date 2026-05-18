@@ -9,9 +9,9 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Self
 
-import stamina
 import structlog
 
+from ouroboros.core.retry import retry_async
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import (
     MCPClientError,
@@ -49,7 +49,7 @@ class MCPClientAdapter:
     """Concrete implementation of MCPClient protocol.
 
     Uses the MCP SDK to connect to MCP servers and provides automatic retry
-    logic using stamina for transient failures.
+    logic for transient failures.
 
     Example:
         config = MCPServerConfig(
@@ -90,8 +90,10 @@ class MCPClientAdapter:
         self._retry_wait_initial = retry_wait_initial
         self._retry_wait_max = retry_wait_max
         self._session: Any = None
+        self._transport_cm: Any = None
         self._read_stream: Any = None
         self._write_stream: Any = None
+        self._http_client: Any = None
         self._server_info: MCPServerInfo | None = None
         self._config: MCPServerConfig | None = None
 
@@ -125,7 +127,7 @@ class MCPClientAdapter:
         """Connect to an MCP server.
 
         Establishes a connection using the appropriate transport (stdio, SSE, etc.)
-        and initializes the session. Uses stamina for automatic retries.
+        and initializes the session. Uses internal retry logic for transient failures.
 
         Args:
             config: Configuration for the server connection.
@@ -143,7 +145,7 @@ class MCPClientAdapter:
 
         self._config = config
 
-        @stamina.retry(
+        @retry_async(
             on=RETRIABLE_EXCEPTIONS,
             attempts=self._max_retries,
             wait_initial=self._retry_wait_initial,
@@ -199,7 +201,7 @@ class MCPClientAdapter:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
         except ImportError as e:
-            msg = "mcp package not installed. Install with: pip install mcp"
+            msg = "mcp package not installed. Install with: pip install 'ouroboros-ai[mcp]'"
             raise ImportError(msg) from e
 
         if config.transport == TransportType.STDIO:
@@ -213,21 +215,134 @@ class MCPClientAdapter:
                 env=config.env if config.env else None,
             )
 
-            self._read_stream, self._write_stream = await stdio_client(server_params).__aenter__()
-            self._session = ClientSession(self._read_stream, self._write_stream)
-            await self._session.__aenter__()
+            self._transport_cm = stdio_client(server_params)
+            try:
+                self._read_stream, self._write_stream = await self._transport_cm.__aenter__()
+                self._session = ClientSession(self._read_stream, self._write_stream)
+                await self._session.__aenter__()
 
-            # Initialize the session
-            result = await self._session.initialize()
-            self._server_info = self._parse_server_info(result, config.name)
+                # Initialize the session
+                result = await self._session.initialize()
+                self._server_info = self._parse_server_info(result, config.name)
+            except Exception:
+                await self._reset_connection_state()
+                raise
 
-        elif config.transport in (TransportType.SSE, TransportType.STREAMABLE_HTTP):
-            # SSE/HTTP transport would be implemented here
-            msg = f"Transport {config.transport} not yet implemented"
-            raise NotImplementedError(msg)
+        elif config.transport == TransportType.SSE:
+            if not config.url:
+                msg = "url is required for sse transport"
+                raise ValueError(msg)
+
+            from mcp.client.sse import sse_client
+
+            self._transport_cm = sse_client(
+                config.url,
+                headers=config.headers if config.headers else None,
+                timeout=config.timeout,
+            )
+            try:
+                self._read_stream, self._write_stream = await self._transport_cm.__aenter__()
+                self._session = ClientSession(self._read_stream, self._write_stream)
+                await self._session.__aenter__()
+
+                result = await self._session.initialize()
+                self._server_info = self._parse_server_info(result, config.name)
+            except Exception:
+                await self._reset_connection_state()
+                raise
+
+        elif config.transport in (TransportType.STREAMABLE_HTTP, TransportType.HTTP):
+            if not config.url:
+                msg = f"url is required for {config.transport} transport"
+                raise ValueError(msg)
+
+            import httpx
+            from mcp.client.streamable_http import streamable_http_client
+
+            from ouroboros import __version__ as _ouroboros_version
+
+            timeout = httpx.Timeout(config.timeout, read=max(config.timeout, 300.0))
+
+            # Compose headers with a stable User-Agent for observability.
+            # Now that we own the httpx client (no longer going through the
+            # mcp SDK's private helper), set the UA explicitly so that MCP
+            # servers can still identify the ouroboros client in their logs.
+            # Caller-supplied headers take precedence.
+            default_headers = {
+                "User-Agent": f"ouroboros-mcp-client/{_ouroboros_version}",
+            }
+            if config.headers:
+                merged_headers: dict[str, str] = {**default_headers, **config.headers}
+            else:
+                merged_headers = default_headers
+
+            http_client = httpx.AsyncClient(
+                headers=merged_headers,
+                timeout=timeout,
+                # SSRF hardening: do not follow redirects. An attacker-controlled
+                # server could otherwise 302 us into a loopback / metadata URL
+                # that bypasses the static URL validation in MCPServerConfig.
+                follow_redirects=False,
+            )
+            self._http_client = http_client
+
+            try:
+                self._transport_cm = streamable_http_client(
+                    config.url,
+                    http_client=http_client,
+                )
+                # streamable_http_client yields 3-tuple: (read, write, get_session_id)
+                streams = await self._transport_cm.__aenter__()
+                self._read_stream = streams[0]
+                self._write_stream = streams[1]
+                self._session = ClientSession(self._read_stream, self._write_stream)
+                await self._session.__aenter__()
+
+                result = await self._session.initialize()
+                self._server_info = self._parse_server_info(result, config.name)
+            except Exception:
+                await self._reset_connection_state()
+                raise
+
         else:
             msg = f"Unknown transport: {config.transport}"
             raise ValueError(msg)
+
+    async def _reset_connection_state(self) -> None:
+        """Best-effort cleanup for partially initialized connection state."""
+        session = self._session
+        transport_cm = self._transport_cm
+        http_client = self._http_client
+
+        self._session = None
+        self._transport_cm = None
+        self._read_stream = None
+        self._write_stream = None
+        self._http_client = None
+        self._server_info = None
+
+        errors: list[BaseException] = []
+
+        if session is not None:
+            try:
+                await session.__aexit__(None, None, None)
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                errors.append(exc)
+
+        if transport_cm is not None:
+            try:
+                await transport_cm.__aexit__(None, None, None)
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                errors.append(exc)
+
+        if http_client is not None:
+            try:
+                await http_client.aclose()
+            except Exception as exc:  # pragma: no cover - defensive cleanup
+                errors.append(exc)
+
+        if errors:
+            raise errors[0]
 
     def _parse_server_info(self, init_result: Any, server_name: str) -> MCPServerInfo:
         """Parse server info from initialization result.
@@ -255,17 +370,21 @@ class MCPClientAdapter:
     async def disconnect(self) -> Result[None, MCPClientError]:
         """Disconnect from the current MCP server.
 
+        Releases both the MCP session and the underlying transport context
+        manager in reverse acquisition order.  Always attempts to close both
+        resources even when one teardown raises.
+
         Returns:
             Result containing None on success or MCPClientError on failure.
         """
-        if self._session is None:
+        if self._session is None and self._transport_cm is None and self._http_client is None:
             return Result.ok(None)
 
+        server_name = self._config.name if self._config else "unknown"
+
         try:
-            await self._session.__aexit__(None, None, None)
-            self._session = None
-            self._server_info = None
-            log.info("mcp.disconnected", server=self._config.name if self._config else "unknown")
+            await self._reset_connection_state()
+            log.info("mcp.disconnected", server=server_name)
             return Result.ok(None)
         except Exception as e:
             return Result.err(

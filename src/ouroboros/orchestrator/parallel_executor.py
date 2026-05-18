@@ -13,7 +13,7 @@ Example:
     executor = ParallelACExecutor(adapter, event_store, console)
     result = await executor.execute_parallel(
         seed=seed,
-        dependency_graph=graph,
+        execution_plan=graph.to_execution_plan(),
         session_id="sess_123",
         tools=["Read", "Write", "Bash"],
         system_prompt="You are an agent...",
@@ -27,103 +27,1980 @@ Example:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 import json
+import os
+from pathlib import Path
+import platform
 import re
+import shlex
+import subprocess
+import time
 from typing import TYPE_CHECKING, Any
 
 import anyio
 from rich.console import Console
 
+from ouroboros.core.seed_contract_prompt import render_auto_recursion_guard
 from ouroboros.observability.logging import get_logger
-from ouroboros.orchestrator.adapter import AgentMessage
-from ouroboros.orchestrator.coordinator import LevelCoordinator
+from ouroboros.orchestrator.adapter import (
+    AgentMessage,
+    RuntimeHandle,
+    runtime_handle_tool_catalog,
+)
+from ouroboros.orchestrator.capabilities import (
+    build_capability_graph,
+    serialize_capability_graph,
+)
+from ouroboros.orchestrator.context_governor import SiblingStatus, compose_context
+from ouroboros.orchestrator.control_plane import (
+    build_control_plane_state,
+    serialize_control_plane_state,
+)
+from ouroboros.orchestrator.coordinator import CoordinatorReview, LevelCoordinator
+from ouroboros.orchestrator.decomposition_params import (
+    build_decomposition_system_prompt,
+    build_decomposition_user_prompt,
+    params_from_profile,
+)
+from ouroboros.orchestrator.events import (
+    create_ac_stall_detected_event,
+    create_heartbeat_event,
+)
+from ouroboros.orchestrator.evidence_schema import (
+    EvidenceError,
+    EvidenceRecord,
+    ProfileEvidenceConfigError,
+    ValidationResult,
+    extract_evidence,
+    validate_evidence,
+)
+from ouroboros.orchestrator.execution_runtime_scope import (
+    ACRuntimeIdentity,
+    ExecutionNodeIdentity,
+    build_ac_runtime_identity,
+    build_ac_runtime_scope,
+    build_level_coordinator_runtime_scope,
+)
 from ouroboros.orchestrator.level_context import (
     LevelContext,
     build_context_prompt,
+    deserialize_level_contexts,
     extract_level_context,
+    serialize_level_contexts,
+)
+from ouroboros.orchestrator.mcp_tools import serialize_tool_catalog
+from ouroboros.orchestrator.parallel_executor_models import (
+    ACExecutionOutcome,
+    ACExecutionResult,
+    ParallelExecutionResult,
+    ParallelExecutionStageResult,
+    StageExecutionOutcome,
+)
+from ouroboros.orchestrator.policy import (
+    PolicyContext,
+    PolicyExecutionPhase,
+    PolicySessionRole,
+    evaluate_capability_policy,
+)
+from ouroboros.orchestrator.profile_loader import EvidenceSchema, ExecutionProfile
+from ouroboros.orchestrator.runtime_message_projection import (
+    project_runtime_message,
+)
+from ouroboros.orchestrator.verifier import (
+    Verifier,
+    VerifierContractError,
+    VerifierVerdict,
+    verifier_operational_failure_verdict,
 )
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
-    from ouroboros.orchestrator.adapter import ClaudeAgentAdapter
-    from ouroboros.orchestrator.dependency_analyzer import DependencyGraph
+    from ouroboros.mcp.types import MCPToolDefinition
+    from ouroboros.orchestrator.adapter import AgentRuntime
+    from ouroboros.orchestrator.dependency_analyzer import (
+        DependencyGraph,
+        StagedExecutionPlan,
+    )
     from ouroboros.persistence.event_store import EventStore
 
 log = get_logger(__name__)
 
 # Decomposition constants
-MAX_DECOMPOSITION_DEPTH = 2
+# Depth >= max_decomposition_depth forces atomic execution as a soft safety net.
+DEFAULT_MAX_DECOMPOSITION_DEPTH = 2
+MAX_DECOMPOSITION_DEPTH = DEFAULT_MAX_DECOMPOSITION_DEPTH
 MIN_SUB_ACS = 2
 MAX_SUB_ACS = 5
+DECOMPOSITION_TIMEOUT_SECONDS = 60.0
+_IMPLEMENTATION_SESSION_KIND = "implementation_session"
 
 
-# =============================================================================
-# Data Models
-# =============================================================================
+_DOC_ONLY_TARGET_RE = re.compile(
+    r"\b(readme(?:\.md)?|docs?/|docs?\.[a-z0-9_-]+|documentation|guide|manual|changelog)\b",
+    re.IGNORECASE,
+)
+_DOC_ONLY_ACTION_RE = re.compile(
+    r"\b(document|describe|explain|add|update|create|fix|write|improve)\b",
+    re.IGNORECASE,
+)
+_CODE_IMPLEMENTATION_ACTION_RE = re.compile(
+    r"\b(implement|build|develop|ship)\b",
+    re.IGNORECASE,
+)
+_CODE_MUTATION_ACTION_RE = re.compile(
+    r"\b(add(?:ing)?|fix(?:ing)?|create|creating|update|updating|change|changing|modify|modifying|refactor(?:ing)?|repair(?:ing)?)\b",
+    re.IGNORECASE,
+)
+_CODE_WORK_SIGNAL_RE = re.compile(
+    r"("
+    r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*\("
+    r"|"
+    r"\.(?:py|pyi|js|jsx|ts|tsx|go|rs|java|kt|c|cc|cpp|h|hpp|swift|rb|php|sh|zsh|fish)\b"
+    r"|"
+    r"\b(parser|function|module|api|endpoint|class|method|cli\s+flag|flag|command|"
+    r"bug|runtime|workflow|validator|validation|implementation)\b"
+    r")",
+    re.IGNORECASE,
+)
+_TEST_WORK_RE = re.compile(
+    r"("
+    r"\b(?:run|execute|pass|validate|verify)\b.{0,40}\b(?:pytest|tests?|unit\s+tests?|integration\s+tests?)\b"
+    r"|"
+    r"\b(?:add|write|create|implement|fix|update)\b.{0,40}\b"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?)\b"
+    r"(?!\s+(?:guide|docs?|documentation|setup))"
+    r"|"
+    r"\b(?:pytest|tests_passed|test\s+command)\b"
+    r")",
+    re.IGNORECASE,
+)
+_TEST_MUTATION_WORK_RE = re.compile(
+    r"("
+    r"\b(?:add|write|create|implement|fix|update|extend|expand)\b.{0,60}\b"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?|coverage|test_[\w.-]+\.py)\b"
+    r"|"
+    r"\b(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)\b.{0,60}\b"
+    r"(?:cover|coverage)\b"
+    r"|"
+    r"\bcheck(?:ed)?\s+(?:(?:the|existing|current|new|added|updated)\s+){0,3}"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)"
+    r"\s+into\b"
+    r"|"
+    r"\bcheck\s+in\b.{0,60}\b"
+    r"(?:tests?|unit\s+tests?|integration\s+tests?|test_[\w.-]+\.py)\b"
+    r")",
+    re.IGNORECASE,
+)
+_DOCS_TEST_REFERENCE_RE = re.compile(
+    r"("
+    r"\b(?:document(?:ing)?|guide|manual|instructions?|usage|setup|how\s+to|verification)\b"
+    r".{0,100}\b(?:test\s+command|python\s+-m\s+unittest|pytest|tests?|unit\s+tests?|test\s+setup)\b"
+    r"|"
+    r"\b(?:test\s+command|python\s+-m\s+unittest|pytest|tests?|unit\s+tests?|test\s+setup)\b"
+    r".{0,100}\b(?:document(?:ing)?|guide|manual|instructions?|usage|setup|how\s+to|verification)\b"
+    r")",
+    re.IGNORECASE,
+)
+_NO_MUTATION_VALIDATION_RE = re.compile(
+    r"("
+    r"\bwithout\s+(?:modifying|changing|editing|writing|updating|touching)\b"
+    r"|"
+    r"\bwith\s+no\s+(?:file|code)?\s*(?:modifications?|changes?|edits?|updates?)\b"
+    r"|"
+    r"\bno\s+(?:file|code)?\s*(?:modifications?|changes?|edits?|updates?)\b"
+    r"|"
+    r"\bdo\s+not\s+(?:modify|change|edit|write|update|touch)\b"
+    r")",
+    re.IGNORECASE,
+)
+_EXISTING_VALIDATION_RE = re.compile(
+    r"\b(?:existing|current|already(?:-|\s+)?satisfied|already(?:-|\s+)?implemented)\b",
+    re.IGNORECASE,
+)
+_VALIDATION_ONLY_ACTION_RE = re.compile(
+    r"\b(?:run|execute|pass|validate|verify|ensure|confirm|check)\b",
+    re.IGNORECASE,
+)
+_VALIDATION_ONLY_TEST_SIGNAL_RE = re.compile(
+    r"\b(?:pytest|unit\s+tests?|integration\s+tests?|tests?|test suite|"
+    r"test_[\w.-]+\.py|python\s+-m\s+unittest)\b",
+    re.IGNORECASE,
+)
 
 
-@dataclass(frozen=True, slots=True)
-class ACExecutionResult:
-    """Result of executing a single AC, including Sub-ACs if decomposed.
+def _has_mixed_code_and_documentation_work(ac_content: str) -> bool:
+    """Return True when one AC appears to combine code mutation and docs work."""
+    for connector in re.finditer(
+        r"\b(?:and|then|while|plus)\b|[,;:]",
+        ac_content,
+        re.IGNORECASE,
+    ):
+        before = ac_content[: connector.start()]
+        after = ac_content[connector.end() :]
+        before_has_docs = bool(_DOC_ONLY_TARGET_RE.search(before))
+        after_has_docs = bool(_DOC_ONLY_TARGET_RE.search(after))
+        before_has_code_work = bool(
+            _CODE_MUTATION_ACTION_RE.search(before) and _CODE_WORK_SIGNAL_RE.search(before)
+        )
+        after_has_code_work = bool(
+            _CODE_MUTATION_ACTION_RE.search(after) and _CODE_WORK_SIGNAL_RE.search(after)
+        )
+        if after_has_docs and not before_has_docs and before_has_code_work:
+            return True
+        if before_has_docs and not after_has_docs and after_has_code_work:
+            return True
+    return False
 
-    Attributes:
-        ac_index: 0-based AC index.
-        ac_content: AC description.
-        success: Whether execution succeeded.
-        messages: All agent messages from execution.
-        final_message: Final result message content.
-        error: Error message if failed.
-        duration_seconds: Execution duration.
-        session_id: Claude session ID for this AC.
-        is_decomposed: Whether this AC was decomposed into Sub-ACs.
-        sub_results: Results from Sub-AC parallel executions.
-        depth: Depth in decomposition tree (0 = root AC).
+
+def _has_mixed_test_and_documentation_work(ac_content: str) -> bool:
+    """Return True when one AC appears to combine test mutation and docs work."""
+    for connector in re.finditer(
+        r"\b(?:and|then|while|plus)\b|[,;:]",
+        ac_content,
+        re.IGNORECASE,
+    ):
+        before = ac_content[: connector.start()]
+        after = ac_content[connector.end() :]
+        before_has_docs = bool(_DOC_ONLY_TARGET_RE.search(before))
+        after_has_docs = bool(_DOC_ONLY_TARGET_RE.search(after))
+        before_has_test_work = bool(_TEST_MUTATION_WORK_RE.search(before))
+        after_has_test_work = bool(_TEST_MUTATION_WORK_RE.search(after))
+        if after_has_docs and not before_has_docs and before_has_test_work:
+            return True
+        if before_has_docs and not after_has_docs and after_has_test_work:
+            return True
+    return False
+
+
+def _has_mixed_validation_and_documentation_work(ac_content: str) -> bool:
+    """Return True when one AC appears to combine docs work and test execution."""
+    for connector in re.finditer(
+        r"\b(?:and|then|while|plus)\b|[,;:]",
+        ac_content,
+        re.IGNORECASE,
+    ):
+        before = ac_content[: connector.start()]
+        after = ac_content[connector.end() :]
+        before_has_docs = bool(_DOC_ONLY_TARGET_RE.search(before))
+        after_has_docs = bool(_DOC_ONLY_TARGET_RE.search(after))
+        before_has_validation = bool(
+            _VALIDATION_ONLY_ACTION_RE.search(before)
+            and _VALIDATION_ONLY_TEST_SIGNAL_RE.search(before)
+        )
+        after_has_validation = bool(
+            _VALIDATION_ONLY_ACTION_RE.search(after)
+            and _VALIDATION_ONLY_TEST_SIGNAL_RE.search(after)
+        )
+        if after_has_docs and not before_has_docs and before_has_validation:
+            return True
+        if before_has_docs and not after_has_docs and after_has_validation:
+            return True
+    return False
+
+
+def _is_documentation_only_ac(ac_content: str) -> bool:
+    """Return True when an AC asks only for documentation/README work.
+
+    The code profile normally requires runnable test evidence. Normal usage can
+    still include a final docs-only AC (for example README usage examples after
+    code ACs already passed). Such an AC should be verified by docs evidence
+    from the current runtime session, not by re-claiming prior code test IDs.
     """
+    normalized = " ".join(ac_content.split())
+    if not normalized:
+        return False
+    has_docs_target = bool(_DOC_ONLY_TARGET_RE.search(normalized))
+    has_docs_action = bool(_DOC_ONLY_ACTION_RE.search(normalized))
+    documents_test_reference = (
+        has_docs_target and has_docs_action and bool(_DOCS_TEST_REFERENCE_RE.search(normalized))
+    )
+    if documents_test_reference and _has_mixed_validation_and_documentation_work(normalized):
+        return False
+    if _TEST_MUTATION_WORK_RE.search(normalized) and (
+        not documents_test_reference or _has_mixed_test_and_documentation_work(normalized)
+    ):
+        return False
+    if _TEST_WORK_RE.search(normalized) and not documents_test_reference:
+        return False
+    if _CODE_IMPLEMENTATION_ACTION_RE.search(normalized):
+        return False
+    if _has_mixed_code_and_documentation_work(normalized):
+        return False
+    if (
+        re.search(r"\bdocumentation\b", normalized, re.IGNORECASE)
+        and _CODE_MUTATION_ACTION_RE.search(normalized)
+        and _CODE_WORK_SIGNAL_RE.search(normalized)
+        and not re.search(
+            r"\b(readme(?:\.md)?|docs?/|docs?\.[a-z0-9_-]+|guide|manual|changelog)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+    ):
+        return False
+    return has_docs_target and has_docs_action
 
-    ac_index: int
-    ac_content: str
-    success: bool
-    messages: tuple[AgentMessage, ...] = field(default_factory=tuple)
-    final_message: str = ""
-    error: str | None = None
-    duration_seconds: float = 0.0
-    session_id: str | None = None
-    is_decomposed: bool = False
-    sub_results: tuple[ACExecutionResult, ...] = field(default_factory=tuple)
-    depth: int = 0
 
+def _is_validation_only_ac(ac_content: str) -> bool:
+    """Return True when an AC asks only to run or verify tests.
 
-@dataclass(frozen=True, slots=True)
-class ParallelExecutionResult:
-    """Result of parallel AC execution.
-
-    Attributes:
-        results: Individual results for each AC.
-        success_count: Number of successful ACs.
-        failure_count: Number of failed ACs.
-        skipped_count: Number of skipped ACs (due to failed dependencies).
-        total_messages: Total messages processed across all ACs.
-        total_duration_seconds: Total execution time.
+    Test-writing ACs still require ``files_touched``; validation-only ACs are
+    allowed to prove completion with command/test evidence and no file mutation.
     """
+    normalized = " ".join(ac_content.split())
+    if not normalized:
+        return False
+    if _is_documentation_only_ac(normalized):
+        return False
+    if _DOC_ONLY_TARGET_RE.search(normalized) and _DOC_ONLY_ACTION_RE.search(normalized):
+        return False
+    stripped_no_mutation_terms = _NO_MUTATION_VALIDATION_RE.sub("", normalized)
+    if _TEST_MUTATION_WORK_RE.search(normalized):
+        return False
+    if _CODE_MUTATION_ACTION_RE.search(stripped_no_mutation_terms) and _CODE_WORK_SIGNAL_RE.search(
+        stripped_no_mutation_terms
+    ):
+        return False
+    if _CODE_IMPLEMENTATION_ACTION_RE.search(stripped_no_mutation_terms):
+        return False
+    if _has_mixed_code_and_documentation_work(stripped_no_mutation_terms):
+        return False
+    if (
+        (
+            _NO_MUTATION_VALIDATION_RE.search(normalized)
+            or _EXISTING_VALIDATION_RE.search(normalized)
+        )
+        and _VALIDATION_ONLY_ACTION_RE.search(normalized)
+        and _VALIDATION_ONLY_TEST_SIGNAL_RE.search(normalized)
+    ):
+        return True
+    return bool(_VALIDATION_ONLY_ACTION_RE.search(normalized)) and bool(
+        _VALIDATION_ONLY_TEST_SIGNAL_RE.search(normalized)
+    )
 
-    results: tuple[ACExecutionResult, ...]
-    success_count: int
-    failure_count: int
-    skipped_count: int = 0
-    total_messages: int = 0
-    total_duration_seconds: float = 0.0
 
-    @property
-    def all_succeeded(self) -> bool:
-        """Return True if all ACs succeeded."""
-        return self.failure_count == 0 and self.skipped_count == 0
+def _effective_evidence_schema_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+) -> EvidenceSchema:
+    """Return the active evidence schema for one atomic AC dispatch."""
+    schema = profile.evidence_schema
+    if _is_validation_only_ac(ac_content) and "files_touched" in schema.required:
+        required = tuple(field for field in schema.required if field != "files_touched")
+        rejected_if = tuple(
+            expr for expr in schema.rejected_if if not expr.strip().startswith("files_touched")
+        )
+        return EvidenceSchema(required=required, rejected_if=rejected_if)
+    if not _is_documentation_only_ac(ac_content) or "tests_passed" not in schema.required:
+        return schema
+    required = tuple(field for field in schema.required if field != "tests_passed")
+    rejected_if = tuple(
+        expr for expr in schema.rejected_if if not expr.strip().startswith("tests_passed")
+    )
+    return EvidenceSchema(required=required, rejected_if=rejected_if)
 
-    @property
-    def any_succeeded(self) -> bool:
-        """Return True if at least one AC succeeded."""
-        return self.success_count > 0
+
+def _out_of_scope_evidence_fields_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord | None,
+) -> tuple[str, ...]:
+    """Return non-empty evidence fields excluded by the AC-specific schema."""
+    if record is None:
+        return ()
+    effective_schema = _effective_evidence_schema_for_ac(profile, ac_content)
+    required_fields = set(effective_schema.required)
+    return tuple(
+        field
+        for field in profile.evidence_schema.required
+        if field not in required_fields and _flatten_evidence_values(record.get(field))
+    )
+
+
+def _out_of_scope_evidence_values_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord | None,
+) -> dict[str, Any]:
+    """Return out-of-scope evidence values retained for audit metadata only."""
+    if record is None:
+        return {}
+    fields = _out_of_scope_evidence_fields_for_ac(profile, ac_content, record)
+    return {field: record.data[field] for field in fields if field in record.data}
+
+
+def _scoped_evidence_record_for_ac(
+    profile: ExecutionProfile,
+    ac_content: str,
+    record: EvidenceRecord,
+) -> EvidenceRecord:
+    """Return only evidence fields inside the AC-specific schema."""
+    effective_schema = _effective_evidence_schema_for_ac(profile, ac_content)
+    allowed_fields = set(effective_schema.required)
+    return EvidenceRecord(
+        data={field: value for field, value in record.data.items() if field in allowed_fields},
+        source=record.source,
+    )
+
+
+def _profile_with_evidence_schema(
+    profile: ExecutionProfile,
+    schema: EvidenceSchema,
+) -> ExecutionProfile:
+    """Return a shallow profile copy using an AC-specific evidence schema."""
+    required_fields = set(schema.required)
+    must_produce = tuple(field for field in profile.must_produce if field in required_fields)
+    return profile.model_copy(update={"evidence_schema": schema, "must_produce": must_produce})
+
+
+def _subtask_event_label(content: str, *, max_length: int = 50) -> str:
+    """Return compact display text without losing full event content."""
+    normalized = " ".join(content.split())
+    if len(normalized) <= max_length:
+        return normalized
+    return normalized[:max_length]
+
+
+def _flatten_evidence_values(value: object) -> tuple[str, ...]:
+    """Return concrete string claims from a typed evidence field."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped,) if stripped else ()
+    if isinstance(value, (int, float, bool)):
+        return (str(value),)
+    if isinstance(value, dict):
+        flattened: list[str] = []
+        for item in value.values():
+            flattened.extend(_flatten_evidence_values(item))
+        return tuple(flattened)
+    if isinstance(value, (list, tuple, set)):
+        flattened_sequence: list[str] = []
+        for item in value:
+            flattened_sequence.extend(_flatten_evidence_values(item))
+        return tuple(flattened_sequence)
+    return (str(value),)
+
+
+def _runtime_message_search_text(message: AgentMessage) -> str:
+    """Build searchable transcript text for one non-final runtime message."""
+    parts: list[str] = [message.content]
+    if message.tool_name:
+        parts.append(message.tool_name)
+    tool_input = message.data.get("tool_input")
+    if isinstance(tool_input, dict):
+        parts.extend(str(value) for value in tool_input.values() if value is not None)
+    parts.extend(_flatten_evidence_values(message.data))
+    return "\n".join(parts).lower()
+
+
+def _runtime_message_file_path_values(message: AgentMessage) -> tuple[str, ...]:
+    """Return explicit file path values carried by a runtime message.
+
+    Codex/OpenCode file-change events may report absolute workspace paths while
+    typed evidence should normally claim workspace-relative paths. Keep this
+    structured path extraction separate from broad text search so read-only text
+    mentions still cannot prove ``files_touched``.
+    """
+    path_keys = {
+        "file_path",
+        "filepath",
+        "filePath",
+        "notebook_path",
+        "notebookPath",
+        "path",
+        "target_file",
+        "targetFile",
+    }
+    values: list[str] = []
+
+    def visit(value: object) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in path_keys and isinstance(child, str) and child.strip():
+                    values.append(child.strip())
+                else:
+                    visit(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                visit(child)
+
+    for container_key in ("tool_input", "input", "arguments", "args"):
+        visit(message.data.get(container_key))
+    return tuple(values)
+
+
+def _runtime_message_command_values(message: AgentMessage) -> tuple[str, ...]:
+    """Return explicit command strings carried by a runtime message.
+
+    Runtime adapters normalize shell calls slightly differently.  Codex-like
+    events usually expose ``tool_input.command``; Goose may expose ``cmd`` or a
+    list argv form.  Keep extraction structured, not prose-based, so command
+    evidence does not fall back to arbitrary assistant text.
+    """
+    values: list[str] = []
+    for container_key in ("tool_input", "input", "arguments", "args"):
+        container = message.data.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for command_key in ("command", "cmd", "command_line"):
+            command = container.get(command_key)
+            normalized = _runtime_command_value_to_text(command)
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return tuple(values)
+
+
+def _runtime_command_value_to_text(value: object) -> str | None:
+    """Normalize a structured runtime command value into shell text."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list) and value:
+        return shlex.join(str(part) for part in value)
+    return None
+
+
+def _file_claim_matches_runtime_path(
+    claim: str,
+    runtime_path: str,
+    *,
+    task_cwd: str | None,
+) -> bool:
+    """Return True when a claimed workspace path matches a runtime path value."""
+    claim_path = Path(claim.strip())
+    if not claim_path or claim_path.is_absolute() or ".." in claim_path.parts:
+        return False
+
+    runtime_path = runtime_path.strip()
+    if not runtime_path:
+        return False
+
+    runtime_candidate = Path(runtime_path)
+    if task_cwd is not None:
+        base = Path(task_cwd).resolve()
+        claimed_absolute = (base / claim_path).resolve()
+        runtime_absolute = (
+            runtime_candidate if runtime_candidate.is_absolute() else base / runtime_candidate
+        ).resolve()
+        try:
+            claimed_absolute.relative_to(base)
+            runtime_absolute.relative_to(base)
+        except ValueError:
+            return False
+        return runtime_absolute == claimed_absolute
+
+    normalized_claim = claim_path.as_posix().lower()
+    normalized_runtime = runtime_candidate.as_posix().lower()
+    return normalized_runtime == normalized_claim or normalized_runtime.endswith(
+        "/" + normalized_claim
+    )
+
+
+def _workspace_relative_file_claim(value: str, *, task_cwd: str | None) -> str | None:
+    """Normalize a files_touched claim to a workspace-relative path.
+
+    The evidence producer should emit workspace-relative paths, but live Codex
+    runs may still report absolute files under the disposable target repo.  Treat
+    those as the same claim only after proving they resolve inside ``task_cwd``.
+    Paths outside the workspace, empty paths, and relative traversal remain
+    unsupported evidence claims.
+    """
+    raw_value = value.strip()
+    if not raw_value or task_cwd is None:
+        return None
+
+    base = Path(task_cwd).resolve()
+    candidate = Path(raw_value)
+    if not candidate.is_absolute() and ".." in candidate.parts:
+        return None
+
+    resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+    try:
+        relative = resolved.relative_to(base)
+    except ValueError:
+        return None
+
+    if not relative.parts or ".." in relative.parts:
+        return None
+    return relative.as_posix()
+
+
+def _runtime_support_messages_for_field(
+    field_name: str,
+    messages: tuple[AgentMessage, ...],
+) -> tuple[AgentMessage, ...]:
+    """Narrow support messages for profile-known evidence fields."""
+    normalized = field_name.lower()
+    if normalized == "files_touched":
+        return messages
+    if normalized in {"commands_run", "tests_passed"}:
+        return tuple(message for message in messages if message.tool_name == "Bash")
+    return messages
+
+
+def _runtime_messages_support_claim(value: str, messages: tuple[AgentMessage, ...]) -> bool:
+    """Return True when a non-final runtime message backs a claim string."""
+    needle = value.strip().lower()
+    return bool(needle) and any(
+        needle in _runtime_message_search_text(message) for message in messages
+    )
+
+
+def _runtime_message_supports_command_claim(value: str, message: AgentMessage) -> bool:
+    """Return True when one runtime message backs a command claim.
+
+    Codex commonly records the executed Bash command as a shell wrapper such as
+    ``/bin/zsh -lc 'cd /workspace && python -m unittest "test_hello.py"'``
+    while typed evidence may claim the inner test command.  Treat those as
+    equivalent only through the structured Bash command field; arbitrary output
+    text or assistant narration must not create command aliases.
+    """
+    if message.tool_name != "Bash":
+        return _runtime_messages_support_claim(value, (message,))
+    claim_aliases = set(_normalized_command_claim_aliases(value))
+    claim_test_invocation = _test_command_invocation(value)
+    for runtime_command in _runtime_message_command_values(message):
+        runtime_aliases = set(_normalized_command_claim_aliases(runtime_command))
+        if claim_aliases and runtime_aliases and claim_aliases.intersection(runtime_aliases):
+            return True
+
+        runtime_inner_command = _single_command_after_safe_shell_preamble(runtime_command)
+        if runtime_inner_command and runtime_inner_command in claim_aliases:
+            return True
+
+        runtime_test_invocation = _test_command_invocation(runtime_command)
+        if (
+            claim_test_invocation
+            and runtime_test_invocation
+            and (
+                runtime_test_invocation == claim_test_invocation
+                or runtime_test_invocation.startswith(claim_test_invocation + " ")
+            )
+        ):
+            return True
+    return False
+
+
+def _runtime_messages_support_command_claim(
+    value: str,
+    messages: tuple[AgentMessage, ...],
+) -> bool:
+    """Return True when runtime messages back a command claim."""
+    return any(_runtime_message_supports_command_claim(value, message) for message in messages)
+
+
+def _runtime_messages_support_file_claim(
+    value: str,
+    messages: tuple[AgentMessage, ...],
+    *,
+    task_cwd: str | None,
+) -> bool:
+    """Return True when runtime transcript evidence backs a workspace file claim.
+
+    Existence alone is not sufficient for ``files_touched``: a stale file in the
+    workspace must not prove that this run created or modified it. Exact
+    transcript support is preferred; basename support is accepted only when the
+    claimed relative path resolves inside the active workspace, which covers
+    tool outputs that report ``generated.py`` instead of ``src/generated.py``.
+    """
+    relative_claim = _workspace_relative_file_claim(value, task_cwd=task_cwd)
+    if relative_claim is None:
+        return False
+    candidate = Path(relative_claim)
+    base = Path(task_cwd).resolve()
+    resolved = (base / candidate).resolve()
+    if any(
+        _runtime_message_supports_file_reference(
+            relative_claim,
+            message,
+            messages=messages,
+            index=index,
+            task_cwd=task_cwd,
+        )
+        for index, message in enumerate(messages)
+    ):
+        return True
+    if not resolved.exists():
+        return False
+    basename = candidate.name.strip().lower()
+    return bool(basename) and any(
+        _runtime_message_supports_file_reference(
+            basename,
+            message,
+            messages=messages,
+            index=index,
+            task_cwd=task_cwd,
+            allow_bash_command_text=False,
+        )
+        for index, message in enumerate(messages)
+    )
+
+
+def _runtime_message_supports_file_reference(
+    reference: str,
+    message: AgentMessage,
+    *,
+    messages: tuple[AgentMessage, ...],
+    index: int,
+    task_cwd: str | None,
+    allow_bash_command_text: bool = True,
+) -> bool:
+    """Return True when one message plausibly reports touching a file reference."""
+    normalized_reference = reference.strip().lower()
+    if not normalized_reference:
+        return False
+    text = _runtime_message_file_proof_text(message)
+    if message.tool_name == "Bash":
+        return _text_supports_file_mutation_reference(text, normalized_reference) or (
+            allow_bash_command_text
+            and _bash_command_mutates_file_reference(message, normalized_reference)
+            and _runtime_message_has_success_evidence(message, messages=messages, index=index)
+        )
+    if message.tool_name in {"Edit", "Write", "NotebookEdit"}:
+        return any(
+            _file_claim_matches_runtime_path(reference, path, task_cwd=task_cwd)
+            for path in _runtime_message_file_path_values(message)
+        )
+    return _text_supports_file_mutation_reference(text, normalized_reference)
+
+
+def _text_supports_file_mutation_reference(text: str, normalized_reference: str) -> bool:
+    """Return True when text pairs a file reference with mutation language."""
+    if not text:
+        return False
+    reference_pattern = _file_reference_pattern(normalized_reference)
+    if not reference_pattern.search(text):
+        return False
+    return bool(
+        re.search(
+            rf"(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-]).*\b("
+            r"updated|modified|changed|created|generated|wrote|written|patched"
+            r")\b|\b("
+            r"updated|modified|changed|created|generated|wrote|written|patched"
+            rf")\b.*(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-])",
+            text,
+        )
+    )
+
+
+def _file_reference_pattern(normalized_reference: str) -> re.Pattern[str]:
+    """Return a conservative token pattern for a workspace-relative file reference."""
+    return re.compile(rf"(?<![\w./-]){re.escape(normalized_reference)}(?![\w./-])")
+
+
+def _bash_command_mutates_file_reference(message: AgentMessage, normalized_reference: str) -> bool:
+    """Return True for explicit shell writes to the referenced file.
+
+    Bash command text is only trusted when the command itself carries mutation
+    semantics for the claimed file. This preserves direct shell-edit evidence
+    such as ``touch src/generated.py`` or ``printf ... > src/generated.py``
+    without allowing read-only probes like ``grep updated src/generated.py`` to
+    prove ``files_touched`` merely by containing a path and a mutation word.
+    """
+    tool_input = message.data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        return False
+    normalized_command = command.strip().lower()
+    if not normalized_command:
+        return False
+    if not _file_reference_pattern(normalized_reference).search(normalized_command):
+        return False
+    quoted_reference = rf"['\"]?{re.escape(normalized_reference)}['\"]?"
+    if re.search(rf"(^|[\s;&|])(?:\d?>|&>|>>|\d>>)\s*{quoted_reference}", normalized_command):
+        return True
+    return bool(
+        re.search(
+            rf"(^|[\s;&|])(touch|truncate|tee)\b[^;&|]*\s{quoted_reference}(?=$|[\s;&|])",
+            normalized_command,
+        )
+        or re.search(
+            rf"(^|[\s;&|])(sed|perl)\b[^;&|]*\s-[^\s;&|]*i[^;&|]*\s"
+            rf"{quoted_reference}(?=$|[\s;&|])",
+            normalized_command,
+        )
+    )
+
+
+def _runtime_message_has_success_signal(message: AgentMessage) -> bool:
+    """Return True when one runtime message carries successful completion evidence."""
+    if message.is_error:
+        return False
+    exit_code = message.data.get("exit_code")
+    if isinstance(exit_code, int):
+        return exit_code == 0
+    if message.data.get("subtype") == "success":
+        return True
+    status = message.data.get("status")
+    if isinstance(status, str) and status.strip().lower() in {
+        "completed",
+        "success",
+        "succeeded",
+    }:
+        return True
+    text = "\n".join(
+        str(part)
+        for part in (
+            message.content,
+            message.data.get("result_preview"),
+            message.data.get("output"),
+            message.data.get("stdout"),
+            message.data.get("stderr"),
+        )
+        if isinstance(part, str)
+    ).lower()
+    return bool(re.search(r"\b(exit\s*code\s*0|completed|succeeded|success)\b", text))
+
+
+def _runtime_message_has_success_evidence(
+    message: AgentMessage,
+    *,
+    messages: tuple[AgentMessage, ...],
+    index: int,
+) -> bool:
+    """Return True when a tool-call message itself or its result proves success."""
+    if _runtime_message_has_success_signal(message):
+        return True
+    return _runtime_message_has_following_success(messages, index)
+
+
+def _runtime_message_has_following_success(messages: tuple[AgentMessage, ...], index: int) -> bool:
+    """Return True when a tool-call message is followed by a successful result."""
+    for candidate in messages[index + 1 :]:
+        if candidate.type == "tool":
+            return False
+        if candidate.is_error:
+            return False
+        if _runtime_message_has_success_signal(candidate):
+            return True
+    return False
+
+
+def _runtime_message_file_proof_text(message: AgentMessage) -> str:
+    """Return text that can prove a file was touched by the current run.
+
+    For Bash tool invocations, command text is not proof by itself: read-only
+    commands such as ``grep updated src/app.py`` can contain both the claimed
+    path and mutation verbs. Trust Bash result/output fields instead. Dedicated
+    edit/write tools still expose their tool inputs because their tool identity
+    supplies the mutation semantics.
+    """
+    if message.tool_name == "Bash":
+        parts: list[str] = []
+        for key in ("result_preview", "output", "stdout", "stderr"):
+            value = message.data.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+        return "\n".join(parts).lower()
+    return _runtime_message_search_text(message)
+
+
+def _looks_like_test_command(command: str) -> bool:
+    """Return True for common whole-suite or targeted test invocations."""
+    return _test_command_invocation(command) is not None
+
+
+def _test_command_invocation(command: str) -> str | None:
+    """Return the backed inner test invocation for a direct or wrapped command."""
+    normalized = command.strip().lower()
+    if not normalized:
+        return None
+
+    direct = _test_invocation_from_prefix(normalized)
+    if direct is not None:
+        return direct
+
+    body = _shell_command_body(normalized)
+    if body is None:
+        return None
+    return _test_invocation_from_shell_body(body)
+
+
+def _shell_command_body(command: str) -> str | None:
+    """Return the ``-c`` body when the command starts with a shell wrapper."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if len(parts) < 3:
+        return None
+    shell_name = Path(parts[0]).name
+    if shell_name not in {"bash", "zsh", "sh"}:
+        return None
+    option_index = next(
+        (index for index, part in enumerate(parts[1:], start=1) if part in {"-c", "-lc", "-cl"}),
+        None,
+    )
+    if option_index is None or option_index + 1 >= len(parts):
+        return None
+    return parts[option_index + 1].strip()
+
+
+def _test_invocation_from_shell_body(body: str) -> str | None:
+    """Return a test invocation after conservative shell setup preambles."""
+    for segment in _segments_after_safe_shell_preamble(body):
+        invocation = _test_invocation_from_prefix(segment)
+        if invocation is not None:
+            return invocation
+        return None
+    return None
+
+
+def _single_command_after_safe_shell_preamble(command: str) -> str | None:
+    """Return a wrapped inner command after only safe setup preambles.
+
+    Generic ``commands_run`` evidence may cite the useful command inside a
+    runtime-recorded shell wrapper such as ``cd /work && python scripts/gen.py``.
+    Keep this narrower than substring containment: only ignore setup-only
+    preambles and only when exactly one non-preamble command remains.
+    """
+    body = _shell_command_body(command)
+    if body is None:
+        return None
+    segments = tuple(_segments_after_safe_shell_preamble(body))
+    if len(segments) != 1:
+        return None
+    return _normalized_evidence_text(segments[0])
+
+
+def _segments_after_safe_shell_preamble(body: str) -> tuple[str, ...]:
+    """Return non-preamble shell segments after setup-only commands."""
+    remaining: list[str] = []
+    for segment in re.split(r"\s*&&\s*", body.strip()):
+        normalized_segment = segment.strip()
+        if not normalized_segment:
+            continue
+        if not remaining and _is_safe_test_command_preamble(normalized_segment):
+            continue
+        remaining.append(normalized_segment)
+    return tuple(remaining)
+
+
+def _is_safe_test_command_preamble(segment: str) -> bool:
+    """Return True for shell setup segments that do not execute tests themselves."""
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return False
+    if not parts:
+        return True
+    if parts[0] == "cd" and len(parts) == 2:
+        return True
+    if parts[0] == "export" and len(parts) > 1:
+        return all(_is_env_assignment(part) for part in parts[1:])
+    return all(_is_env_assignment(part) for part in parts)
+
+
+def _is_env_assignment(value: str) -> bool:
+    """Return True for a simple shell environment assignment token."""
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", value))
+
+
+def _strip_env_prefix(parts: list[str]) -> list[str]:
+    """Remove leading env assignment tokens before command recognition."""
+    index = 0
+    if parts and parts[0] == "env":
+        index = 1
+    while index < len(parts) and _is_env_assignment(parts[index]):
+        index += 1
+    return parts[index:]
+
+
+def _test_invocation_from_prefix(command: str) -> str | None:
+    """Return a normalized test invocation only when it starts the command text."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.replace('"', "").replace("'", "").split()
+    parts = _strip_env_prefix(parts)
+    if not parts:
+        return None
+
+    if parts[0] in {"pytest", "py.test", "tox", "nox"}:
+        return _normalized_evidence_text(" ".join(parts))
+    if len(parts) >= 2 and parts[0] in {"npm", "pnpm", "yarn"} and parts[1] == "test":
+        return _normalized_evidence_text(" ".join(parts))
+    if len(parts) >= 3 and parts[:3] == ["uv", "run", "pytest"]:
+        return _normalized_evidence_text(" ".join(parts))
+    if (
+        len(parts) >= 3
+        and parts[:2] == ["python", "-m"]
+        and parts[2]
+        in {
+            "pytest",
+            "unittest",
+        }
+    ):
+        return _normalized_evidence_text(" ".join(parts))
+    return None
+
+
+def _unittest_command_invocation(command: str) -> str | None:
+    """Return the embedded ``python -m unittest`` invocation, if present."""
+    invocation = _test_command_invocation(command)
+    if invocation is None:
+        return None
+    parts = invocation.split()
+    if len(parts) >= 3 and parts[:3] == ["python", "-m", "unittest"]:
+        return invocation
+    return None
+
+
+def _looks_like_unittest_command(command: str) -> bool:
+    """Return True when a shell command invokes stdlib unittest."""
+    return _unittest_command_invocation(command) is not None
+
+
+def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:
+    """Return normalized command forms that a concise evidence claim may use.
+
+    Structured Bash tool inputs may wrap the user command as
+    ``/bin/zsh -lc '<body>'``.  The wrapper itself is runtime-backed, so an
+    evidence claim may cite the exact shell body without re-stating the wrapper.
+    Keep this alias exact: test-command-specific helpers handle conservative
+    setup preambles, while generic ``commands_run`` claims should not be proven
+    by partial substrings of arbitrary shell scripts.
+    """
+    normalized = _normalized_evidence_text(command)
+    aliases = [normalized] if normalized else []
+    shell_body = _shell_command_body(command)
+    normalized_shell_body = _normalized_evidence_text(shell_body) if shell_body else None
+    if normalized_shell_body and normalized_shell_body not in aliases:
+        aliases.append(normalized_shell_body)
+    test_invocation = _test_command_invocation(command)
+    if test_invocation and test_invocation not in aliases:
+        aliases.append(test_invocation)
+    return tuple(aliases)
+
+
+def _text_contains_unittest_success(text: str) -> bool:
+    """Return True for real unittest success output."""
+    return _text_contains_test_success(text) and bool(
+        re.search(r"\bran\s+[1-9]\d*\s+tests?\b[\s\S]*\bok\b", text.lower())
+    )
+
+
+def _text_contains_test_success(text: str) -> bool:
+    """Return True when text contains a conservative test-success signal."""
+    text = text.lower()
+    zero_failure_pattern = (
+        r"\b(0\s+(failed|failures?|errors?)|no\s+(tests?\s+)?(failed|failures?|errors?))\b"
+    )
+    failure_scan_text = re.sub(zero_failure_pattern, "", text)
+    if re.search(
+        r"\b[1-9]\d*\s+(failed|failures?|errors?)\b|"
+        r"\b(failed|failure|failures?|error|errors)\b|"
+        r"exit\s*code\s*[1-9]",
+        failure_scan_text,
+    ):
+        return False
+    if re.search(r"\b0\s+passed\b", text) and not re.search(r"\b[1-9]\d*\s+passed\b", text):
+        return False
+    return bool(
+        re.search(r"\b([1-9]\d*\s+passed|passed|pass|success|succeeded)\b|exit\s*code\s*0", text)
+        or re.search(r"\bran\s+[1-9]\d*\s+tests?\b[\s\S]*\bok\b", text)
+    )
+
+
+def _message_contains_test_success(message: AgentMessage) -> bool:
+    """Return True when one message says a test command passed."""
+    parts = [message.content]
+    for key in ("result_preview", "output", "stdout", "status", "subtype"):
+        value = message.data.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    exit_code = message.data.get("exit_code")
+    if type(exit_code) is int:
+        parts.append(f"exit code {exit_code}")
+    return _text_contains_test_success("\n".join(parts))
+
+
+def _runtime_message_test_proof_text(message: AgentMessage) -> str:
+    """Return runtime-produced text that can prove test output for a Bash chunk.
+
+    Assistant narration after a Bash call is useful transcript context, but it
+    is not runtime output for that command. Keep summary matching tied to the
+    Bash output/result payloads and tool-result messages that runtimes emit.
+    """
+    resultish = (
+        message.type in {"result", "tool_result"} or message.data.get("subtype") == "tool_result"
+    )
+    parts: list[str] = []
+    if resultish:
+        parts.append(message.content)
+    for key in ("result_preview", "output", "stdout", "stderr", "tool_result_text"):
+        value = message.data.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    tool_result = message.data.get("tool_result")
+    if isinstance(tool_result, dict):
+        for key in ("text_content", "content", "output", "stdout", "stderr"):
+            value = tool_result.get(key)
+            if isinstance(value, str):
+                parts.append(value)
+    elif isinstance(tool_result, str):
+        parts.append(tool_result)
+    return "\n".join(parts)
+
+
+def _is_tool_result_message(message: AgentMessage) -> bool:
+    """Return True for runtime tool-result messages, including named-tool variants."""
+    return message.type in {"result", "tool_result"} or message.data.get("subtype") == "tool_result"
+
+
+def _test_claim_file_part(value: str) -> str | None:
+    """Return the file path portion of a pytest node-id style claim."""
+    stripped = value.strip()
+    if not stripped:
+        return None
+    file_part = stripped.split("::", 1)[0].strip()
+    return file_part or None
+
+
+def _normalized_evidence_text(text: str) -> str:
+    """Normalize transcript/claim text for conservative containment checks."""
+    return " ".join(text.lower().split())
+
+
+def _claim_summary_matches_runtime_chunk(
+    *,
+    command: str,
+    claim: str,
+    chunk_text: str,
+) -> bool:
+    """Return True when a command+summary claim is present in runtime output.
+
+    This keeps the verifier transcript-driven: the claim may combine the backed
+    command and a unittest-style success summary, but the summary itself must
+    also appear in the runtime chunk. The claim text alone is never proof.
+    """
+    normalized_claim = _normalized_evidence_text(claim)
+    normalized_chunk = _normalized_evidence_text(chunk_text)
+    summary = ""
+    for normalized_command in _normalized_command_claim_aliases(command):
+        if normalized_command in normalized_claim:
+            summary = normalized_claim.split(normalized_command, 1)[1].strip(" :-")
+            break
+    if not summary or summary not in normalized_chunk:
+        return False
+    if (
+        summary == "ok"
+        and _looks_like_unittest_command(command)
+        and _text_contains_unittest_success(chunk_text)
+    ):
+        return True
+    return _text_contains_test_success(summary)
+
+
+def _claim_contains_command_success_summary(*, command: str, claim: str) -> bool:
+    """Return True when a test claim appends a success summary to a command."""
+    normalized_claim = _normalized_evidence_text(claim)
+    for normalized_command in _normalized_command_claim_aliases(command):
+        if normalized_command in normalized_claim:
+            summary = normalized_claim.split(normalized_command, 1)[1].strip(" :-")
+            return bool(summary) and _text_contains_test_success(summary)
+    return False
+
+
+def _test_command_targets_claim(
+    *,
+    command: str,
+    claim: str,
+    chunk_text: str,
+    chunk_test_proof_text: str,
+    messages: tuple[AgentMessage, ...],
+    task_cwd: str | None,
+) -> bool:
+    """Return True when a successful test command can cover a test claim."""
+    needle = claim.strip().lower()
+    if _claim_contains_command_success_summary(command=command, claim=claim):
+        return _claim_summary_matches_runtime_chunk(
+            command=command,
+            claim=claim,
+            chunk_text=chunk_test_proof_text,
+        )
+    if needle and needle in chunk_text:
+        return True
+
+    file_part = _test_claim_file_part(claim)
+    if file_part is None:
+        return False
+    normalized_file = file_part.lower()
+    normalized_command = command.lower()
+    if normalized_file in chunk_text or normalized_file in normalized_command:
+        return True
+    if _claim_summary_matches_runtime_chunk(
+        command=command,
+        claim=claim,
+        chunk_text=chunk_test_proof_text,
+    ):
+        return True
+
+    # A broad suite command such as ``pytest`` can cover a node-id claim when
+    # the claimed test file is also backed by current-run mutation evidence.
+    # Existence alone is deliberately insufficient: otherwise a transcript with
+    # unrelated ``pytest`` output could prove any stale test file in the tree.
+    command_parts = (_test_command_invocation(command) or normalized_command).split()
+    broad_pytest = command_parts in (["pytest"], ["py.test"]) or command_parts[-3:] == [
+        "python",
+        "-m",
+        "pytest",
+    ]
+    if not broad_pytest or task_cwd is None:
+        return False
+    return _runtime_messages_support_file_claim(file_part, messages, task_cwd=task_cwd)
+
+
+def _runtime_messages_support_test_claim(
+    *,
+    value: str,
+    backed_commands: tuple[str, ...],
+    messages: tuple[AgentMessage, ...],
+    task_cwd: str | None,
+) -> bool:
+    """Return True when a backed test command chunk proves one test claim."""
+    needle = value.strip().lower()
+    if not needle:
+        return False
+    for index, message in enumerate(messages):
+        if message.tool_name != "Bash":
+            continue
+        matching_commands = tuple(
+            candidate
+            for candidate in backed_commands
+            if _looks_like_test_command(candidate)
+            and _runtime_message_supports_command_claim(candidate, message)
+        )
+        if not matching_commands:
+            continue
+        chunk = [message]
+        for following in messages[index + 1 :]:
+            if following.tool_name and not _is_tool_result_message(following):
+                break
+            chunk.append(following)
+        if not any(_message_contains_test_success(item) for item in chunk):
+            continue
+        chunk_text = "\n".join(_runtime_message_search_text(item) for item in chunk)
+        chunk_test_proof_text = "\n".join(_runtime_message_test_proof_text(item) for item in chunk)
+        if any(
+            _test_command_targets_claim(
+                command=command,
+                claim=value,
+                chunk_text=chunk_text,
+                chunk_test_proof_text=chunk_test_proof_text,
+                messages=messages,
+                task_cwd=task_cwd,
+            )
+            for command in matching_commands
+        ):
+            return True
+    return False
+
+
+_REUSABLE_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "execution.session.recovered",
+        "execution.session.started",
+        "execution.session.resumed",
+    }
+)
+_NON_REUSABLE_RUNTIME_EVENT_TYPES = frozenset(
+    {
+        "execution.session.completed",
+        "execution.session.failed",
+    }
+)
+_AC_RUNTIME_OWNERSHIP_METADATA_KEYS = frozenset(
+    {
+        "ac_id",
+        "ac_index",
+        "attempt_number",
+        "depth",
+        "display_path",
+        "execution_id",
+        "identity_model",
+        "legacy_node_id",
+        "legacy_node_aliases",
+        "legacy_parent_node_id",
+        "legacy_parent_node_aliases",
+        "legacy_session_scope_id",
+        "legacy_session_scope_ids",
+        "legacy_session_state_path",
+        "legacy_session_state_paths",
+        "node_kind",
+        "node_id",
+        "ordinal",
+        "parent_ac_index",
+        "parent_node_id",
+        "path",
+        "retry_attempt",
+        "root_ac_index",
+        "root_ac_number",
+        "scope",
+        "schema_version",
+        "session_attempt_id",
+        "session_role",
+        "session_scope_id",
+        "session_state_path",
+        "sub_ac_index",
+    }
+)
+_AC_RUNTIME_SCOPE_METADATA_KEYS = frozenset(
+    {
+        "ac_id",
+        "ac_index",
+        "execution_id",
+        "identity_model",
+        "node_kind",
+        "node_id",
+        "parent_ac_index",
+        "parent_node_id",
+        "path",
+        "root_ac_index",
+        "scope",
+        "schema_version",
+        "session_role",
+        "session_scope_id",
+        "session_state_path",
+        "sub_ac_index",
+    }
+)
+_AC_RUNTIME_RESUME_METADATA_KEYS = frozenset({"runtime_event_type", "server_session_id"})
+
+# Stall detection constants
+STALL_TIMEOUT_SECONDS: float = 300.0  # 5 minutes of silence → stall
+HEARTBEAT_INTERVAL_SECONDS: float = 30.0  # Heartbeat emission interval
+MAX_STALL_RETRIES: int = 2  # Max retries after stall (3 total attempts)
+_STALL_SENTINEL = "__STALL_DETECTED__"  # Sentinel error for stall results
+
+# Memory-pressure gate constants
+_MIN_FREE_MEMORY_GB = 2.0
+_MEMORY_CHECK_INTERVAL_SECONDS = 5.0
+_MEMORY_WAIT_MAX_SECONDS = 120.0
+_MAX_LEAF_RESULT_CHARS = 1200
+_SIBLING_HEADLINE_CHARS = 80
+_SiblingACRef = tuple[int | None, str]
+
+
+def _build_governed_parent_summary(level_contexts: list[LevelContext] | None) -> str:
+    """Render level context for governed dispatch without nested H2 headings.
+
+    ``build_context_prompt()`` is also used by the legacy prompt path, where its
+    top-level ``##`` sections are appropriate.  Governed dispatch already wraps
+    that text in ``## Parent context`` via ``compose_context()``, so preserving
+    those headings creates a hard-to-scan nested hierarchy.  Build the governed
+    variant from structured ``LevelContext`` data so only orchestrator-owned
+    section wrappers become compact labels; embedded markdown from AC outputs
+    remains byte-for-byte content inside its original summary text.
+    """
+    if not level_contexts:
+        return ""
+
+    sections: list[str] = []
+    for ctx in level_contexts:
+        text = ctx.to_prompt_text()
+        if text:
+            sections.append(text)
+
+    has_reviews = any(ctx.coordinator_review for ctx in level_contexts)
+    if not sections and not has_reviews:
+        return ""
+
+    lines: list[str] = []
+    if sections:
+        lines.extend(
+            (
+                "Previous Work Context:",
+                "The following ACs have already been completed. "
+                "Use this context to inform your work.",
+                "",
+                "\n\n".join(sections),
+            )
+        )
+
+    for ctx in level_contexts:
+        if ctx.coordinator_review:
+            review = ctx.coordinator_review
+            review_lines: list[str] = []
+
+            if review.review_summary:
+                review_lines.append(f"**Review**: {review.review_summary}")
+
+            if review.fixes_applied:
+                fixes = "; ".join(review.fixes_applied)
+                review_lines.append(f"**Fixes applied**: {fixes}")
+
+            if review.warnings_for_next_level:
+                for warning in review.warnings_for_next_level:
+                    review_lines.append(f"- WARNING: {warning}")
+
+            if review_lines:
+                if lines:
+                    lines.append("")
+                lines.append(f"Coordinator Review (Level {review.level_number}):")
+                lines.extend(review_lines)
+
+    return "\n".join(lines).strip()
+
+
+def _get_available_memory_gb() -> float | None:
+    """Get available memory in GB. Returns None if check fails."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            result = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            pages_free = 0
+            pages_inactive = 0
+            page_size = 4096  # macOS default
+            for line in result.stdout.splitlines():
+                if "page size of" in line:
+                    parts = line.split()
+                    for part in parts:
+                        if part.isdigit():
+                            page_size = int(part)
+                elif line.startswith("Pages free:"):
+                    pages_free = int(line.split(":")[1].strip().rstrip("."))
+                elif line.startswith("Pages inactive:"):
+                    pages_inactive = int(line.split(":")[1].strip().rstrip("."))
+            return (pages_free + pages_inactive) * page_size / (1024**3)
+
+        elif system == "Linux":
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        kb = int(line.split()[1])
+                        return kb / (1024**2)
+            return None
+
+        else:
+            return None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+# Data models re-exported from parallel_executor_models for backwards compat.
+# (ACExecutionOutcome, ACExecutionResult, ParallelExecutionStageResult,
+#  ParallelExecutionResult, StageExecutionOutcome are imported above.)
+
+
+def _normalize_command(command: str) -> str:
+    """Normalize Bash commands for stable audit output."""
+    return " ".join(command.split())
+
+
+def _normalize_exact_command(command: str) -> str:
+    """Normalize command whitespace while preserving case-sensitive exactness."""
+    return " ".join(command.split())
+
+
+def _truncate_text(text: str, limit: int = _MAX_LEAF_RESULT_CHARS) -> str:
+    """Truncate long evidence blocks while preserving their beginning."""
+    stripped = text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[:limit].rstrip() + "\n[TRUNCATED]"
+
+
+def _extract_leaf_evidence_lines(result: ACExecutionResult) -> list[str]:
+    """Extract normalized command, file, and result evidence for a leaf AC."""
+    lines: list[str] = []
+    seen_commands: set[str] = set()
+    seen_file_ops: set[tuple[str, str]] = set()
+
+    for message in result.messages:
+        if not message.tool_name:
+            continue
+        tool_input = message.data.get("tool_input", {})
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+
+        if message.tool_name == "Bash":
+            command = tool_input.get("command")
+            if isinstance(command, str):
+                normalized = _normalize_command(command)
+                if normalized and normalized not in seen_commands:
+                    if not lines:
+                        lines.append("Commands Run:")
+                    lines.append(f"- Bash: {normalized}")
+                    seen_commands.add(normalized)
+            continue
+
+        if message.tool_name in ("Write", "Edit", "NotebookEdit"):
+            path_key = "notebook_path" if message.tool_name == "NotebookEdit" else "file_path"
+            file_path = tool_input.get(path_key)
+            if isinstance(file_path, str) and file_path:
+                file_op = (message.tool_name, file_path)
+                if file_op not in seen_file_ops:
+                    if "File Changes:" not in lines:
+                        lines.append("File Changes:")
+                    lines.append(f"- {message.tool_name}: {file_path}")
+                    seen_file_ops.add(file_op)
+
+    result_text = result.final_message or (f"Error: {result.error}" if result.error else "")
+    if result_text:
+        lines.append("Result:")
+        lines.append(_truncate_text(result_text))
+    return lines
+
+
+def _successful_runtime_test_commands(messages: tuple[AgentMessage, ...]) -> set[str]:
+    """Return Bash test commands backed by adjacent runtime success output."""
+    commands: set[str] = set()
+    for index, message in enumerate(messages):
+        if message.tool_name != "Bash":
+            continue
+        message_commands = {
+            alias
+            for command in _runtime_message_command_values(message)
+            if _looks_like_test_command(command)
+            for alias in _runtime_command_evidence_aliases(command)
+        }
+        if not message_commands:
+            continue
+        chunk = [message]
+        for following in messages[index + 1 :]:
+            if following.tool_name and not _is_tool_result_message(following):
+                break
+            chunk.append(following)
+        if any(
+            not item.is_final
+            and _text_contains_test_success(_runtime_message_test_proof_text(item))
+            for item in chunk
+        ):
+            commands.update(command for command in message_commands if command)
+    return commands
+
+
+def _add_runtime_command_evidence(commands: set[str], command: str) -> None:
+    """Add runtime command evidence without accepting compound shell aliases."""
+    commands.update(_runtime_command_evidence_aliases(command))
+
+
+def _runtime_command_evidence_aliases(command: str) -> tuple[str, ...]:
+    """Return exact runtime command aliases for sibling reconciliation."""
+    aliases = [_normalize_exact_command(command)]
+    single_inner_command = _single_exact_command_after_safe_shell_preamble(command)
+    if single_inner_command and single_inner_command not in aliases:
+        aliases.append(single_inner_command)
+    return tuple(alias for alias in aliases if alias)
+
+
+def _single_exact_command_after_safe_shell_preamble(command: str) -> str | None:
+    """Return one wrapped inner command without lowercasing exact evidence."""
+    body = _shell_command_body(command)
+    if body is None:
+        return None
+    segments = tuple(_segments_after_safe_shell_preamble(body))
+    if len(segments) != 1:
+        return None
+    return _normalize_exact_command(segments[0])
+
+
+def _typed_evidence_is_usable_for_sibling_reconciliation(result: ACExecutionResult) -> bool:
+    """Return True when typed evidence was not rejected by validation/verifier."""
+    if result.typed_evidence is None:
+        return False
+    if result.typed_evidence_error:
+        return False
+    if result.typed_evidence_validation is not None and not result.typed_evidence_validation.ok:
+        return False
+    return result.atomic_verifier_verdict is None or result.atomic_verifier_verdict.passed
+
+
+def _typed_file_evidence_proves_current_existence(
+    result: ACExecutionResult,
+    relative_path: str,
+) -> bool:
+    """Return True when typed file evidence is backed by current end-state existence."""
+    if result.runtime_handle is None or result.runtime_handle.cwd is None:
+        return False
+    candidate = (Path(result.runtime_handle.cwd).resolve() / relative_path).resolve()
+    try:
+        candidate.relative_to(Path(result.runtime_handle.cwd).resolve())
+    except ValueError:
+        return False
+    return candidate.is_file()
+
+
+def _evidence_values_from_result(result: ACExecutionResult) -> tuple[set[str], set[str], set[str]]:
+    """Return normalized file paths, run commands, and passed commands.
+
+    This intentionally uses only structured/runtime evidence, not broad natural
+    language success claims, so sibling AC completion remains conservative.
+    """
+    files: set[str] = set()
+    run_commands: set[str] = set()
+    passed_commands: set[str] = set()
+
+    if _typed_evidence_is_usable_for_sibling_reconciliation(result):
+        assert result.typed_evidence is not None
+        task_cwd = result.runtime_handle.cwd if result.runtime_handle is not None else None
+        for value in _flatten_evidence_values(result.typed_evidence.get("files_touched")):
+            normalized = (
+                _workspace_relative_file_claim(str(value), task_cwd=task_cwd) or str(value).strip()
+            )
+            if normalized and _typed_file_evidence_proves_current_existence(result, normalized):
+                files.add(normalized)
+        for value in _flatten_evidence_values(result.typed_evidence.get("commands_run")):
+            _add_runtime_command_evidence(run_commands, str(value))
+        for value in _flatten_evidence_values(result.typed_evidence.get("tests_passed")):
+            _add_runtime_command_evidence(passed_commands, str(value))
+            _add_runtime_command_evidence(run_commands, str(value))
+
+    for message in result.messages:
+        if not message.tool_name:
+            continue
+
+        if message.tool_name == "Bash":
+            for command in _runtime_message_command_values(message):
+                _add_runtime_command_evidence(run_commands, command)
+            continue
+
+    passed_commands.update(_successful_runtime_test_commands(result.messages))
+    return files, run_commands, passed_commands
+
+
+def _criterion_satisfied_by_evidence(
+    criterion: str,
+    files: set[str],
+    run_commands: set[str],
+    passed_commands: set[str] | None = None,
+) -> bool:
+    """Conservatively decide whether evidence satisfies a sibling criterion."""
+    normalized_run_commands = {
+        _normalize_exact_command(command) for command in run_commands if command
+    }
+    normalized_passed_commands = {
+        _normalize_exact_command(command) for command in (passed_commands or set()) if command
+    }
+
+    for file_path in files:
+        if file_path and _criterion_is_exact_file_presence_ac(criterion, file_path):
+            return True
+
+    for command in normalized_passed_commands:
+        if command and _criterion_is_exact_command_pass_ac(criterion, command):
+            return True
+
+    for command in normalized_run_commands:
+        if command and _criterion_is_exact_command_run_ac(criterion, command):
+            return True
+
+    return False
+
+
+def _criterion_is_exact_file_presence_ac(criterion: str, file_path: str) -> bool:
+    """Return True when the criterion is only an exact file-presence AC."""
+    normalized_path = Path(file_path.strip()).as_posix()
+    if (
+        not normalized_path
+        or Path(normalized_path).is_absolute()
+        or ".." in Path(normalized_path).parts
+    ):
+        return False
+    inline_code_paths = [
+        Path(match.group(1).strip()).as_posix()
+        for match in re.finditer(r"`([^`]+)`", criterion)
+        if match.group(1).strip()
+    ]
+    if inline_code_paths != [normalized_path]:
+        return False
+
+    normalized = _normalized_evidence_text(
+        re.sub(r"`[^`]+`", "<path>", criterion).strip().rstrip(".")
+    )
+    return normalized in {
+        "<path> exists",
+        "<path> is present",
+        "the file <path> exists",
+        "the file <path> is present",
+    }
+
+
+def _criterion_inline_code_values(criterion: str) -> list[str]:
+    """Return normalized inline-code fragments from a criterion."""
+    return [
+        _normalize_exact_command(match.group(1).strip())
+        for match in re.finditer(r"`([^`]+)`", criterion)
+        if match.group(1).strip()
+    ]
+
+
+def _criterion_is_exact_command_pass_ac(criterion: str, command: str) -> bool:
+    """Return True when the criterion is only an exact command-pass AC."""
+    normalized_command = _normalize_exact_command(command)
+    if not normalized_command or _criterion_inline_code_values(criterion) != [normalized_command]:
+        return False
+    normalized = _normalized_evidence_text(
+        re.sub(r"`[^`]+`", "<command>", criterion).strip().rstrip(".")
+    )
+    return normalized in {
+        "<command> passes",
+        "<command> passed",
+        "<command> succeeds",
+        "<command> succeeded",
+        "the exact command <command> passes",
+        "the exact command <command> passed",
+        "the exact command <command> succeeds",
+        "the exact command <command> succeeded",
+        "the exact command <command> exits with code 0",
+        "the command <command> passes",
+        "the command <command> succeeds",
+    }
+
+
+def _criterion_is_exact_command_run_ac(criterion: str, command: str) -> bool:
+    """Return True when the criterion is only an exact command-run AC."""
+    normalized_command = _normalize_exact_command(command)
+    if not normalized_command or _criterion_inline_code_values(criterion) != [normalized_command]:
+        return False
+    normalized = _normalized_evidence_text(
+        re.sub(r"`[^`]+`", "<command>", criterion).strip().rstrip(".")
+    )
+    return normalized in {
+        "run <command>",
+        "run the exact command <command>",
+        "execute <command>",
+        "execute the exact command <command>",
+        "the exact command <command> runs",
+        "the command <command> runs",
+    }
+
+
+def _complete_sibling_acs_from_evidence(
+    *,
+    level_results: list[ACExecutionResult],
+    ac_statuses: dict[int, str],
+    failed_indices: set[int],
+    completed_count: int,
+    level_success: int,
+    level_failed: int,
+) -> tuple[int, int, int, list[ACExecutionResult]]:
+    """Mark sibling ACs satisfied when a successful sibling has exact evidence.
+
+    Observation jobs often ask for separate ACs such as "file exists", "test
+    file exists", and "pytest passes". A single worker can legitimately create
+    both files and run the test. This function reconciles those concrete sibling
+    ACs from runtime/typed evidence instead of leaving them failed or pending.
+    """
+    replacements: dict[int, ACExecutionResult] = {}
+    successful_evidence = [
+        (result.ac_index, *_evidence_values_from_result(result))
+        for result in level_results
+        if result.success
+    ]
+    if not successful_evidence:
+        return completed_count, level_success, level_failed, level_results
+
+    for result in level_results:
+        if result.success or result.outcome != ACExecutionOutcome.FAILED:
+            continue
+        for source_idx, files, run_commands, passed_commands in successful_evidence:
+            if source_idx == result.ac_index:
+                continue
+            if not _criterion_satisfied_by_evidence(
+                result.ac_content,
+                files,
+                run_commands,
+                passed_commands,
+            ):
+                continue
+            replacements[result.ac_index] = ACExecutionResult(
+                ac_index=result.ac_index,
+                ac_content=result.ac_content,
+                success=True,
+                final_message=(f"Satisfied by runtime evidence from sibling AC {source_idx + 1}."),
+                retry_attempt=result.retry_attempt,
+                outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+            )
+            break
+
+    if not replacements:
+        return completed_count, level_success, level_failed, level_results
+
+    reconciled: list[ACExecutionResult] = []
+    for result in level_results:
+        replacement = replacements.get(result.ac_index)
+        if replacement is None:
+            reconciled.append(result)
+            continue
+        if result.outcome == ACExecutionOutcome.FAILED:
+            failed_indices.discard(result.ac_index)
+            if level_failed > 0:
+                level_failed -= 1
+        ac_statuses[result.ac_index] = "completed"
+        completed_count += 1
+        level_success += 1
+        reconciled.append(replacement)
+
+    return completed_count, level_success, level_failed, reconciled
+
+
+def _render_ac_section(
+    result: ACExecutionResult,
+    *,
+    index_path: tuple[int, ...],
+    heading_level: int,
+    include_header: bool = True,
+) -> list[str]:
+    """Render a single Task or Subtask section for verification/audit output."""
+    lines: list[str] = []
+    if include_header:
+        status = "COMPLETED" if result.success else "FAILED"
+        label = "Task" if len(index_path) == 1 else "Subtask"
+        lines.append(
+            f"{'#' * heading_level} {label} {'.'.join(str(i) for i in index_path)}: "
+            f"[{status}] {result.ac_content}"
+        )
+
+    if result.is_decomposed and result.sub_results:
+        lines.append(f"Decomposed into {len(result.sub_results)} Subtasks")
+        for idx, sub_result in enumerate(result.sub_results, start=1):
+            if lines:
+                lines.append("")
+            lines.extend(
+                _render_ac_section(
+                    sub_result,
+                    index_path=index_path + (idx,),
+                    heading_level=min(heading_level + 1, 6),
+                )
+            )
+        return lines
+
+    evidence_lines = _extract_leaf_evidence_lines(result)
+    if evidence_lines:
+        lines.extend(evidence_lines)
+    else:
+        lines.append("Result:")
+        lines.append("No final result message captured.")
+    return lines
+
+
+def _collect_decomposition_depth_warning_paths(
+    result: ACExecutionResult,
+    *,
+    index_path: tuple[int, ...],
+) -> list[str]:
+    """Collect dotted AC paths that hit the soft decomposition depth safety net."""
+    warning_paths: list[str] = []
+    if result.decomposition_depth_warning:
+        warning_paths.append(".".join(str(i) for i in index_path))
+
+    for idx, sub_result in enumerate(result.sub_results, start=1):
+        warning_paths.extend(
+            _collect_decomposition_depth_warning_paths(
+                sub_result,
+                index_path=index_path + (idx,),
+            )
+        )
+    return warning_paths
+
+
+def render_parallel_verification_report(
+    parallel_result: ParallelExecutionResult,
+    total_acceptance_criteria: int,
+    *,
+    max_decomposition_depth: int = DEFAULT_MAX_DECOMPOSITION_DEPTH,
+) -> str:
+    """Build the canonical QA artifact for parallel execution results."""
+    total_satisfied = parallel_result.success_count + parallel_result.externally_satisfied_count
+    lines = [
+        "Parallel Execution Verification Report",
+        f"Success: {total_satisfied}/{total_acceptance_criteria}",
+    ]
+    if parallel_result.externally_satisfied_count > 0:
+        lines.append(f"Externally Satisfied: {parallel_result.externally_satisfied_count}")
+    if parallel_result.failure_count > 0:
+        lines.append(f"Failed: {parallel_result.failure_count}")
+    if parallel_result.skipped_count > 0:
+        lines.append(f"Skipped: {parallel_result.skipped_count}")
+
+    warning_paths: list[str] = []
+    for user_facing_idx, result in enumerate(parallel_result.results, start=1):
+        warning_paths.extend(
+            _collect_decomposition_depth_warning_paths(
+                result,
+                index_path=(user_facing_idx,),
+            )
+        )
+
+    if warning_paths:
+        feedback_metadata = {
+            "feedback_metadata": [
+                {
+                    "code": "decomposition_depth_warning",
+                    "severity": "warning",
+                    "message": (
+                        "Recursive decomposition reached the soft depth safety net; "
+                        "affected leaves were forced to atomic execution."
+                    ),
+                    "source": "parallel_executor",
+                    "details": {
+                        "max_depth": max_decomposition_depth,
+                        "affected_count": len(warning_paths),
+                        "affected_ac_paths": warning_paths,
+                    },
+                }
+            ]
+        }
+        lines.append("")
+        lines.append("## Feedback Metadata")
+        lines.append(f"Feedback Metadata JSON: {json.dumps(feedback_metadata, sort_keys=True)}")
+
+    lines.append("")
+    lines.append("## Task Results")
+    for result in parallel_result.results:
+        lines.append("")
+        lines.extend(
+            _render_ac_section(
+                result,
+                index_path=(result.ac_index + 1,),
+                heading_level=3,
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_parallel_completion_message(
+    parallel_result: ParallelExecutionResult,
+    total_acceptance_criteria: int,
+) -> str:
+    """Build a concise operator-facing completion summary."""
+    total_satisfied = parallel_result.success_count + parallel_result.externally_satisfied_count
+    lines = [
+        "Parallel Execution Complete",
+        f"Success: {total_satisfied}/{total_acceptance_criteria}",
+    ]
+    if parallel_result.externally_satisfied_count > 0:
+        lines.append(f"Externally Satisfied: {parallel_result.externally_satisfied_count}")
+    if parallel_result.failure_count > 0:
+        lines.append(f"Failed: {parallel_result.failure_count}")
+    if parallel_result.skipped_count > 0:
+        lines.append(f"Skipped: {parallel_result.skipped_count}")
+
+    lines.append("")
+    lines.append("Task Status:")
+    for result in parallel_result.results:
+        if result.outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY:
+            status = "COMPLETED"
+            suffix = " (externally satisfied)"
+        else:
+            status = "COMPLETED" if result.success else "FAILED"
+            suffix = f" ({len(result.sub_results)} subtasks)" if result.is_decomposed else ""
+        lines.append(f"- Task {result.ac_index + 1}: [{status}] {result.ac_content}{suffix}")
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -136,27 +2013,59 @@ class ParallelACExecutor:
 
     def __init__(
         self,
-        adapter: ClaudeAgentAdapter,
+        adapter: AgentRuntime,
         event_store: EventStore,
         console: Console | None = None,
         enable_decomposition: bool = True,
         max_concurrent: int = 3,
+        max_decomposition_depth: int = DEFAULT_MAX_DECOMPOSITION_DEPTH,
+        checkpoint_store: Any | None = None,
+        inherited_runtime_handle: RuntimeHandle | None = None,
+        task_cwd: str | None = None,
+        execution_profile: ExecutionProfile | None = None,
+        fat_harness_mode: bool = False,
+        atomic_verifier: Verifier | None = None,
     ):
         """Initialize executor.
 
         Args:
-            adapter: Claude Agent adapter for execution.
+            adapter: Agent runtime for execution.
             event_store: Event store for progress tracking.
             console: Rich console for output.
             enable_decomposition: Enable Claude to decompose complex ACs.
             max_concurrent: Maximum number of concurrent AC executions.
+            max_decomposition_depth: Maximum recursive decomposition depth.
+            checkpoint_store: Optional CheckpointStore for state recovery (RC3).
+            inherited_runtime_handle: Optional parent Claude runtime handle for
+                        delegated child executions.
+            task_cwd: Explicit working directory override for task execution metadata.
+            execution_profile: Optional profile that makes decomposition split along
+                profile axis/min_unit instead of the legacy generic prompt.
+            fat_harness_mode: Enforce profile typed evidence plus a verifier
+                PASS at atomic AC acceptance.
+            atomic_verifier: Optional verifier callable for the separate
+                atomic evidence PASS gate. Defaults to the harness-owned
+                structural verifier.
         """
         self._adapter = adapter
         self._event_store = event_store
         self._console = console or Console()
         self._enable_decomposition = enable_decomposition
-        self._coordinator = LevelCoordinator(adapter)
+        self._max_decomposition_depth = max(0, max_decomposition_depth)
+        self._inherited_runtime_handle = inherited_runtime_handle
+        self._task_cwd = task_cwd
+        self._execution_profile = execution_profile
+        self._fat_harness_mode = fat_harness_mode
+        self._atomic_verifier = atomic_verifier
+        self._coordinator = LevelCoordinator(
+            adapter,
+            inherited_runtime_handle=inherited_runtime_handle,
+            task_cwd=task_cwd,
+        )
         self._semaphore = anyio.Semaphore(max_concurrent)
+        self._ac_runtime_handles: dict[str, RuntimeHandle] = {}
+        self._checkpoint_store = checkpoint_store
+        self._execution_counters_lock = asyncio.Lock()
 
     def _flush_console(self) -> None:
         """Flush console output to ensure progress is visible immediately."""
@@ -166,43 +2075,1225 @@ class ParallelACExecutor:
             except (OSError, ValueError):
                 pass
 
+    async def _safe_emit_event(self, event: Any, max_retries: int = 3) -> bool:
+        """Emit event with retry on failure (RC5).
+
+        Retries with exponential backoff to handle transient DB lock errors.
+        On permanent failure, logs error AND prints a console warning so the
+        operator is aware of event persistence degradation.
+
+        Args:
+            event: BaseEvent to persist.
+            max_retries: Maximum number of attempts.
+
+        Returns:
+            True if event was written, False if all retries failed.
+        """
+        for attempt in range(max_retries):
+            try:
+                await self._event_store.append(event)
+                return True
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = min(1.0 * (2**attempt), 5.0)
+                    log.warning(
+                        "parallel_executor.event_write.retry",
+                        event_type=event.type,
+                        attempt=attempt + 1,
+                        error=str(e),
+                    )
+                    await anyio.sleep(wait)
+                else:
+                    log.error(
+                        "parallel_executor.event_write.failed",
+                        event_type=event.type,
+                        attempts=max_retries,
+                        error=str(e),
+                    )
+                    self._console.print(
+                        f"  [yellow]Event persistence degraded: "
+                        f"{event.type} dropped after {max_retries} retries[/yellow]"
+                    )
+        return False
+
+    @staticmethod
+    def _build_expected_ac_runtime_metadata(
+        runtime_scope: Any,
+        *,
+        ac_index: int,
+        is_sub_ac: bool,
+        parent_ac_index: int | None,
+        sub_ac_index: int | None,
+        node_identity: ExecutionNodeIdentity | None,
+        retry_attempt: int,
+    ) -> dict[str, Any]:
+        """Build metadata that binds a runtime handle to a single AC execution scope."""
+        identity = build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=node_identity.execution_context_id
+            if node_identity is not None
+            else None,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        if identity.runtime_scope != runtime_scope:
+            identity = replace(identity, runtime_scope=runtime_scope)
+        return identity.to_metadata()
+
+    @staticmethod
+    def _metadata_value_matches_expected_scope(
+        key: str,
+        observed_value: Any,
+        expected_metadata: dict[str, Any],
+    ) -> bool:
+        """Return True when observed metadata matches canonical or legacy scope."""
+        if observed_value == expected_metadata.get(key):
+            return True
+
+        if key in {"ac_id", "session_scope_id"}:
+            legacy_scope_ids = expected_metadata.get("legacy_session_scope_ids")
+            if isinstance(legacy_scope_ids, (list, tuple)) and observed_value in legacy_scope_ids:
+                return True
+            return observed_value == expected_metadata.get("legacy_session_scope_id")
+
+        if key == "session_state_path":
+            legacy_state_paths = expected_metadata.get("legacy_session_state_paths")
+            if (
+                isinstance(legacy_state_paths, (list, tuple))
+                and observed_value in legacy_state_paths
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_session_state_path")
+
+        if key == "node_id":
+            legacy_node_aliases = expected_metadata.get("legacy_node_aliases")
+            if (
+                isinstance(legacy_node_aliases, (list, tuple))
+                and observed_value in legacy_node_aliases
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_node_id")
+
+        if key == "parent_node_id":
+            legacy_parent_node_aliases = expected_metadata.get("legacy_parent_node_aliases")
+            if (
+                isinstance(legacy_parent_node_aliases, (list, tuple))
+                and observed_value in legacy_parent_node_aliases
+            ):
+                return True
+            return observed_value == expected_metadata.get("legacy_parent_node_id")
+
+        return False
+
+    @staticmethod
+    def _runtime_handle_claims_foreign_ac_scope(
+        runtime_handle: RuntimeHandle | None,
+        *,
+        expected_metadata: dict[str, Any],
+        is_sub_ac: bool,
+    ) -> bool:
+        """Return True when the handle explicitly belongs to another AC scope."""
+        if runtime_handle is None:
+            return False
+
+        metadata = runtime_handle.metadata
+        for key in _AC_RUNTIME_SCOPE_METADATA_KEYS:
+            if key in metadata and not ParallelACExecutor._metadata_value_matches_expected_scope(
+                key,
+                metadata.get(key),
+                expected_metadata,
+            ):
+                return True
+
+        if is_sub_ac:
+            return metadata.get("ac_index") is not None
+
+        return (
+            metadata.get("parent_ac_index") is not None or metadata.get("sub_ac_index") is not None
+        )
+
+    @classmethod
+    def _runtime_handle_matches_ac_scope_for_resume(
+        cls,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        expected_metadata: dict[str, Any],
+        is_sub_ac: bool,
+    ) -> bool:
+        """Return True when a resumable handle is fully owned by the current AC scope."""
+        if runtime_handle is None or cls._runtime_resume_session_id(runtime_handle) is None:
+            return False
+
+        metadata = runtime_handle.metadata
+        matched_scope_key = False
+        for key in _AC_RUNTIME_SCOPE_METADATA_KEYS:
+            if key not in metadata:
+                continue
+            matched_scope_key = True
+            if not cls._metadata_value_matches_expected_scope(
+                key,
+                metadata.get(key),
+                expected_metadata,
+            ):
+                return False
+
+        if not matched_scope_key:
+            return False
+
+        if is_sub_ac:
+            return (
+                metadata.get("parent_ac_index") == expected_metadata.get("parent_ac_index")
+                and metadata.get("sub_ac_index") == expected_metadata.get("sub_ac_index")
+                and metadata.get("ac_index") is None
+            )
+
+        return (
+            metadata.get("ac_index") == expected_metadata.get("ac_index")
+            and metadata.get("parent_ac_index") is None
+            and metadata.get("sub_ac_index") is None
+        )
+
+    @staticmethod
+    def _bind_runtime_handle_to_ac_scope(
+        runtime_handle: RuntimeHandle | None,
+        *,
+        expected_metadata: dict[str, Any],
+        scrub_resume_state: bool = False,
+    ) -> RuntimeHandle | None:
+        """Overlay normalized AC ownership metadata onto a runtime handle."""
+        if runtime_handle is None:
+            return None
+
+        metadata = dict(runtime_handle.metadata)
+        for key in _AC_RUNTIME_OWNERSHIP_METADATA_KEYS:
+            metadata.pop(key, None)
+        if scrub_resume_state:
+            for key in _AC_RUNTIME_RESUME_METADATA_KEYS:
+                metadata.pop(key, None)
+        metadata.update(expected_metadata)
+
+        return replace(
+            runtime_handle,
+            native_session_id=None if scrub_resume_state else runtime_handle.native_session_id,
+            conversation_id=None if scrub_resume_state else runtime_handle.conversation_id,
+            previous_response_id=None
+            if scrub_resume_state
+            else runtime_handle.previous_response_id,
+            transcript_path=None if scrub_resume_state else runtime_handle.transcript_path,
+            updated_at=datetime.now(UTC).isoformat(),
+            metadata=metadata,
+        )
+
+    def _normalize_ac_runtime_handle(
+        self,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        runtime_scope: Any,
+        ac_index: int,
+        is_sub_ac: bool,
+        parent_ac_index: int | None,
+        sub_ac_index: int | None,
+        node_identity: ExecutionNodeIdentity | None,
+        retry_attempt: int,
+        source: str,
+        require_resume_scope_match: bool,
+    ) -> RuntimeHandle | None:
+        """Bind a runtime handle to the active AC scope and reject foreign resumes."""
+        if runtime_handle is None:
+            return None
+
+        expected_metadata = self._build_expected_ac_runtime_metadata(
+            runtime_scope,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+
+        if require_resume_scope_match and self._is_resumable_runtime_handle(runtime_handle):
+            if not self._runtime_handle_matches_ac_scope_for_resume(
+                runtime_handle,
+                expected_metadata=expected_metadata,
+                is_sub_ac=is_sub_ac,
+            ):
+                log.warning(
+                    "parallel_executor.ac.runtime_handle_scope_rejected",
+                    source=source,
+                    ac_index=ac_index,
+                    is_sub_ac=is_sub_ac,
+                    parent_ac_index=parent_ac_index,
+                    sub_ac_index=sub_ac_index,
+                    retry_attempt=retry_attempt,
+                    expected_session_scope_id=runtime_scope.aggregate_id,
+                    observed_session_scope_id=runtime_handle.metadata.get("session_scope_id"),
+                    observed_ac_index=runtime_handle.metadata.get("ac_index"),
+                    observed_parent_ac_index=runtime_handle.metadata.get("parent_ac_index"),
+                    observed_sub_ac_index=runtime_handle.metadata.get("sub_ac_index"),
+                )
+                return None
+
+        scrub_resume_state = self._runtime_handle_claims_foreign_ac_scope(
+            runtime_handle,
+            expected_metadata=expected_metadata,
+            is_sub_ac=is_sub_ac,
+        )
+        if scrub_resume_state:
+            log.warning(
+                "parallel_executor.ac.runtime_handle_scope_scrubbed",
+                source=source,
+                ac_index=ac_index,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                retry_attempt=retry_attempt,
+                expected_session_scope_id=runtime_scope.aggregate_id,
+                observed_session_scope_id=runtime_handle.metadata.get("session_scope_id"),
+                observed_ac_index=runtime_handle.metadata.get("ac_index"),
+                observed_parent_ac_index=runtime_handle.metadata.get("parent_ac_index"),
+                observed_sub_ac_index=runtime_handle.metadata.get("sub_ac_index"),
+            )
+
+        return self._bind_runtime_handle_to_ac_scope(
+            runtime_handle,
+            expected_metadata=expected_metadata,
+            scrub_resume_state=scrub_resume_state,
+        )
+
+    def _build_ac_runtime_handle(
+        self,
+        ac_index: int,
+        *,
+        execution_context_id: str | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
+        retry_attempt: int = 0,
+        tool_catalog: tuple[MCPToolDefinition, ...] | None = None,
+    ) -> RuntimeHandle | None:
+        """Build an AC-scoped runtime handle for implementation work.
+
+        Handles are cached per AC scope so reconnect/resume stays inside the
+        current AC retry/fix loop and never crosses into another AC execution.
+        """
+        runtime_identity = self._resolve_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        cached_seeded_handle = self._ac_runtime_handles.get(runtime_identity.cache_key)
+        seeded_handle = self._normalize_ac_runtime_handle(
+            cached_seeded_handle,
+            runtime_scope=runtime_identity.runtime_scope,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+            source="cache",
+            require_resume_scope_match=True,
+        )
+        if cached_seeded_handle is not None and seeded_handle is None:
+            self._ac_runtime_handles.pop(runtime_identity.cache_key, None)
+        backend = self._adapter.runtime_backend
+        if not backend:
+            return None
+
+        cwd = self._task_cwd or self._adapter.working_directory
+        approval_mode = self._adapter.permission_mode
+        metadata: dict[str, Any] = dict(seeded_handle.metadata) if seeded_handle is not None else {}
+        metadata.update(runtime_identity.to_metadata())
+        metadata.setdefault("turn_number", 1)
+        metadata.setdefault(
+            "turn_id",
+            self._default_turn_id(runtime_identity, int(metadata["turn_number"])),
+        )
+        if tool_catalog is not None:
+            metadata["tool_catalog"] = serialize_tool_catalog(tool_catalog)
+            capability_graph = build_capability_graph(tool_catalog)
+            policy_context = PolicyContext(
+                runtime_backend=backend,
+                session_role=PolicySessionRole.IMPLEMENTATION,
+                execution_phase=PolicyExecutionPhase.IMPLEMENTATION,
+            )
+            metadata["capability_graph"] = serialize_capability_graph(capability_graph)
+            metadata["control_plane"] = serialize_control_plane_state(
+                build_control_plane_state(
+                    capability_graph,
+                    evaluate_capability_policy(capability_graph, policy_context),
+                )
+            )
+
+        if seeded_handle is not None:
+            return replace(
+                seeded_handle,
+                backend=backend,
+                kind=seeded_handle.kind or _IMPLEMENTATION_SESSION_KIND,
+                cwd=seeded_handle.cwd
+                if seeded_handle.cwd
+                else cwd
+                if isinstance(cwd, str) and cwd
+                else None,
+                approval_mode=(
+                    seeded_handle.approval_mode
+                    if seeded_handle.approval_mode
+                    else approval_mode
+                    if isinstance(approval_mode, str) and approval_mode
+                    else None
+                ),
+                updated_at=datetime.now(UTC).isoformat(),
+                metadata=metadata,
+            )
+
+        return RuntimeHandle(
+            backend=backend,
+            kind=_IMPLEMENTATION_SESSION_KIND,
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            approval_mode=approval_mode
+            if isinstance(approval_mode, str) and approval_mode
+            else None,
+            updated_at=datetime.now(UTC).isoformat(),
+            metadata=metadata,
+        )
+
+    async def _load_persisted_ac_runtime_handle(
+        self,
+        ac_index: int,
+        *,
+        execution_context_id: str | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
+        retry_attempt: int = 0,
+    ) -> RuntimeHandle | None:
+        """Load the latest reusable AC-scoped runtime handle from execution events."""
+        runtime_identity = self._resolve_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        cached_runtime_handle = self._ac_runtime_handles.get(runtime_identity.cache_key)
+        cached_handle = self._normalize_ac_runtime_handle(
+            cached_runtime_handle,
+            runtime_scope=runtime_identity.runtime_scope,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+            source="cache",
+            require_resume_scope_match=True,
+        )
+        if cached_runtime_handle is not None and cached_handle is None:
+            self._ac_runtime_handles.pop(runtime_identity.cache_key, None)
+        if cached_handle is not None:
+            return cached_handle
+
+        candidate_scope_ids = (
+            runtime_identity.session_scope_id,
+            *runtime_identity.legacy_session_scope_ids,
+        )
+        for candidate_scope_id in dict.fromkeys(candidate_scope_ids):
+            try:
+                events = await self._event_store.replay(
+                    runtime_identity.runtime_scope.aggregate_type,
+                    candidate_scope_id,
+                )
+            except Exception:
+                log.exception(
+                    "parallel_executor.ac.runtime_handle_load_failed",
+                    ac_index=ac_index,
+                    is_sub_ac=is_sub_ac,
+                    parent_ac_index=parent_ac_index,
+                    sub_ac_index=sub_ac_index,
+                    retry_attempt=retry_attempt,
+                    session_scope_id=candidate_scope_id,
+                )
+                continue
+
+            for event in reversed(events):
+                event_data = event.data if isinstance(event.data, dict) else {}
+                if not self._event_matches_ac_runtime_identity(event_data, runtime_identity):
+                    continue
+
+                if event.type in _NON_REUSABLE_RUNTIME_EVENT_TYPES:
+                    self._forget_ac_runtime_handle(
+                        ac_index,
+                        execution_context_id=execution_context_id,
+                        is_sub_ac=is_sub_ac,
+                        parent_ac_index=parent_ac_index,
+                        sub_ac_index=sub_ac_index,
+                        node_identity=node_identity,
+                        retry_attempt=retry_attempt,
+                    )
+                    return None
+                if event.type not in _REUSABLE_RUNTIME_EVENT_TYPES:
+                    continue
+
+                runtime_payload = event_data.get("runtime")
+                try:
+                    runtime_handle = RuntimeHandle.from_dict(runtime_payload)
+                except ValueError as exc:
+                    log.warning(
+                        "parallel_executor.persisted_runtime_handle_invalid",
+                        aggregate_id=event.aggregate_id,
+                        event_type=event.type,
+                        error=str(exc),
+                        runtime_keys=sorted(runtime_payload)
+                        if isinstance(runtime_payload, dict)
+                        else None,
+                    )
+                    continue
+                if runtime_handle is None:
+                    continue
+                runtime_handle = self._normalize_ac_runtime_handle(
+                    runtime_handle,
+                    runtime_scope=runtime_identity.runtime_scope,
+                    ac_index=ac_index,
+                    is_sub_ac=is_sub_ac,
+                    parent_ac_index=parent_ac_index,
+                    sub_ac_index=sub_ac_index,
+                    node_identity=node_identity,
+                    retry_attempt=retry_attempt,
+                    source="persisted_event",
+                    require_resume_scope_match=True,
+                )
+                if runtime_handle is None:
+                    continue
+
+                self._ac_runtime_handles[runtime_identity.cache_key] = runtime_handle
+                return runtime_handle
+
+        return None
+
+    def _remember_ac_runtime_handle(
+        self,
+        ac_index: int,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        execution_context_id: str | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
+        retry_attempt: int = 0,
+    ) -> RuntimeHandle | None:
+        """Cache the latest reusable AC-scoped runtime handle."""
+        if runtime_handle is None:
+            return None
+
+        runtime_identity = self._resolve_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        normalized_handle = self._normalize_ac_runtime_handle(
+            runtime_handle,
+            runtime_scope=runtime_identity.runtime_scope,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+            source="runtime",
+            require_resume_scope_match=False,
+        )
+        if normalized_handle is None:
+            return None
+
+        previous_handle = self._ac_runtime_handles.get(runtime_identity.cache_key)
+        normalized_previous_handle = self._normalize_ac_runtime_handle(
+            previous_handle,
+            runtime_scope=runtime_identity.runtime_scope,
+            ac_index=ac_index,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+            source="cache",
+            require_resume_scope_match=False,
+        )
+        normalized_handle = self._augment_ac_runtime_handle(
+            normalized_handle,
+            runtime_identity=runtime_identity,
+            previous_handle=normalized_previous_handle,
+        )
+        self._ac_runtime_handles[runtime_identity.cache_key] = normalized_handle
+        return normalized_handle
+
+    def _forget_ac_runtime_handle(
+        self,
+        ac_index: int,
+        *,
+        execution_context_id: str | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
+        retry_attempt: int = 0,
+    ) -> None:
+        """Drop live cached handle state once an AC scope is no longer resumable."""
+        runtime_identity = self._resolve_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        self._ac_runtime_handles.pop(runtime_identity.cache_key, None)
+
+    async def _terminate_runtime_handle(
+        self,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        runtime_scope_id: str,
+    ) -> None:
+        """Best-effort termination for live AC-scoped runtimes."""
+        if runtime_handle is None or not runtime_handle.can_terminate:
+            return
+
+        try:
+            terminated = await runtime_handle.terminate()
+        except Exception as exc:
+            log.warning(
+                "parallel_executor.runtime_handle_terminate_failed",
+                runtime_scope_id=runtime_scope_id,
+                backend=runtime_handle.backend,
+                error=str(exc),
+            )
+            return
+
+        if terminated:
+            log.info(
+                "parallel_executor.runtime_handle_terminated",
+                runtime_scope_id=runtime_scope_id,
+                backend=runtime_handle.backend,
+            )
+
+    @staticmethod
+    def _resolve_ac_runtime_identity(
+        ac_index: int,
+        *,
+        execution_context_id: str | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
+        retry_attempt: int = 0,
+    ) -> ACRuntimeIdentity:
+        """Return the normalized AC runtime identity for one implementation attempt."""
+        return build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+
+    @staticmethod
+    def _event_matches_ac_runtime_identity(
+        event_data: dict[str, Any],
+        runtime_identity: ACRuntimeIdentity,
+    ) -> bool:
+        """Return True when an event belongs to the requested AC attempt."""
+        runtime_payload = event_data.get("runtime")
+        runtime_metadata: dict[str, Any] = {}
+        if isinstance(runtime_payload, dict):
+            raw_metadata = runtime_payload.get("metadata")
+            if isinstance(raw_metadata, dict):
+                runtime_metadata = raw_metadata
+
+        expected_metadata = runtime_identity.to_metadata()
+        matched_identity_key = False
+        for key in _AC_RUNTIME_OWNERSHIP_METADATA_KEYS:
+            if key in event_data:
+                observed_value = event_data.get(key)
+            elif key in runtime_metadata:
+                observed_value = runtime_metadata.get(key)
+            else:
+                continue
+
+            matched_identity_key = True
+            if not ParallelACExecutor._metadata_value_matches_expected_scope(
+                key,
+                observed_value,
+                expected_metadata,
+            ):
+                return False
+
+        return matched_identity_key
+
+    @staticmethod
+    def _default_turn_id(
+        runtime_identity: ACRuntimeIdentity,
+        turn_number: int,
+    ) -> str:
+        """Build a stable logical turn identifier within one AC session attempt."""
+        return f"{runtime_identity.session_attempt_id}:turn_{turn_number}"
+
+    @staticmethod
+    def _runtime_turn_number(runtime_handle: RuntimeHandle | None) -> int:
+        """Return the 1-based logical turn number carried by a runtime handle."""
+        if runtime_handle is None:
+            return 1
+
+        value = runtime_handle.metadata.get("turn_number")
+        if isinstance(value, int) and value > 0:
+            return value
+        return 1
+
+    @classmethod
+    def _runtime_turn_id(
+        cls,
+        runtime_handle: RuntimeHandle | None,
+        *,
+        runtime_identity: ACRuntimeIdentity,
+    ) -> str:
+        """Return the stable logical turn identifier for a runtime handle."""
+        if runtime_handle is not None:
+            value = runtime_handle.metadata.get("turn_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return cls._default_turn_id(
+            runtime_identity,
+            cls._runtime_turn_number(runtime_handle),
+        )
+
+    @staticmethod
+    def _runtime_recovery_discontinuity(
+        runtime_handle: RuntimeHandle | None,
+    ) -> dict[str, Any] | None:
+        """Return persisted recovery discontinuity metadata when present."""
+        if runtime_handle is None:
+            return None
+
+        value = runtime_handle.metadata.get("recovery_discontinuity")
+        return dict(value) if isinstance(value, dict) else None
+
+    @classmethod
+    def _runtime_handle_same_session(
+        cls,
+        previous_handle: RuntimeHandle | None,
+        current_handle: RuntimeHandle | None,
+    ) -> bool:
+        """Return True when two runtime handles identify the same backend session."""
+        if previous_handle is None or current_handle is None:
+            return False
+
+        previous_native = previous_handle.native_session_id
+        current_native = current_handle.native_session_id
+        if previous_native and current_native:
+            return previous_native == current_native
+
+        previous_server = previous_handle.server_session_id
+        current_server = current_handle.server_session_id
+        if previous_server and current_server:
+            return previous_server == current_server
+
+        previous_resume = previous_handle.resume_session_id
+        current_resume = current_handle.resume_session_id
+        if previous_resume and current_resume:
+            return previous_resume == current_resume
+
+        return False
+
+    @classmethod
+    def _build_recovery_discontinuity(
+        cls,
+        *,
+        previous_handle: RuntimeHandle | None,
+        current_handle: RuntimeHandle,
+        runtime_identity: ACRuntimeIdentity,
+    ) -> dict[str, Any] | None:
+        """Build failed-to-replacement session/turn linkage for soft recovery."""
+        if previous_handle is None or previous_handle.resume_session_id is None:
+            return None
+        if cls._runtime_handle_same_session(previous_handle, current_handle):
+            return None
+
+        current_event_type = current_handle.metadata.get("runtime_event_type")
+        replacement_event = isinstance(
+            current_event_type, str
+        ) and current_event_type.strip().lower() in {"session.started", "thread.started"}
+        previous_native = previous_handle.native_session_id
+        current_native = current_handle.native_session_id
+        previous_server = previous_handle.server_session_id
+        current_server = current_handle.server_session_id
+        native_changed = bool(
+            previous_native and current_native and previous_native != current_native
+        )
+        server_changed = bool(
+            previous_server and current_server and previous_server != current_server
+        )
+        if not replacement_event and not native_changed and not server_changed:
+            return None
+
+        failed_turn_number = cls._runtime_turn_number(previous_handle)
+        replacement_turn_number = max(
+            cls._runtime_turn_number(current_handle),
+            failed_turn_number + 1,
+        )
+
+        return {
+            "reason": "replacement_session",
+            "failed": {
+                "session_id": previous_native,
+                "server_session_id": previous_server,
+                "resume_session_id": previous_handle.resume_session_id,
+                "turn_id": cls._runtime_turn_id(
+                    previous_handle,
+                    runtime_identity=runtime_identity,
+                ),
+                "turn_number": failed_turn_number,
+            },
+            "replacement": {
+                "session_id": current_native,
+                "server_session_id": current_server,
+                "resume_session_id": current_handle.resume_session_id,
+                "turn_id": cls._default_turn_id(runtime_identity, replacement_turn_number),
+                "turn_number": replacement_turn_number,
+            },
+        }
+
+    @classmethod
+    def _augment_ac_runtime_handle(
+        cls,
+        runtime_handle: RuntimeHandle,
+        *,
+        runtime_identity: ACRuntimeIdentity,
+        previous_handle: RuntimeHandle | None,
+    ) -> RuntimeHandle:
+        """Carry forward logical turn state and record same-attempt recovery linkage."""
+        metadata = dict(runtime_handle.metadata)
+        metadata.setdefault("turn_number", cls._runtime_turn_number(runtime_handle))
+        metadata.setdefault(
+            "turn_id",
+            cls._runtime_turn_id(runtime_handle, runtime_identity=runtime_identity),
+        )
+
+        if previous_handle is not None and cls._runtime_handle_same_session(
+            previous_handle,
+            runtime_handle,
+        ):
+            previous_turn_number = cls._runtime_turn_number(previous_handle)
+            if previous_turn_number > cls._runtime_turn_number(runtime_handle):
+                metadata["turn_number"] = previous_turn_number
+                metadata["turn_id"] = cls._runtime_turn_id(
+                    previous_handle,
+                    runtime_identity=runtime_identity,
+                )
+
+            previous_recovery_discontinuity = cls._runtime_recovery_discontinuity(previous_handle)
+            if previous_recovery_discontinuity is not None:
+                metadata.setdefault(
+                    "recovery_discontinuity",
+                    previous_recovery_discontinuity,
+                )
+
+        recovery_discontinuity = cls._build_recovery_discontinuity(
+            previous_handle=previous_handle,
+            current_handle=runtime_handle,
+            runtime_identity=runtime_identity,
+        )
+        if recovery_discontinuity is not None:
+            replacement = recovery_discontinuity["replacement"]
+            metadata["turn_number"] = replacement["turn_number"]
+            metadata["turn_id"] = replacement["turn_id"]
+            metadata["recovery_discontinuity"] = recovery_discontinuity
+
+        if metadata == runtime_handle.metadata:
+            return runtime_handle
+
+        return replace(
+            runtime_handle,
+            updated_at=datetime.now(UTC).isoformat(),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _with_native_session_id(
+        runtime_handle: RuntimeHandle | None,
+        native_session_id: str | None,
+    ) -> RuntimeHandle | None:
+        """Attach a discovered native session id to an existing runtime handle."""
+        if runtime_handle is None or not native_session_id:
+            return runtime_handle
+        if runtime_handle.native_session_id == native_session_id:
+            return runtime_handle
+
+        return replace(
+            runtime_handle,
+            native_session_id=native_session_id,
+            updated_at=datetime.now(UTC).isoformat(),
+            metadata=dict(runtime_handle.metadata),
+        )
+
+    @staticmethod
+    def _is_resumable_runtime_handle(runtime_handle: RuntimeHandle | None) -> bool:
+        """Return True when the handle can reconnect to an existing backend session."""
+        return ParallelACExecutor._runtime_resume_session_id(runtime_handle) is not None
+
+    @staticmethod
+    def _runtime_resume_session_id(runtime_handle: RuntimeHandle | None) -> str | None:
+        """Return the minimal persisted session identifier used for reconnect/resume."""
+        if runtime_handle is None:
+            return None
+        return runtime_handle.resume_session_id
+
+    async def _emit_ac_runtime_event(
+        self,
+        *,
+        event_type: str,
+        runtime_identity: ACRuntimeIdentity,
+        ac_content: str,
+        runtime_handle: RuntimeHandle | None,
+        execution_id: str | None = None,
+        session_id: str | None = None,
+        result_summary: str | None = None,
+        success: bool | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Persist AC-scoped runtime lifecycle events using normalized metadata."""
+        from ouroboros.events.base import BaseEvent
+
+        effective_session_id = session_id or self._runtime_resume_session_id(runtime_handle)
+        server_session_id = runtime_handle.server_session_id if runtime_handle is not None else None
+        identity_metadata = runtime_identity.to_metadata()
+
+        event = BaseEvent(
+            type=event_type,
+            aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+            aggregate_id=runtime_identity.session_scope_id,
+            data={
+                **identity_metadata,
+                "ac_id": runtime_identity.ac_id,
+                "acceptance_criterion": ac_content,
+                "scope": runtime_identity.scope,
+                "session_role": runtime_identity.session_role,
+                "retry_attempt": runtime_identity.retry_attempt,
+                "attempt_number": runtime_identity.attempt_number,
+                "execution_id": execution_id,
+                "session_scope_id": runtime_identity.session_scope_id,
+                "session_attempt_id": runtime_identity.session_attempt_id,
+                "session_state_path": runtime_identity.session_state_path,
+                "runtime_backend": (runtime_handle.backend if runtime_handle is not None else None),
+                "runtime": (
+                    runtime_handle.to_persisted_dict() if runtime_handle is not None else None
+                ),
+                "session_id": effective_session_id,
+                "server_session_id": server_session_id,
+                "success": success,
+                "result_summary": result_summary,
+                "error": error,
+            },
+        )
+        if runtime_handle is not None:
+            turn_id = runtime_handle.metadata.get("turn_id")
+            if isinstance(turn_id, str) and turn_id.strip():
+                event.data["turn_id"] = turn_id.strip()
+
+            turn_number = runtime_handle.metadata.get("turn_number")
+            if isinstance(turn_number, int) and turn_number > 0:
+                event.data["turn_number"] = turn_number
+
+            recovery_discontinuity = self._runtime_recovery_discontinuity(runtime_handle)
+            if recovery_discontinuity is not None:
+                event.data["recovery_discontinuity"] = recovery_discontinuity
+        tool_catalog = runtime_handle_tool_catalog(runtime_handle)
+        if tool_catalog is not None:
+            event.data["tool_catalog"] = tool_catalog
+        await self._event_store.append(event)
+        if success is True and execution_id:
+            try:
+                await self._event_store.append(
+                    BaseEvent(
+                        type="execution.ac.completed",
+                        aggregate_type="execution",
+                        aggregate_id=execution_id,
+                        data={
+                            **identity_metadata,
+                            "ac_id": runtime_identity.ac_id,
+                            "acceptance_criterion": ac_content,
+                            "execution_id": execution_id,
+                            "session_id": effective_session_id,
+                            "session_scope_id": runtime_identity.session_scope_id,
+                            "retry_attempt": runtime_identity.retry_attempt,
+                            "attempt_number": runtime_identity.attempt_number,
+                            "success": True,
+                            "result_summary": result_summary,
+                        },
+                    )
+                )
+            except Exception as exc:
+                log.warning(
+                    "parallel_executor.execution_ac_completed_append_failed",
+                    ac_id=runtime_identity.ac_id,
+                    execution_id=execution_id,
+                    error=str(exc),
+                )
+
+    @staticmethod
+    def _coerce_ac_indices(raw_indices: Any) -> tuple[int, ...]:
+        """Normalize a stage or batch AC index payload into an ordered tuple."""
+        if raw_indices is None:
+            return ()
+        if isinstance(raw_indices, int):
+            return (raw_indices,)
+
+        indices: list[int] = []
+        for candidate in raw_indices:
+            if isinstance(candidate, int):
+                indices.append(candidate)
+        return tuple(indices)
+
+    def _get_stage_batches(self, stage: Any) -> tuple[tuple[int, ...], ...]:
+        """Return normalized batch AC groupings for a stage."""
+        raw_batches = getattr(stage, "batches", None)
+        if raw_batches:
+            batches = tuple(
+                batch_indices
+                for batch_indices in (
+                    self._coerce_ac_indices(getattr(batch, "ac_indices", batch))
+                    for batch in raw_batches
+                )
+                if batch_indices
+            )
+            if batches:
+                return batches
+
+        ac_indices = self._coerce_ac_indices(getattr(stage, "ac_indices", ()))
+        return (ac_indices,) if ac_indices else ()
+
+    def _get_stage_ac_indices(self, stage: Any) -> tuple[int, ...]:
+        """Return the ordered AC indices covered by a stage."""
+        ac_indices = self._coerce_ac_indices(getattr(stage, "ac_indices", ()))
+        if ac_indices:
+            return ac_indices
+
+        ordered_indices: list[int] = []
+        seen_indices: set[int] = set()
+        for batch in self._get_stage_batches(stage):
+            for ac_index in batch:
+                if ac_index in seen_indices:
+                    continue
+                seen_indices.add(ac_index)
+                ordered_indices.append(ac_index)
+        return tuple(ordered_indices)
+
+    async def _execute_ac_batch(
+        self,
+        *,
+        seed: Seed,
+        batch_indices: list[int],
+        session_id: str,
+        execution_id: str,
+        tools: list[str],
+        tool_catalog: tuple[MCPToolDefinition, ...] | None,
+        system_prompt: str,
+        level_contexts: list[LevelContext],
+        ac_retry_attempts: dict[int, int],
+        execution_counters: dict[str, int] | None = None,
+    ) -> list[ACExecutionResult | BaseException]:
+        """Execute one batch of stage-ready ACs using the shared worker pool."""
+        batch_results: list[ACExecutionResult | BaseException] = [None] * len(batch_indices)
+        sibling_acs: list[_SiblingACRef] = (
+            [(i, seed.acceptance_criteria[i]) for i in batch_indices]
+            if len(batch_indices) > 1
+            else []
+        )
+
+        async def _run_ac(idx: int, ac_idx: int) -> None:
+            async with self._semaphore:
+                try:
+                    batch_results[idx] = await self._execute_single_ac(
+                        ac_index=ac_idx,
+                        ac_content=seed.acceptance_criteria[ac_idx],
+                        session_id=session_id,
+                        tools=tools,
+                        tool_catalog=tool_catalog,
+                        system_prompt=system_prompt,
+                        seed_goal=seed.goal,
+                        depth=0,
+                        execution_id=execution_id,
+                        level_contexts=level_contexts,
+                        sibling_acs=sibling_acs,
+                        retry_attempt=ac_retry_attempts[ac_idx],
+                        execution_counters=execution_counters,
+                    )
+                except BaseException as e:
+                    # Never suppress anyio Cancelled — doing so breaks
+                    # the task group's cancel-scope propagation and can
+                    # cause the entire group to hang indefinitely.
+                    if isinstance(e, anyio.get_cancelled_exc_class()):
+                        raise
+                    batch_results[idx] = e
+
+        # Cross-AC concurrency is governed by the LevelCoordinator's
+        # file-conflict guard, not by session-level tool catalog presence.
+        # Tool-call-level serialization (same runtime session cannot invoke
+        # ISOLATED_SESSION_REQUIRED capabilities concurrently) is enforced by
+        # the provider runtime, which is the correct layer: the batch
+        # scheduler does not know which ACs will actually invoke which tools.
+        async with anyio.create_task_group() as tg:
+            for idx, ac_idx in enumerate(batch_indices):
+                tg.start_soon(_run_ac, idx, ac_idx)
+
+        return batch_results
+
     async def execute_parallel(
         self,
         seed: Seed,
-        dependency_graph: DependencyGraph,
+        *,
         session_id: str,
         execution_id: str,
         tools: list[str],
         system_prompt: str,
+        tool_catalog: tuple[MCPToolDefinition, ...] | None = None,
+        dependency_graph: DependencyGraph | None = None,
+        execution_plan: StagedExecutionPlan | None = None,
+        reconciled_level_contexts: list[LevelContext] | None = None,
+        externally_satisfied_acs: dict[int, dict[str, Any]] | None = None,
     ) -> ParallelExecutionResult:
-        """Execute ACs in parallel according to dependency graph.
+        """Execute ACs according to a staged execution plan.
 
         Args:
             seed: Seed specification.
-            dependency_graph: Dependency graph defining execution order.
+            execution_plan: Staged execution plan defining serial stages.
             session_id: Parent session ID for tracking.
             execution_id: Execution ID for event tracking.
             tools: Tools available to agents.
             system_prompt: System prompt for agents.
+            dependency_graph: Legacy fallback used to derive ``execution_plan``.
+            reconciled_level_contexts: Existing post-reconcile stage contexts
+                from a previous execution attempt. Reopened ACs receive these
+                as prompt context so they continue from the current shared
+                workspace state instead of the original failed-attempt state.
+            externally_satisfied_acs: Top-level ACs already satisfied by the
+                current working tree and therefore skipped for re-execution.
 
         Returns:
             ParallelExecutionResult with outcomes for all ACs.
         """
+        if execution_plan is None:
+            if dependency_graph is None:
+                msg = "execution_plan is required when dependency_graph is not provided"
+                raise ValueError(msg)
+            execution_plan = dependency_graph.to_execution_plan()
+
         start_time = datetime.now(UTC)
         all_results: list[ACExecutionResult] = []
         failed_indices: set[int] = set()
-        level_contexts: list[LevelContext] = []
+        blocked_indices: set[int] = set()
+        stage_results: list[ParallelExecutionStageResult] = []
+        level_contexts = list(reconciled_level_contexts or [])
 
-        total_levels = dependency_graph.total_levels
+        total_levels = execution_plan.total_stages
         total_acs = len(seed.acceptance_criteria)
+        external_completed = externally_satisfied_acs or {}
+        execution_counters = {
+            "messages_count": 0,
+            "tool_calls_count": 0,
+        }
 
         # Track AC statuses for TUI updates
         ac_statuses: dict[int, str] = dict.fromkeys(range(total_acs), "pending")
+        ac_retry_attempts: dict[int, int] = dict.fromkeys(range(total_acs), 0)
         completed_count = 0
+        resume_from_level = 0
+
+        # RC3: Attempt to recover from checkpoint
+        if self._checkpoint_store:
+            try:
+                seed_id = getattr(seed, "id", session_id)
+                load_result = self._checkpoint_store.load(seed_id)
+                if hasattr(load_result, "is_ok") and load_result.is_ok and load_result.value:
+                    cp = load_result.value
+                    if cp.phase == "parallel_execution":
+                        resume_from_level = cp.state.get("completed_levels", 0)
+                        for idx, status in cp.state.get("ac_statuses", {}).items():
+                            ac_statuses[int(idx)] = status
+                        for idx in cp.state.get("failed_indices", []):
+                            failed_indices.add(int(idx))
+                        completed_count = cp.state.get("completed_count", 0)
+                        # Restore level contexts so subsequent levels
+                        # have access to completed levels' output
+                        saved_contexts = cp.state.get("level_contexts", [])
+                        if saved_contexts:
+                            level_contexts = deserialize_level_contexts(saved_contexts)
+                        log.info(
+                            "parallel_executor.recovery.resuming",
+                            from_level=resume_from_level,
+                            seed_id=seed_id,
+                            restored_contexts=len(level_contexts),
+                        )
+                        # Reconstruct all_results for completed/failed/skipped ACs.
+                        for prev_stage in execution_plan.stages[:resume_from_level]:
+                            for ac_idx in self._get_stage_ac_indices(prev_stage):
+                                if ac_idx >= total_acs:
+                                    continue
+                                status = ac_statuses.get(ac_idx, "pending")
+                                is_completed = status == "completed"
+                                is_skipped = status == "skipped"
+                                all_results.append(
+                                    ACExecutionResult(
+                                        ac_index=ac_idx,
+                                        ac_content=seed.acceptance_criteria[ac_idx],
+                                        success=is_completed,
+                                        final_message=(
+                                            "[Restored from checkpoint]" if is_completed else ""
+                                        ),
+                                        error=(
+                                            "Skipped: dependency failed"
+                                            if is_skipped
+                                            else None
+                                            if is_completed
+                                            else "Failed (restored from checkpoint)"
+                                        ),
+                                        retry_attempt=ac_retry_attempts.get(ac_idx, 0),
+                                    )
+                                )
+                        self._console.print(
+                            f"[cyan]Resuming from level {resume_from_level + 1} "
+                            f"(checkpoint recovered, "
+                            f"{len(level_contexts)} level context(s) restored)[/cyan]"
+                        )
+            except Exception as e:
+                log.warning(
+                    "parallel_executor.recovery.failed",
+                    error=str(e),
+                )
 
         # Validation: check all AC indices are present in dependency graph
         expected_indices = set(range(total_acs))
-        actual_indices = {idx for level in dependency_graph.execution_levels for idx in level}
+        actual_indices = {
+            idx for stage in execution_plan.stages for idx in self._get_stage_ac_indices(stage)
+        }
         missing_indices = expected_indices - actual_indices
         extra_indices = actual_indices - expected_indices
 
@@ -220,6 +3311,8 @@ class ParallelACExecutor:
                         ac_content=seed.acceptance_criteria[idx],
                         success=False,
                         error="Not included in dependency graph",
+                        retry_attempt=ac_retry_attempts[idx],
+                        outcome=ACExecutionOutcome.INVALID,
                     )
                 )
 
@@ -237,7 +3330,7 @@ class ParallelACExecutor:
             session_id=session_id,
             total_acs=total_acs,
             total_levels=total_levels,
-            levels=dependency_graph.execution_levels,
+            levels=execution_plan.execution_levels,
         )
 
         # Emit initial progress for TUI
@@ -246,252 +3339,485 @@ class ParallelACExecutor:
             execution_id=execution_id,
             seed=seed,
             ac_statuses=ac_statuses,
+            ac_retry_attempts=ac_retry_attempts,
             executing_indices=[],
-            completed_count=0,
-            current_level=1,
+            completed_count=completed_count,
+            current_level=resume_from_level + 1,
             total_levels=total_levels,
             activity="Starting parallel execution",
+            messages_count=execution_counters["messages_count"],
+            tool_calls_count=execution_counters["tool_calls_count"],
         )
 
-        # Execute groups sequentially, but ACs within each group in parallel
-        for level_idx, level in enumerate(dependency_graph.execution_levels):
-            level_num = level_idx + 1
+        # RC2+RC4: Shared state for resilient progress emitter
+        progress_state: dict[str, int] = {
+            "current_level": resume_from_level + 1,
+            "total_levels": total_levels,
+        }
 
-            # Check for skipped ACs (dependencies failed)
-            executable: list[int] = []
-            skipped: list[int] = []
+        # Execute groups sequentially, but ACs within each group in parallel.
+        # The resilient progress emitter runs as a sibling background task
+        # and is automatically cancelled when the execution loop finishes.
+        async with anyio.create_task_group() as outer_tg:
+            outer_tg.start_soon(
+                self._resilient_progress_emitter,
+                session_id,
+                execution_id,
+                seed,
+                ac_statuses,
+                progress_state,
+            )
 
-            for ac_idx in level:
-                # Skip invalid indices
-                if ac_idx < 0 or ac_idx >= total_acs:
+            for stage in execution_plan.stages:
+                level_idx = stage.index
+                level = self._get_stage_ac_indices(stage)
+                stage_batches = self._get_stage_batches(stage)
+                level_num = level_idx + 1
+
+                # RC3: Skip already-completed levels on recovery
+                if level_idx < resume_from_level:
+                    log.info(
+                        "parallel_executor.recovery.skipping_level",
+                        level=level_num,
+                    )
                     continue
 
-                deps = dependency_graph.get_dependencies(ac_idx)
-                if any(dep in failed_indices for dep in deps):
-                    skipped.append(ac_idx)
-                else:
-                    executable.append(ac_idx)
+                # Update shared progress state for background emitter
+                progress_state["current_level"] = level_num
 
-            # Add skipped results
-            for ac_idx in skipped:
-                all_results.append(
-                    ACExecutionResult(
+                # Check for blocked ACs (dependencies failed or were blocked upstream)
+                executable: list[int] = []
+                blocked: list[int] = []
+                externally_satisfied: list[int] = []
+                stage_ac_results: list[ACExecutionResult] = []
+
+                for ac_idx in level:
+                    # Skip invalid indices
+                    if ac_idx < 0 or ac_idx >= total_acs:
+                        continue
+
+                    # Always validate dependencies first — even externally
+                    # satisfied ACs must be blocked if their upstream
+                    # dependencies failed, because the "satisfied" state may
+                    # be stale relative to the current execution.
+                    deps = execution_plan.get_dependencies(ac_idx)
+                    if any(dep in failed_indices or dep in blocked_indices for dep in deps):
+                        blocked.append(ac_idx)
+                    elif ac_idx in external_completed:
+                        externally_satisfied.append(ac_idx)
+                    else:
+                        executable.append(ac_idx)
+
+                level_success = 0
+                level_failed = 0
+
+                for ac_idx in externally_satisfied:
+                    metadata = external_completed.get(ac_idx, {})
+                    reason = metadata.get("reason")
+                    commit = metadata.get("commit")
+                    notes: list[str] = [
+                        "Skipped via --skip-completed; existing working tree state is treated as satisfied."
+                    ]
+                    if isinstance(reason, str) and reason.strip():
+                        notes.append(f"Reason: {reason.strip()}")
+                    if isinstance(commit, str) and commit.strip():
+                        notes.append(f"Commit: {commit.strip()}")
+
+                    satisfied_result = ACExecutionResult(
+                        ac_index=ac_idx,
+                        ac_content=seed.acceptance_criteria[ac_idx],
+                        success=True,
+                        final_message="\n".join(notes),
+                        retry_attempt=ac_retry_attempts[ac_idx],
+                        outcome=ACExecutionOutcome.SATISFIED_EXTERNALLY,
+                    )
+                    all_results.append(satisfied_result)
+                    stage_ac_results.append(satisfied_result)
+                    ac_statuses[ac_idx] = "completed"
+                    completed_count += 1
+                    level_success += 1
+                    log.info(
+                        "parallel_executor.ac.satisfied_externally",
+                        session_id=session_id,
+                        ac_index=ac_idx,
+                        reason=reason,
+                        commit=commit,
+                    )
+
+                # Add blocked results
+                for ac_idx in blocked:
+                    blocked_result = ACExecutionResult(
                         ac_index=ac_idx,
                         ac_content=seed.acceptance_criteria[ac_idx],
                         success=False,
                         error="Skipped: dependency failed",
+                        retry_attempt=ac_retry_attempts[ac_idx],
+                        outcome=ACExecutionOutcome.BLOCKED,
                     )
-                )
-                ac_statuses[ac_idx] = "skipped"
-                log.info(
-                    "parallel_executor.ac.skipped",
-                    session_id=session_id,
-                    ac_index=ac_idx,
-                    reason="dependency_failed",
-                )
-
-            if not executable:
-                continue
-
-            # Mark ACs as executing
-            for ac_idx in executable:
-                ac_statuses[ac_idx] = "executing"
-
-            self._console.print(
-                f"\n[cyan]Level {level_num}/{total_levels}: "
-                f"Executing ACs {[idx + 1 for idx in executable]} in parallel[/cyan]"
-            )
-            self._flush_console()
-
-            # Emit level started event
-            await self._emit_level_started(
-                session_id=session_id,
-                level=level_num,
-                ac_indices=executable,
-                total_levels=total_levels,
-            )
-
-            # Emit progress with executing status for TUI
-            await self._emit_workflow_progress(
-                session_id=session_id,
-                execution_id=execution_id,
-                seed=seed,
-                ac_statuses=ac_statuses,
-                executing_indices=executable,
-                completed_count=completed_count,
-                current_level=level_num,
-                total_levels=total_levels,
-                activity="Executing",
-            )
-
-            # Execute level in parallel using anyio task group
-            # (anyio manages cancel scopes correctly across concurrent tasks,
-            # unlike asyncio.gather which creates separate asyncio Tasks
-            # that break the SDK's internal cancel scope tracking)
-            level_results: list[ACExecutionResult | BaseException] = [None] * len(executable)
-
-            # Capture current contexts for this level's closure
-            current_contexts = list(level_contexts)
-
-            # Build sibling AC descriptions for parallel awareness
-            sibling_acs = (
-                [seed.acceptance_criteria[i] for i in executable] if len(executable) > 1 else []
-            )
-
-            async def _run_ac(idx: int, ac_idx: int) -> None:
-                async with self._semaphore:
-                    try:
-                        level_results[idx] = await self._execute_single_ac(
-                            ac_index=ac_idx,
-                            ac_content=seed.acceptance_criteria[ac_idx],
-                            session_id=session_id,
-                            tools=tools,
-                            system_prompt=system_prompt,
-                            seed_goal=seed.goal,
-                            depth=0,
-                            execution_id=execution_id,
-                            level_contexts=current_contexts,
-                            sibling_acs=sibling_acs,
-                        )
-                    except BaseException as e:
-                        # Never suppress anyio Cancelled — doing so breaks
-                        # the task group's cancel-scope propagation and can
-                        # cause the entire group to hang indefinitely.
-                        if isinstance(e, anyio.get_cancelled_exc_class()):
-                            raise
-                        level_results[idx] = e
-
-            async with anyio.create_task_group() as tg:
-                for i, ac_idx in enumerate(executable):
-                    tg.start_soon(_run_ac, i, ac_idx)
-
-            # Process results
-            level_success = 0
-            level_failed = 0
-
-            for ac_idx, result in zip(executable, level_results, strict=False):
-                if isinstance(result, BaseException):
-                    # Exception during execution
-                    error_msg = str(result)
-                    ac_result = ACExecutionResult(
-                        ac_index=ac_idx,
-                        ac_content=seed.acceptance_criteria[ac_idx],
-                        success=False,
-                        error=error_msg,
-                    )
-                    failed_indices.add(ac_idx)
-                    level_failed += 1
-                    ac_statuses[ac_idx] = "failed"
-
-                    log.error(
-                        "parallel_executor.ac.exception",
+                    all_results.append(blocked_result)
+                    stage_ac_results.append(blocked_result)
+                    blocked_indices.add(ac_idx)
+                    ac_statuses[ac_idx] = "skipped"
+                    log.info(
+                        "parallel_executor.ac.skipped",
                         session_id=session_id,
                         ac_index=ac_idx,
-                        error=error_msg,
+                        reason="dependency_failed",
                     )
-                else:
-                    ac_result = result
-                    if ac_result.success:
-                        level_success += 1
-                        ac_statuses[ac_idx] = "completed"
-                        completed_count += 1
-                    else:
-                        failed_indices.add(ac_idx)
-                        level_failed += 1
-                        ac_statuses[ac_idx] = "failed"
 
-                all_results.append(ac_result)
+                if not executable:
+                    stage_started = bool(externally_satisfied)
+                    stage_result = ParallelExecutionStageResult(
+                        stage_index=level_idx,
+                        ac_indices=tuple(level),
+                        results=tuple(sorted(stage_ac_results, key=lambda result: result.ac_index)),
+                        started=stage_started,
+                    )
+                    stage_results.append(stage_result)
+                    await self._emit_level_completed(
+                        session_id=session_id,
+                        level=level_num,
+                        success_count=stage_result.success_count,
+                        failure_count=stage_result.failure_count,
+                        blocked_count=stage_result.blocked_count,
+                        started=stage_started,
+                        outcome=stage_result.outcome.value,
+                    )
+                    continue
 
-            # Emit level completed event
-            await self._emit_level_completed(
-                session_id=session_id,
-                level=level_num,
-                success_count=level_success,
-                failure_count=level_failed,
-            )
+                # Mark ACs as executing
+                for ac_idx in executable:
+                    ac_statuses[ac_idx] = "executing"
 
-            # Emit progress after level completes
-            await self._emit_workflow_progress(
-                session_id=session_id,
-                execution_id=execution_id,
-                seed=seed,
-                ac_statuses=ac_statuses,
-                executing_indices=[],
-                completed_count=completed_count,
-                current_level=level_num,
-                total_levels=total_levels,
-                activity=f"Level {level_num} complete",
-            )
+                self._console.print(
+                    f"\n[cyan]Level {level_num}/{total_levels}: "
+                    f"Executing ACs {[idx + 1 for idx in executable]} in parallel[/cyan]"
+                )
+                self._flush_console()
 
-            self._console.print(
-                f"[green]Level {level_num} complete: "
-                f"{level_success} succeeded, {level_failed} failed[/green]"
-            )
-            self._flush_console()
+                # Emit level started event
+                await self._emit_level_started(
+                    session_id=session_id,
+                    level=level_num,
+                    ac_indices=executable,
+                    total_levels=total_levels,
+                )
 
-            # Extract context from this level for next level's ACs
-            if level_success > 0:
-                level_ac_data = [
-                    (r.ac_index, r.ac_content, r.success, r.messages, r.final_message)
-                    for r in all_results
-                    if isinstance(r, ACExecutionResult) and r.ac_index in executable
+                # Capture current contexts for this level's closure
+                current_contexts = list(level_contexts)
+
+                for batch_index, batch in enumerate(stage_batches, start=1):
+                    batch_executable = [ac_idx for ac_idx in batch if ac_idx in executable]
+                    if not batch_executable:
+                        continue
+
+                    for ac_idx in batch_executable:
+                        ac_statuses[ac_idx] = "executing"
+
+                    if len(stage_batches) > 1:
+                        self._console.print(
+                            f"  [cyan]Batch {batch_index}/{len(stage_batches)}: "
+                            f"ACs {[idx + 1 for idx in batch_executable]}[/cyan]"
+                        )
+                        self._flush_console()
+
+                    await self._emit_workflow_progress(
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        seed=seed,
+                        ac_statuses=ac_statuses,
+                        ac_retry_attempts=ac_retry_attempts,
+                        executing_indices=batch_executable,
+                        completed_count=completed_count,
+                        current_level=level_num,
+                        total_levels=total_levels,
+                        activity="Executing",
+                        messages_count=execution_counters["messages_count"],
+                        tool_calls_count=execution_counters["tool_calls_count"],
+                    )
+
+                    batch_results = await self._execute_ac_batch(
+                        seed=seed,
+                        batch_indices=batch_executable,
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        tools=tools,
+                        tool_catalog=tool_catalog,
+                        system_prompt=system_prompt,
+                        level_contexts=current_contexts,
+                        ac_retry_attempts=ac_retry_attempts,
+                        execution_counters=execution_counters,
+                    )
+
+                    for ac_idx, result in zip(batch_executable, batch_results, strict=False):
+                        if isinstance(result, BaseException):
+                            # Exception during execution
+                            error_msg = str(result)
+                            ac_result = ACExecutionResult(
+                                ac_index=ac_idx,
+                                ac_content=seed.acceptance_criteria[ac_idx],
+                                success=False,
+                                error=error_msg,
+                                retry_attempt=ac_retry_attempts[ac_idx],
+                                outcome=ACExecutionOutcome.FAILED,
+                            )
+                            failed_indices.add(ac_idx)
+                            level_failed += 1
+                            ac_statuses[ac_idx] = "failed"
+
+                            log.error(
+                                "parallel_executor.ac.exception",
+                                session_id=session_id,
+                                ac_index=ac_idx,
+                                error=error_msg,
+                            )
+                        elif (
+                            isinstance(result, ACExecutionResult)
+                            and result.error == _STALL_SENTINEL
+                        ):
+                            # Stalled AC — treat as permanent failure at batch level
+                            ac_id = f"ac_{ac_idx}"
+                            await self._safe_emit_event(
+                                create_ac_stall_detected_event(
+                                    session_id=session_id,
+                                    ac_index=ac_idx,
+                                    ac_id=ac_id,
+                                    silent_seconds=STALL_TIMEOUT_SECONDS,
+                                    attempt=1,
+                                    max_attempts=1,
+                                    action="abandon",
+                                )
+                            )
+                            ac_result = ACExecutionResult(
+                                ac_index=ac_idx,
+                                ac_content=seed.acceptance_criteria[ac_idx],
+                                success=False,
+                                error=(f"Stalled (no activity for {STALL_TIMEOUT_SECONDS:.0f}s)"),
+                                retry_attempt=ac_retry_attempts[ac_idx],
+                                outcome=ACExecutionOutcome.FAILED,
+                            )
+                            failed_indices.add(ac_idx)
+                            level_failed += 1
+                            ac_statuses[ac_idx] = "failed"
+                            log.error(
+                                "parallel_executor.ac.stall_abandoned",
+                                session_id=session_id,
+                                ac_index=ac_idx,
+                            )
+                        else:
+                            ac_result = result
+                            if ac_result.success:
+                                level_success += 1
+                                ac_statuses[ac_idx] = "completed"
+                                completed_count += 1
+                            elif ac_result.is_blocked:
+                                blocked_indices.add(ac_idx)
+                                ac_statuses[ac_idx] = "skipped"
+                            else:
+                                failed_indices.add(ac_idx)
+                                level_failed += 1
+                                ac_statuses[ac_idx] = "failed"
+
+                        all_results.append(ac_result)
+                        stage_ac_results.append(ac_result)
+
+                (
+                    completed_count,
+                    level_success,
+                    level_failed,
+                    stage_ac_results,
+                ) = _complete_sibling_acs_from_evidence(
+                    level_results=stage_ac_results,
+                    ac_statuses=ac_statuses,
+                    failed_indices=failed_indices,
+                    completed_count=completed_count,
+                    level_success=level_success,
+                    level_failed=level_failed,
+                )
+
+                reconciled_by_index = {result.ac_index: result for result in stage_ac_results}
+                all_results = [
+                    reconciled_by_index.get(result.ac_index, result) for result in all_results
                 ]
-                level_ctx = extract_level_context(level_ac_data, level_num)
 
-                # Coordinator: detect and resolve file conflicts (Approach A)
-                level_ac_results = [
-                    r
-                    for r in all_results
-                    if isinstance(r, ACExecutionResult) and r.ac_index in executable
-                ]
-                conflicts = self._coordinator.detect_file_conflicts(level_ac_results)
+                stage_result = ParallelExecutionStageResult(
+                    stage_index=level_idx,
+                    ac_indices=tuple(level),
+                    results=tuple(sorted(stage_ac_results, key=lambda result: result.ac_index)),
+                    started=True,
+                )
 
-                if conflicts:
-                    self._console.print(
-                        f"  [yellow]Coordinator: {len(conflicts)} file conflict(s) detected, "
-                        f"starting review...[/yellow]"
+                # Emit level completed event
+                await self._emit_level_completed(
+                    session_id=session_id,
+                    level=level_num,
+                    success_count=level_success,
+                    failure_count=level_failed,
+                    blocked_count=stage_result.blocked_count,
+                    started=True,
+                    outcome=stage_result.outcome.value,
+                )
+
+                # Emit progress after level completes
+                await self._emit_workflow_progress(
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    seed=seed,
+                    ac_statuses=ac_statuses,
+                    ac_retry_attempts=ac_retry_attempts,
+                    executing_indices=[],
+                    completed_count=completed_count,
+                    current_level=level_num,
+                    total_levels=total_levels,
+                    activity=f"Level {level_num} complete",
+                    messages_count=execution_counters["messages_count"],
+                    tool_calls_count=execution_counters["tool_calls_count"],
+                )
+
+                self._console.print(
+                    f"[green]Level {level_num} complete: "
+                    f"{level_success} succeeded, {level_failed} failed[/green]"
+                )
+                self._flush_console()
+
+                # Extract context from this level for next level's ACs
+                if executable and level_success > 0:
+                    level_ac_data = [
+                        (r.ac_index, r.ac_content, r.success, r.messages, r.final_message)
+                        for r in stage_ac_results
+                        if r.ac_index in executable
+                    ]
+                    # workspace_root is required: fall back through
+                    # adapter working directory, then process cwd. Never None.
+                    workspace_root = (
+                        self._task_cwd or self._adapter.working_directory or os.getcwd()
                     )
-                    review = await self._coordinator.run_review(
-                        conflicts=conflicts,
-                        level_context=level_ctx,
-                        level_number=level_num,
-                    )
-                    # Attach review to the level context
-                    level_ctx = LevelContext(
-                        level_number=level_ctx.level_number,
-                        completed_acs=level_ctx.completed_acs,
-                        coordinator_review=review,
-                    )
-                    self._console.print(
-                        f"  [green]Coordinator review complete: "
-                        f"{len(review.fixes_applied)} fix(es), "
-                        f"{len(review.warnings_for_next_level)} warning(s)[/green]"
+                    level_ctx = extract_level_context(
+                        level_ac_data,
+                        level_num,
+                        workspace_root=workspace_root,
                     )
 
-                level_contexts.append(level_ctx)
+                    # Coordinator: detect and resolve file conflicts (Approach A)
+                    level_ac_results = [r for r in stage_ac_results if r.ac_index in executable]
+                    conflicts = self._coordinator.detect_file_conflicts(level_ac_results)
+
+                    if conflicts:
+                        self._console.print(
+                            f"  [yellow]Coordinator: {len(conflicts)} file conflict(s) detected, "
+                            f"starting review...[/yellow]"
+                        )
+                        await self._emit_coordinator_started(
+                            execution_id=execution_id,
+                            session_id=session_id,
+                            level=level_num,
+                            conflicts=conflicts,
+                        )
+                        review = await self._coordinator.run_review(
+                            execution_id=execution_id,
+                            conflicts=conflicts,
+                            level_context=level_ctx,
+                            level_number=level_num,
+                        )
+                        await self._emit_coordinator_runtime_events(
+                            execution_id=execution_id,
+                            session_id=session_id,
+                            review=review,
+                        )
+                        await self._emit_coordinator_completed(
+                            execution_id=execution_id,
+                            session_id=session_id,
+                            review=review,
+                        )
+                        # Attach review to the level context
+                        level_ctx = LevelContext(
+                            level_number=level_ctx.level_number,
+                            completed_acs=level_ctx.completed_acs,
+                            coordinator_review=review,
+                        )
+                        stage_result = replace(stage_result, coordinator_review=review)
+                        self._console.print(
+                            f"  [green]Coordinator review complete: "
+                            f"{len(review.fixes_applied)} fix(es), "
+                            f"{len(review.warnings_for_next_level)} warning(s)[/green]"
+                        )
+
+                    level_contexts.append(level_ctx)
+                stage_results.append(stage_result)
+
+                # RC3: Save checkpoint after each level completion
+                if self._checkpoint_store:
+                    try:
+                        from ouroboros.persistence.checkpoint import CheckpointData
+
+                        seed_id = getattr(seed, "id", session_id)
+                        checkpoint = CheckpointData.create(
+                            seed_id=seed_id,
+                            phase="parallel_execution",
+                            state={
+                                "session_id": session_id,
+                                "execution_id": execution_id,
+                                "completed_levels": level_idx + 1,
+                                "ac_statuses": {str(k): v for k, v in ac_statuses.items()},
+                                "failed_indices": sorted(failed_indices),
+                                "completed_count": completed_count,
+                                "level_contexts": serialize_level_contexts(level_contexts),
+                            },
+                        )
+                        save_result = self._checkpoint_store.save(checkpoint)
+                        if hasattr(save_result, "is_ok") and save_result.is_ok:
+                            log.info(
+                                "parallel_executor.checkpoint.saved",
+                                level=level_num,
+                                seed_id=seed_id,
+                            )
+                        else:
+                            err_msg = (
+                                str(save_result.error)
+                                if hasattr(save_result, "error")
+                                else "unknown error"
+                            )
+                            log.warning(
+                                "parallel_executor.checkpoint.save_failed",
+                                level=level_num,
+                                seed_id=seed_id,
+                                error=err_msg,
+                            )
+                            self._console.print(
+                                f"  [yellow]Checkpoint save failed for level "
+                                f"{level_num}: {err_msg}[/yellow]"
+                            )
+                    except Exception as e:
+                        log.warning(
+                            "parallel_executor.checkpoint.save_failed",
+                            level=level_num,
+                            error=str(e),
+                        )
+
+            # All levels done — cancel the background progress emitter
+            outer_tg.cancel_scope.cancel()
 
         # Aggregate results - sort by AC index for consistent ordering
         sorted_results = sorted(all_results, key=lambda r: r.ac_index)
         total_duration = (datetime.now(UTC) - start_time).total_seconds()
-        success_count = sum(1 for r in sorted_results if r.success)
-        failure_count = sum(
-            1
-            for r in sorted_results
-            if not r.success
-            and r.error not in ("Skipped: dependency failed", "Not included in dependency graph")
+        success_count = sum(1 for r in sorted_results if r.outcome == ACExecutionOutcome.SUCCEEDED)
+        externally_satisfied_count = sum(
+            1 for r in sorted_results if r.outcome == ACExecutionOutcome.SATISFIED_EXTERNALLY
         )
-        skipped_count = sum(
-            1
-            for r in sorted_results
-            if r.error in ("Skipped: dependency failed", "Not included in dependency graph")
-        )
-        total_messages = sum(len(r.messages) for r in sorted_results)
+        failure_count = sum(1 for r in sorted_results if r.outcome == ACExecutionOutcome.FAILED)
+        blocked_count = sum(1 for r in sorted_results if r.outcome == ACExecutionOutcome.BLOCKED)
+        invalid_count = sum(1 for r in sorted_results if r.outcome == ACExecutionOutcome.INVALID)
+        skipped_count = blocked_count + invalid_count
+        total_messages = execution_counters["messages_count"]
 
         log.info(
             "parallel_executor.execution.completed",
             session_id=session_id,
             success_count=success_count,
+            externally_satisfied_count=externally_satisfied_count,
             failure_count=failure_count,
+            blocked_count=blocked_count,
+            invalid_count=invalid_count,
             skipped_count=skipped_count,
             total_messages=total_messages,
             duration_seconds=total_duration,
@@ -501,7 +3827,12 @@ class ParallelACExecutor:
             results=tuple(sorted_results),
             success_count=success_count,
             failure_count=failure_count,
+            externally_satisfied_count=externally_satisfied_count,
             skipped_count=skipped_count,
+            blocked_count=blocked_count,
+            invalid_count=invalid_count,
+            stages=tuple(stage_results),
+            reconciled_level_contexts=tuple(level_contexts),
             total_messages=total_messages,
             total_duration_seconds=total_duration,
         )
@@ -512,14 +3843,21 @@ class ParallelACExecutor:
         ac_content: str,
         session_id: str,
         tools: list[str],
+        tool_catalog: tuple[MCPToolDefinition, ...] | None,
         system_prompt: str,
         seed_goal: str,
         depth: int = 0,
         execution_id: str = "",
         level_contexts: list[LevelContext] | None = None,
-        sibling_acs: list[str] | None = None,
+        sibling_acs: list[_SiblingACRef] | None = None,
+        retry_attempt: int = 0,
+        execution_counters: dict[str, int] | None = None,
+        is_sub_ac: bool = False,
+        parent_ac_index: int | None = None,
+        sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> ACExecutionResult:
-        """Execute a single AC, decomposing into parallel Sub-ACs if complex.
+        """Execute a single AC via the sole recursive AC execution entry point.
 
         Flow:
         1. Ask Claude to analyze if AC needs decomposition
@@ -542,17 +3880,30 @@ class ParallelACExecutor:
             ACExecutionResult for this AC.
         """
         start_time = datetime.now(UTC)
+        execution_context_id = execution_id or session_id
+        if node_identity is None:
+            node_identity = ExecutionNodeIdentity.root(
+                execution_context_id=execution_context_id,
+                ac_index=ac_index,
+            )
 
         log.info(
             "parallel_executor.ac.started",
             parent_session_id=session_id,
             ac_index=ac_index,
+            node_id=node_identity.node_id,
+            display_path=node_identity.display_path,
             depth=depth,
         )
 
         # Try decomposition if enabled and not too deep
-        if self._enable_decomposition and depth < MAX_DECOMPOSITION_DEPTH:
-            self._console.print(f"  [dim]AC {ac_index + 1}: Analyzing complexity...[/dim]")
+        if self._enable_decomposition and depth < self._max_decomposition_depth:
+            display_label = (
+                f"AC {node_identity.display_path}"
+                if node_identity.depth == 0
+                else f"Sub-AC {node_identity.display_path}"
+            )
+            self._console.print(f"  [dim]{display_label}: Analyzing complexity...[/dim]")
             self._flush_console()
             sub_acs = await self._try_decompose_ac(
                 ac_content=ac_content,
@@ -560,77 +3911,224 @@ class ParallelACExecutor:
                 seed_goal=seed_goal,
                 tools=tools,
                 system_prompt=system_prompt,
+                node_identity=node_identity,
             )
 
             if sub_acs and len(sub_acs) >= MIN_SUB_ACS:
                 # Decomposition successful - execute Sub-ACs in parallel
                 self._console.print(
-                    f"  [cyan]AC {ac_index + 1} → Decomposed into {len(sub_acs)} Sub-ACs (parallel)[/cyan]"
+                    f"  [cyan]{display_label} → Decomposed into {len(sub_acs)} Sub-ACs (parallel)[/cyan]"
                 )
                 self._flush_console()
 
                 # Emit decomposition event for TUI
                 for i, sub_ac in enumerate(sub_acs):
+                    child_node_identity = node_identity.child(i)
                     await self._emit_subtask_event(
                         execution_id=execution_id,
                         ac_index=ac_index,
                         sub_task_index=i + 1,
-                        sub_task_desc=sub_ac[:50],
+                        sub_task_content=sub_ac,
                         status="pending",
+                        node_identity=child_node_identity,
                     )
 
-                # Execute Sub-ACs in parallel
-                sub_results = await self._execute_sub_acs_parallel(
-                    parent_ac_index=ac_index,
-                    sub_acs=sub_acs,
-                    session_id=session_id,
-                    tools=tools,
-                    system_prompt=system_prompt,
-                    seed_goal=seed_goal,
-                    depth=depth + 1,
-                    execution_id=execution_id,
-                    level_contexts=level_contexts,
+                # Execute Sub-ACs sequentially (memory optimization) while
+                # re-entering this same method for both composite and atomic children.
+                self._console.print(
+                    f"    [green]Starting {len(sub_acs)} Sub-ACs sequentially...[/green]"
+                )
+
+                sub_results: list[ACExecutionResult | BaseException] = [None] * len(sub_acs)
+                sub_depth = depth + 1
+
+                for idx, sub_ac in enumerate(sub_acs):
+                    try:
+                        child_node_identity = node_identity.child(idx)
+                        child_is_sub_ac = child_node_identity.depth > 0
+                        legacy_parent_ac_index = (
+                            node_identity.root_ac_index if child_node_identity.depth == 1 else None
+                        )
+                        legacy_sub_ac_index = idx if child_node_identity.depth == 1 else None
+                        await self._emit_subtask_event(
+                            execution_id=execution_id,
+                            ac_index=ac_index,
+                            sub_task_index=idx + 1,
+                            sub_task_content=sub_ac,
+                            status="executing",
+                            node_identity=child_node_identity,
+                        )
+
+                        sub_results[idx] = await self._execute_single_ac(
+                            ac_index=ac_index * 100 + idx,
+                            ac_content=sub_ac,
+                            session_id=session_id,
+                            tools=tools,
+                            tool_catalog=tool_catalog,
+                            system_prompt=system_prompt,
+                            seed_goal=seed_goal,
+                            depth=sub_depth,
+                            execution_id=execution_id,
+                            level_contexts=level_contexts,
+                            retry_attempt=retry_attempt,
+                            execution_counters=execution_counters,
+                            is_sub_ac=child_is_sub_ac,
+                            parent_ac_index=legacy_parent_ac_index,
+                            sub_ac_index=legacy_sub_ac_index,
+                            node_identity=child_node_identity,
+                        )
+                    except BaseException as e:
+                        if isinstance(e, anyio.get_cancelled_exc_class()):
+                            raise
+                        sub_results[idx] = e
+
+                # Convert exceptions and None sentinels to failed results
+                final_sub_results: list[ACExecutionResult] = []
+                for i, result in enumerate(sub_results):
+                    if isinstance(result, BaseException) or result is None:
+                        final_sub_results.append(
+                            ACExecutionResult(
+                                ac_index=ac_index * 100 + i,
+                                ac_content=sub_acs[i],
+                                success=False,
+                                error=str(result)
+                                if isinstance(result, BaseException)
+                                else "Task cancelled or produced no result",
+                                retry_attempt=retry_attempt,
+                                depth=sub_depth,
+                            )
+                        )
+                    else:
+                        final_sub_results.append(result)
+
+                success_count = sum(1 for result in final_sub_results if result.success)
+                self._console.print(
+                    f"    [{'green' if success_count == len(sub_acs) else 'yellow'}]"
+                    f"Sub-ACs completed: {success_count}/{len(sub_acs)} succeeded[/]"
                 )
 
                 # Update TUI with final statuses
-                for i, result in enumerate(sub_results):
+                for i, result in enumerate(final_sub_results):
                     status = "completed" if result.success else "failed"
+                    child_node_identity = node_identity.child(i)
                     await self._emit_subtask_event(
                         execution_id=execution_id,
                         ac_index=ac_index,
                         sub_task_index=i + 1,
-                        sub_task_desc=sub_acs[i][:50],
+                        sub_task_content=sub_acs[i],
                         status=status,
+                        node_identity=child_node_identity,
                     )
 
                 duration = (datetime.now(UTC) - start_time).total_seconds()
-                all_success = all(r.success for r in sub_results)
+                all_success = all(result.success for result in final_sub_results)
 
                 return ACExecutionResult(
                     ac_index=ac_index,
                     ac_content=ac_content,
                     success=all_success,
                     messages=(),
-                    final_message=f"Decomposed into {len(sub_acs)} Sub-ACs",
+                    final_message="\n".join(
+                        _render_ac_section(
+                            ACExecutionResult(
+                                ac_index=ac_index,
+                                ac_content=ac_content,
+                                success=all_success,
+                                messages=(),
+                                duration_seconds=duration,
+                                is_decomposed=True,
+                                sub_results=tuple(final_sub_results),
+                                depth=depth,
+                            ),
+                            index_path=(ac_index + 1,),
+                            heading_level=3,
+                            include_header=False,
+                        )
+                    ),
                     duration_seconds=duration,
+                    retry_attempt=retry_attempt,
                     is_decomposed=True,
-                    sub_results=tuple(sub_results),
+                    sub_results=tuple(final_sub_results),
                     depth=depth,
                 )
 
-        # Execute atomic AC directly
-        return await self._execute_atomic_ac(
-            ac_index=ac_index,
-            ac_content=ac_content,
-            session_id=session_id,
-            tools=tools,
-            system_prompt=system_prompt,
-            seed_goal=seed_goal,
-            depth=depth,
-            start_time=start_time,
-            level_contexts=level_contexts,
-            sibling_acs=sibling_acs,
+        # Depth-limit canary: execution is forced atomic once the soft recursion
+        # safety net is reached, so downstream stages can detect decomposition pressure.
+        decomposition_depth_warning = (
+            self._enable_decomposition and depth >= self._max_decomposition_depth
         )
+
+        # Stall recovery belongs to atomic leaves only. Once this method decides
+        # to execute atomically, it can retry the leaf without re-running the
+        # decomposition/dispatch branch above.
+        atomic_retry_attempt = retry_attempt
+        max_attempts = retry_attempt + MAX_STALL_RETRIES + 1
+        while True:
+            atomic_result = await self._execute_atomic_ac(
+                ac_index=ac_index,
+                ac_content=ac_content,
+                session_id=session_id,
+                tools=tools,
+                tool_catalog=tool_catalog,
+                system_prompt=system_prompt,
+                seed_goal=seed_goal,
+                depth=depth,
+                start_time=start_time,
+                execution_id=execution_id,
+                level_contexts=level_contexts,
+                sibling_acs=sibling_acs,
+                retry_attempt=atomic_retry_attempt,
+                execution_counters=execution_counters,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+            )
+            if atomic_result.error != _STALL_SENTINEL:
+                if decomposition_depth_warning:
+                    return replace(atomic_result, decomposition_depth_warning=True)
+                return atomic_result
+
+            runtime_identity = build_ac_runtime_identity(
+                ac_index,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=atomic_retry_attempt,
+            )
+            should_retry = atomic_retry_attempt - retry_attempt < MAX_STALL_RETRIES
+            stall_event = create_ac_stall_detected_event(
+                session_id=session_id,
+                ac_index=ac_index,
+                ac_id=runtime_identity.ac_id,
+                silent_seconds=STALL_TIMEOUT_SECONDS,
+                attempt=runtime_identity.attempt_number,
+                max_attempts=max_attempts,
+                action="restart" if should_retry else "abandon",
+            )
+            if node_identity is not None:
+                stall_event.data.update(node_identity.to_event_metadata())
+            await self._safe_emit_event(stall_event)
+
+            if not should_retry:
+                log.error(
+                    "parallel_executor.ac.stall_abandoned",
+                    session_id=session_id,
+                    ac_index=ac_index,
+                    depth=depth,
+                    retry_attempt=atomic_retry_attempt,
+                )
+                failed_result = replace(
+                    atomic_result,
+                    error=f"Stalled (no activity for {STALL_TIMEOUT_SECONDS:.0f}s)",
+                )
+                if decomposition_depth_warning:
+                    return replace(failed_result, decomposition_depth_warning=True)
+                return failed_result
+
+            atomic_retry_attempt += 1
 
     async def _try_decompose_ac(
         self,
@@ -639,18 +4137,45 @@ class ParallelACExecutor:
         seed_goal: str,
         tools: list[str],
         system_prompt: str,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> list[str] | None:
         """Ask Claude to decompose AC into Sub-ACs if complex.
 
         Returns:
             List of Sub-AC descriptions, or None if AC is atomic.
         """
-        decompose_prompt = f"""Analyze this acceptance criterion and determine if it should be decomposed.
+        ac_label = (
+            f"AC #{node_identity.display_path}"
+            if node_identity is not None
+            else f"AC #{ac_index + 1}"
+        )
+        decomposition_system_prompt = (
+            "You are a task decomposition expert. Analyze tasks and break them down if needed."
+        )
+        min_sub_acs = MIN_SUB_ACS
+        max_sub_acs = MAX_SUB_ACS
+        profile_metadata = self._decomposition_profile_metadata()
+        if self._execution_profile is not None:
+            params = params_from_profile(
+                self._execution_profile,
+                min_branching=MIN_SUB_ACS,
+            )
+            min_sub_acs = params.min_branching
+            max_sub_acs = params.max_branching
+            decomposition_system_prompt = build_decomposition_system_prompt(params)
+            decompose_prompt = build_decomposition_user_prompt(
+                params,
+                ac_label=ac_label,
+                ac_content=ac_content,
+                seed_goal=seed_goal,
+            )
+        else:
+            decompose_prompt = f"""Analyze this acceptance criterion and determine if it should be decomposed.
 
 ## Goal Context
 {seed_goal}
 
-## Acceptance Criterion (AC #{ac_index + 1})
+## Acceptance Criterion ({ac_label})
 {ac_content}
 
 ## Instructions
@@ -678,13 +4203,28 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             # is closed via aclose() (from break or aclosing), the cancel scope
             # cleanup creates background asyncio Tasks that cancel other
             # running tasks. Let the generator complete naturally instead.
-            async for message in self._adapter.execute_task(
-                prompt=decompose_prompt,
-                tools=[],  # No tools for decomposition analysis
-                system_prompt="You are a task decomposition expert. Analyze tasks and break them down if needed.",
-            ):
-                if message.content:
-                    response_text = message.content
+            async with asyncio.timeout(DECOMPOSITION_TIMEOUT_SECONDS):
+                async for message in self._adapter.execute_task(
+                    prompt=decompose_prompt,
+                    tools=[],  # No tools for decomposition analysis
+                    system_prompt=decomposition_system_prompt,
+                    resume_handle=self._inherited_runtime_handle,
+                ):
+                    if message.content:
+                        # Some runtimes (notably Goose stream-json) emit assistant text
+                        # as token/delta chunks.  The decomposition parser needs the
+                        # full response, so accumulate chunks for Goose while preserving
+                        # the previous last-message behavior for runtimes that emit
+                        # complete assistant messages.
+                        if getattr(self._adapter, "runtime_backend", "") == "goose":
+                            if message.type not in {"assistant", "result"}:
+                                continue
+                            if message.is_final:
+                                response_text = message.content
+                            else:
+                                response_text += message.content
+                        else:
+                            response_text = message.content
 
             # Parse response
             response_text = response_text.strip()
@@ -693,6 +4233,7 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 log.info(
                     "parallel_executor.decomposition.atomic",
                     ac_index=ac_index,
+                    **profile_metadata,
                 )
                 return None
 
@@ -701,11 +4242,12 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             if json_match:
                 sub_acs = json.loads(json_match.group())
                 if isinstance(sub_acs, list) and all(isinstance(s, str) for s in sub_acs):
-                    if MIN_SUB_ACS <= len(sub_acs) <= MAX_SUB_ACS:
+                    if min_sub_acs <= len(sub_acs) <= max_sub_acs:
                         log.info(
                             "parallel_executor.decomposition.success",
                             ac_index=ac_index,
                             sub_ac_count=len(sub_acs),
+                            **profile_metadata,
                         )
                         return sub_acs
 
@@ -713,100 +4255,26 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 "parallel_executor.decomposition.parse_failed",
                 ac_index=ac_index,
                 response_preview=response_text[:100],
+                **profile_metadata,
             )
             return None
 
+        except TimeoutError:
+            log.warning(
+                "parallel_executor.decomposition.timeout",
+                ac_index=ac_index,
+                timeout_seconds=DECOMPOSITION_TIMEOUT_SECONDS,
+                **profile_metadata,
+            )
+            return None
         except Exception as e:
             log.warning(
                 "parallel_executor.decomposition.error",
                 ac_index=ac_index,
                 error=str(e),
+                **profile_metadata,
             )
             return None
-
-    async def _execute_sub_acs_parallel(
-        self,
-        parent_ac_index: int,
-        sub_acs: list[str],
-        session_id: str,
-        tools: list[str],
-        system_prompt: str,
-        seed_goal: str,
-        depth: int,
-        execution_id: str,
-        level_contexts: list[LevelContext] | None = None,
-    ) -> list[ACExecutionResult]:
-        """Execute Sub-ACs in parallel, each in its own Claude session.
-
-        Returns:
-            List of ACExecutionResult for each Sub-AC.
-        """
-        self._console.print(f"    [green]Starting {len(sub_acs)} Sub-ACs in parallel...[/green]")
-
-        # Execute all Sub-ACs in parallel using anyio task group
-        # (preserves cancel scope context for SDK calls)
-        sub_results: list[ACExecutionResult | BaseException] = [None] * len(sub_acs)
-
-        async def _run_sub_ac(idx: int, sub_ac: str) -> None:
-            # NOTE: No semaphore here — the parent AC already holds a slot.
-            # Acquiring the same semaphore would deadlock when all AC slots
-            # are occupied (parent waits for Sub-ACs, Sub-ACs wait for slots).
-            try:
-                # Mark Sub-AC as executing before starting
-                await self._emit_subtask_event(
-                    execution_id=execution_id,
-                    ac_index=parent_ac_index,
-                    sub_task_index=idx + 1,
-                    sub_task_desc=sub_ac[:50],
-                    status="executing",
-                )
-
-                sub_results[idx] = await self._execute_atomic_ac(
-                    ac_index=parent_ac_index * 100 + idx,
-                    ac_content=sub_ac,
-                    session_id=session_id,
-                    tools=tools,
-                    system_prompt=system_prompt,
-                    seed_goal=seed_goal,
-                    depth=depth,
-                    start_time=datetime.now(UTC),
-                    is_sub_ac=True,
-                    parent_ac_index=parent_ac_index,
-                    sub_ac_index=idx,
-                    level_contexts=level_contexts,
-                )
-            except BaseException as e:
-                if isinstance(e, anyio.get_cancelled_exc_class()):
-                    raise
-                sub_results[idx] = e
-
-        async with anyio.create_task_group() as tg:
-            for i, sub_ac in enumerate(sub_acs):
-                tg.start_soon(_run_sub_ac, i, sub_ac)
-
-        # Convert exceptions to failed results
-        final_results: list[ACExecutionResult] = []
-        for i, result in enumerate(sub_results):
-            if isinstance(result, BaseException):
-                final_results.append(
-                    ACExecutionResult(
-                        ac_index=parent_ac_index * 100 + i,
-                        ac_content=sub_acs[i],
-                        success=False,
-                        error=str(result),
-                        depth=depth,
-                    )
-                )
-            else:
-                final_results.append(result)
-
-        success_count = sum(1 for r in final_results if r.success)
-        self._console.print(
-            f"    [{'green' if success_count == len(sub_acs) else 'yellow'}]"
-            f"Sub-ACs completed: {success_count}/{len(sub_acs)} succeeded[/]"
-        )
-
-        return final_results
 
     @staticmethod
     def _format_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
@@ -827,6 +4295,399 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             detail = detail[:57] + "..."
         return f"{tool_name}: {detail}" if detail else tool_name
 
+    async def _wait_for_memory(self, label: str) -> None:
+        """Block until system has enough free memory to spawn a subprocess."""
+        requires_memory_gate = getattr(self._adapter, "_requires_memory_gate", None)
+        if not isinstance(requires_memory_gate, bool):
+            requires_memory_gate = False
+        if not requires_memory_gate:
+            return
+
+        elapsed = 0.0
+        while elapsed < _MEMORY_WAIT_MAX_SECONDS:
+            available_gb = _get_available_memory_gb()
+            if available_gb is None or available_gb >= _MIN_FREE_MEMORY_GB:
+                return
+            log.warning(
+                "memory_pressure.waiting",
+                available_gb=round(available_gb, 2),
+                label=label,
+            )
+            await asyncio.sleep(_MEMORY_CHECK_INTERVAL_SECONDS)
+            elapsed += _MEMORY_CHECK_INTERVAL_SECONDS
+        log.warning("memory_pressure.timeout", label=label)
+
+    def _decomposition_profile_metadata(self) -> dict[str, Any]:
+        """Return audit metadata for profile-aware decomposition decisions.
+
+        The metadata is intentionally descriptive only. It lets projections,
+        tests, and reviewers prove which profile shaped decomposition without
+        changing dispatch behavior or the CLI fat-harness default path.
+        """
+        profile = self._execution_profile
+        if profile is None:
+            return {"decomposition_profile": None}
+        return {
+            "decomposition_profile": {
+                "profile": profile.profile,
+                "axis": profile.axis,
+                "min_unit": profile.min_unit,
+                "cut_signal": profile.cut_signal,
+                "max_branching": profile.max_branching,
+            }
+        }
+
+    def _build_atomic_dispatch_context(
+        self,
+        *,
+        ac_index: int,
+        ac_content: str,
+        label: str,
+        level_contexts: list[LevelContext] | None,
+        sibling_acs: list[_SiblingACRef] | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """Build the task section for an atomic leaf dispatch.
+
+        Legacy execution keeps its historical prompt shape.  When an
+        ExecutionProfile is active, route parent/sibling/AC context through
+        the #830 H6 context governor so profile-backed leaves receive bounded,
+        deterministic context without flipping any evidence/verifier default.
+        """
+        if self._execution_profile is None:
+            return f"## Your Task ({label})\n{ac_content}", None
+
+        sibling_statuses: list[SiblingStatus] = []
+        if sibling_acs and len(sibling_acs) > 1:
+            for sibling_index, sibling_ac in sibling_acs:
+                if sibling_index == ac_index:
+                    continue
+                sibling_id = f"sibling-{len(sibling_statuses) + 1}"
+                headline = " ".join(sibling_ac.split())
+                if len(headline) > _SIBLING_HEADLINE_CHARS:
+                    headline = headline[:_SIBLING_HEADLINE_CHARS]
+                sibling_statuses.append(
+                    SiblingStatus(
+                        sibling_id=sibling_id,
+                        accepted=None,
+                        headline=headline,
+                    )
+                )
+
+        try:
+            composed = compose_context(
+                ac=ac_content,
+                parent_summary=_build_governed_parent_summary(level_contexts),
+                siblings=sibling_statuses,
+            )
+        except ValueError as exc:
+            # This C.3 slice wires the governor into profile-backed dispatch
+            # without making budget failures an acceptance/default gate yet.
+            # Preserve execution by falling back to the legacy prompt shape and
+            # emit auditable metadata so later enforcement work can quantify
+            # how often the hard governor would have rejected a leaf.
+            return f"## Your Task ({label})\n{ac_content}", {
+                "context_governed": False,
+                "context_acceptance_enforced": False,
+                "context_default_flipped": False,
+                "context_governance_error": str(exc),
+                "context_fallback": "legacy_prompt",
+            }
+        rendered = composed.render()
+        audit = {
+            "context_governed": True,
+            "context_acceptance_enforced": False,
+            "context_default_flipped": False,
+            "context_rendered_chars": len(rendered),
+            "context_truncated": composed.truncated,
+            "context_sibling_status_count": len(composed.sibling_lines),
+            "context_parent_summary_present": bool(composed.parent_summary),
+        }
+        return f"## Governed Dispatch Context ({label})\n{rendered}", audit
+
+    async def _emit_atomic_context_governed_event(
+        self,
+        *,
+        runtime_identity: ACRuntimeIdentity,
+        execution_id: str,
+        session_id: str | None,
+        ac_content: str,
+        context_audit: dict[str, Any] | None,
+    ) -> None:
+        """Persist observe-only context-governor metadata for profile-backed leaves."""
+        if self._execution_profile is None or context_audit is None:
+            return
+
+        from ouroboros.events.base import BaseEvent
+
+        await self._safe_emit_event(
+            BaseEvent(
+                type="execution.ac.context_governed",
+                aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+                aggregate_id=runtime_identity.session_scope_id,
+                data={
+                    **runtime_identity.to_metadata(),
+                    **self._decomposition_profile_metadata(),
+                    "execution_id": execution_id,
+                    "session_id": session_id,
+                    "acceptance_criterion": ac_content,
+                    "profile": self._execution_profile.profile,
+                    **context_audit,
+                },
+            )
+        )
+
+    @staticmethod
+    def _runtime_event_metadata(message: AgentMessage) -> dict[str, Any]:
+        """Serialize shared runtime/tool metadata for execution-scoped events."""
+        projected = project_runtime_message(message)
+        return dict(projected.runtime_metadata)
+
+    @staticmethod
+    def _message_tool_input_preview(tool_input: dict[str, Any]) -> str | None:
+        """Build a compact preview string for shared session tool-call events."""
+        if not tool_input:
+            return None
+
+        parts: list[str] = []
+        for key, value in tool_input.items():
+            rendered = str(value).strip()
+            if rendered:
+                parts.append(f"{key}: {rendered}")
+        preview = ", ".join(parts)
+        return preview[:100] if preview else None
+
+    @staticmethod
+    def _should_emit_session_progress_event(
+        message: AgentMessage,
+        *,
+        projected: Any,
+        messages_processed: int,
+    ) -> bool:
+        """Reuse the shared progress-emission policy for AC session messages."""
+        runtime_backend = message.resume_handle.backend if message.resume_handle else None
+        return (
+            message.is_final
+            or messages_processed % 10 == 0
+            or projected.is_tool_call
+            or projected.thinking is not None
+            or message.type == "system"
+            or runtime_backend == "opencode"
+            or projected.is_tool_result
+        )
+
+    def _build_session_progress_event(
+        self,
+        session_id: str,
+        message: AgentMessage,
+        *,
+        projected: Any,
+    ):
+        """Create a shared session progress event from an AC runtime message."""
+        from ouroboros.orchestrator.events import create_progress_event
+        from ouroboros.orchestrator.workflow_state import coerce_ac_marker_update
+
+        message_type = projected.message_type
+        event = create_progress_event(
+            session_id=session_id,
+            message_type=message_type,
+            content_preview=projected.content,
+            tool_name=projected.tool_name if message_type in {"tool", "tool_result"} else None,
+        )
+        event_data = {
+            **event.data,
+            **projected.runtime_metadata,
+            "progress": {
+                "last_message_type": message_type,
+                "last_content_preview": projected.content[:200],
+            },
+        }
+        runtime = event_data.get("runtime")
+        if isinstance(runtime, dict):
+            event_data["progress"]["runtime"] = runtime
+        runtime_event_type = event_data.get("runtime_event_type")
+        if isinstance(runtime_event_type, str) and runtime_event_type:
+            event_data["progress"]["runtime_event_type"] = runtime_event_type
+        runtime_signal = event_data.get("runtime_signal")
+        if isinstance(runtime_signal, str) and runtime_signal:
+            event_data["progress"]["runtime_signal"] = runtime_signal
+        runtime_status = event_data.get("runtime_status")
+        if isinstance(runtime_status, str) and runtime_status:
+            event_data["progress"]["runtime_status"] = runtime_status
+        thinking = event_data.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            event_data["progress"]["thinking"] = thinking
+        ac_tracking = coerce_ac_marker_update(event_data.get("ac_tracking"))
+        if not ac_tracking.is_empty:
+            event_data["progress"]["ac_tracking"] = ac_tracking.to_dict()
+        return event.model_copy(update={"data": event_data})
+
+    def _build_session_tool_called_event(
+        self,
+        session_id: str,
+        *,
+        projected: Any,
+    ):
+        """Create a shared session tool-call event from an AC runtime message."""
+        from ouroboros.orchestrator.events import create_tool_called_event
+
+        if projected.tool_name is None:
+            return None
+
+        event = create_tool_called_event(
+            session_id=session_id,
+            tool_name=projected.tool_name,
+            tool_input_preview=self._message_tool_input_preview(projected.tool_input),
+        )
+        event_data = {
+            **event.data,
+            **projected.runtime_metadata,
+        }
+        return event.model_copy(update={"data": event_data})
+
+    @staticmethod
+    def _coordinator_aggregate_id(execution_id: str, level: int) -> str:
+        """Build a deterministic level-scoped aggregate ID for coordinator work."""
+        return f"{execution_id}:l{level - 1}:coord"
+
+    async def _emit_coordinator_started(
+        self,
+        execution_id: str,
+        session_id: str,
+        level: int,
+        conflicts: list[Any],
+    ) -> None:
+        """Emit a level-scoped event when coordinator reconciliation starts."""
+        from ouroboros.events.base import BaseEvent
+
+        runtime_scope = build_level_coordinator_runtime_scope(execution_id, level)
+        event = BaseEvent(
+            type="execution.coordinator.started",
+            aggregate_type="execution",
+            aggregate_id=self._coordinator_aggregate_id(execution_id, level),
+            data={
+                "execution_id": execution_id,
+                "session_id": session_id,
+                "scope": "level",
+                "session_role": "coordinator",
+                "stage_index": level - 1,
+                "level_number": level,
+                "session_scope_id": runtime_scope.aggregate_id,
+                "session_state_path": runtime_scope.state_path,
+                "conflict_count": len(conflicts),
+                "conflicts": [
+                    {
+                        "file_path": conflict.file_path,
+                        "ac_indices": list(conflict.ac_indices),
+                    }
+                    for conflict in conflicts
+                ],
+            },
+        )
+        await self._event_store.append(event)
+
+    async def _emit_coordinator_runtime_events(
+        self,
+        execution_id: str,
+        session_id: str,
+        review: CoordinatorReview,
+    ) -> None:
+        """Persist normalized coordinator runtime audit events at level scope."""
+        from ouroboros.events.base import BaseEvent
+
+        aggregate_id = self._coordinator_aggregate_id(execution_id, review.level_number)
+        base_data = {
+            "execution_id": execution_id,
+            "session_id": session_id,
+            "coordinator_session_id": review.session_id,
+            "scope": review.scope,
+            "session_role": review.session_role,
+            "stage_index": review.stage_index,
+            "level_number": review.level_number,
+            "session_scope_id": review.artifact_owner_id,
+            "session_state_path": review.artifact_state_path,
+        }
+
+        for message in review.messages:
+            projected = project_runtime_message(message)
+
+            if projected.is_tool_call and projected.tool_name is not None:
+                tool_input = projected.tool_input
+                tool_event = BaseEvent(
+                    type="execution.coordinator.tool.started",
+                    aggregate_type="execution",
+                    aggregate_id=aggregate_id,
+                    data={
+                        **base_data,
+                        "tool_name": projected.tool_name,
+                        "tool_detail": self._format_tool_detail(projected.tool_name, tool_input),
+                        "tool_input": tool_input,
+                        **self._runtime_event_metadata(message),
+                    },
+                )
+                await self._event_store.append(tool_event)
+
+            if projected.is_tool_result and projected.tool_name is not None:
+                tool_result_event = BaseEvent(
+                    type="execution.coordinator.tool.completed",
+                    aggregate_type="execution",
+                    aggregate_id=aggregate_id,
+                    data={
+                        **base_data,
+                        "tool_name": projected.tool_name,
+                        "tool_result_text": projected.content,
+                        **self._runtime_event_metadata(message),
+                    },
+                )
+                await self._event_store.append(tool_result_event)
+
+            if projected.thinking:
+                thinking_event = BaseEvent(
+                    type="execution.coordinator.thinking",
+                    aggregate_type="execution",
+                    aggregate_id=aggregate_id,
+                    data={
+                        **base_data,
+                        "thinking_text": projected.thinking,
+                        **self._runtime_event_metadata(message),
+                    },
+                )
+                await self._event_store.append(thinking_event)
+
+    async def _emit_coordinator_completed(
+        self,
+        execution_id: str,
+        session_id: str,
+        review: CoordinatorReview,
+    ) -> None:
+        """Persist the coordinator reconciliation result as a level-scoped artifact."""
+        from ouroboros.events.base import BaseEvent
+
+        event = BaseEvent(
+            type="execution.coordinator.completed",
+            aggregate_type="execution",
+            aggregate_id=self._coordinator_aggregate_id(execution_id, review.level_number),
+            data={
+                "execution_id": execution_id,
+                "session_id": session_id,
+                "coordinator_session_id": review.session_id,
+                **review.to_artifact_payload(),
+                "conflicts_detected": [
+                    {
+                        "file_path": conflict.file_path,
+                        "ac_indices": list(conflict.ac_indices),
+                        "resolved": conflict.resolved,
+                        "resolution_description": conflict.resolution_description,
+                    }
+                    for conflict in review.conflicts_detected
+                ],
+                "review_summary": review.review_summary,
+                "fixes_applied": list(review.fixes_applied),
+                "warnings_for_next_level": list(review.warnings_for_next_level),
+                "duration_seconds": review.duration_seconds,
+            },
+        )
+        await self._event_store.append(event)
+
     async def _execute_atomic_ac(
         self,
         ac_index: int,
@@ -837,11 +4698,16 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
         seed_goal: str,
         depth: int,
         start_time: datetime,
+        execution_id: str = "",
         is_sub_ac: bool = False,
         parent_ac_index: int | None = None,
         sub_ac_index: int | None = None,
+        node_identity: ExecutionNodeIdentity | None = None,
         level_contexts: list[LevelContext] | None = None,
-        sibling_acs: list[str] | None = None,
+        sibling_acs: list[_SiblingACRef] | None = None,
+        retry_attempt: int = 0,
+        tool_catalog: tuple[MCPToolDefinition, ...] | None = None,
+        execution_counters: dict[str, int] | None = None,
     ) -> ACExecutionResult:
         """Execute an atomic AC directly via Claude Agent.
 
@@ -851,39 +4717,161 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
         ac_session_id: str | None = None
 
         # Build prompt
-        if is_sub_ac:
+        if node_identity is not None:
+            label = (
+                f"AC {node_identity.display_path}"
+                if node_identity.depth == 0
+                else f"Sub-AC {node_identity.display_path}"
+            )
+            indent = "    " if node_identity.depth > 0 else "  "
+        elif is_sub_ac:
             label = f"Sub-AC {sub_ac_index + 1} of AC {parent_ac_index + 1}"
             indent = "    "
         else:
             label = f"AC {ac_index + 1}"
             indent = "  "
 
-        # Build context section from previous levels
-        context_section = build_context_prompt(level_contexts or [])
+        task_section, context_governance_audit = self._build_atomic_dispatch_context(
+            ac_index=ac_index,
+            ac_content=ac_content,
+            label=label,
+            level_contexts=level_contexts,
+            sibling_acs=sibling_acs,
+        )
+        legacy_context_section = (
+            ""
+            if context_governance_audit is not None
+            and context_governance_audit.get("context_governed") is True
+            else build_context_prompt(level_contexts or [])
+        )
+
+        retry_section = ""
+        if retry_attempt > 0:
+            retry_section = (
+                "\n## Retry Context\n"
+                f"This is retry attempt {retry_attempt} for this acceptance criterion.\n"
+                "Resume from the current shared workspace state, including any "
+                "coordinator-reconciled changes already applied.\n"
+            )
 
         # Build parallel awareness section
         parallel_section = ""
         if sibling_acs and len(sibling_acs) > 1:
-            other_acs = [ac for ac in sibling_acs if ac != ac_content]
+            other_acs = [
+                content for sibling_index, content in sibling_acs if sibling_index != ac_index
+            ]
             if other_acs:
-                other_list = "\n".join(f"- {ac[:80]}" for ac in other_acs)
-                parallel_section = (
-                    "\n## Parallel Execution Notice\n"
-                    "Other agents are working on sibling tasks concurrently. "
-                    "Avoid modifying files that other agents are likely editing. "
-                    "Focus on files directly related to YOUR task.\n\n"
-                    f"Sibling tasks in progress:\n{other_list}\n"
+                context_is_governed = (
+                    context_governance_audit is not None
+                    and context_governance_audit.get("context_governed") is True
                 )
+                if context_is_governed:
+                    if self._fat_harness_mode and self._execution_profile is not None:
+                        other_list = (
+                            "Sibling/future ACs are summarized in the governed "
+                            "sibling-status section above as out-of-scope boundary "
+                            "context."
+                        )
+                    else:
+                        other_list = (
+                            "Sibling tasks in progress are summarized in the governed "
+                            "sibling-status section above."
+                        )
+                else:
+                    sibling_heading = (
+                        "Sibling/future ACs that are OUT OF SCOPE for this dispatch:"
+                        if self._fat_harness_mode and self._execution_profile is not None
+                        else "Sibling tasks in progress:"
+                    )
+                    other_list = (
+                        sibling_heading + "\n" + "\n".join(f"- {ac[:80]}" for ac in other_acs)
+                    )
+                if self._fat_harness_mode and self._execution_profile is not None:
+                    parallel_section = (
+                        "\n## Current AC Scope Boundary\n"
+                        "Sibling/future ACs are listed only to define work that is "
+                        "outside the current dispatch. Do not satisfy those criteria "
+                        "now, and do not pre-create their files, tests, docs, or "
+                        "evidence. Avoid modifying files that sibling/future ACs are "
+                        "likely to own unless the current AC explicitly requires it.\n\n"
+                        f"{other_list}\n"
+                    )
+                else:
+                    parallel_section = (
+                        "\n## Parallel Execution Notice\n"
+                        "Other agents are working on sibling tasks concurrently. "
+                        "Avoid modifying files that other agents are likely editing. "
+                        "Focus on files directly related to YOUR task.\n\n"
+                        f"{other_list}\n"
+                    )
 
-        # Scan project files so the agent doesn't hallucinate paths.
+        # Scan the requested runtime workspace so prompts stay aligned with the actual task cwd.
         import os
 
-        cwd = os.getcwd()
+        cwd = self._task_cwd or self._adapter.working_directory
+        if not isinstance(cwd, str) or not cwd:
+            cwd = os.getcwd()
         try:
             entries = sorted(os.listdir(cwd))
             file_listing = "\n".join(f"- {e}" for e in entries if not e.startswith("."))
         except OSError:
             file_listing = "(unable to list)"
+
+        if self._fat_harness_mode and self._execution_profile is not None:
+            effective_schema = _effective_evidence_schema_for_ac(
+                self._execution_profile, ac_content
+            )
+            required_fields = ", ".join(effective_schema.required)
+            doc_only_note = ""
+            if _is_documentation_only_ac(ac_content):
+                doc_only_note = (
+                    "This is a documentation-only current AC: verify the requested docs "
+                    "with current-session README/docs evidence such as Edit plus a direct "
+                    "read/grep/diff command when that command is the validation for the docs change. "
+                    "Do not include tests_passed at all for documentation-only ACs. "
+                    "If you ran tests as a sanity check, cite only the validation command "
+                    "in commands_run when it directly validates the current docs change; "
+                    "do not list individual test names or prior test IDs.\n"
+                )
+            validation_only_note = ""
+            if _is_validation_only_ac(ac_content):
+                validation_only_note = (
+                    "This is a validation-only current AC: prove it with commands_run "
+                    "and tests_passed from this runtime session. Do not include "
+                    "files_touched unless you actually edited, wrote, or generated files "
+                    "for this current AC. Read-only inspection or running tests does not "
+                    "count as files_touched.\n"
+                )
+            completion_instruction = (
+                "## Current AC Scope Contract\n"
+                "You are responsible only for the current acceptance criterion in "
+                "this dispatch. Do not implement, test, document, or pre-create work "
+                "that belongs only to sibling or future ACs. If another AC mentions "
+                "related files, future functions, tests, or docs, treat that work as "
+                "out of scope unless the current AC explicitly requires it.\n"
+                "Your final evidence JSON must cite only files, commands, and tests "
+                "directly changed or run for this current AC in this runtime session. "
+                "For files_touched, cite workspace-relative paths only, never absolute "
+                "paths such as /tmp/... or /private/tmp/..., and never paths outside "
+                "the working directory. "
+                "For commands_run, include only validation/production commands such "
+                "as test, build, lint, generation, or docs verification commands; omit "
+                "exploratory discovery commands such as rg, grep, sed, cat, ls, find, "
+                "or pwd unless the current AC explicitly requires that command as validation.\n"
+                f"{doc_only_note}{validation_only_note}\n"
+                "Use the available tools to accomplish this task. Report progress through "
+                "tool-visible work, not a prose-only completion claim.\n"
+                "When complete, emit exactly ONE fenced JSON evidence record as the "
+                "final response and then stop. Populate the active profile fields "
+                f"directly ({required_fields}); do not emit a generic command_result "
+                "wrapper. Do not prefix it with [TASK_COMPLETE] or any prose; the "
+                "harness decides success from typed evidence plus the verifier PASS."
+            )
+        else:
+            completion_instruction = (
+                "Use the available tools to accomplish this task. Report your progress "
+                "clearly.\nWhen complete, explicitly state: [TASK_COMPLETE]"
+            )
 
         prompt = f"""Execute the following task:
 
@@ -898,79 +4886,366 @@ Files present:
 ## Goal Context
 {seed_goal}
 
-## Your Task ({label})
-{ac_content}
-{context_section}{parallel_section}
-Use the available tools to accomplish this task. Report your progress clearly.
-When complete, explicitly state: [TASK_COMPLETE]
+{render_auto_recursion_guard()}
+
+{task_section}
+{legacy_context_section}{retry_section}{parallel_section}
+{completion_instruction}
 """
 
         messages: list[AgentMessage] = []
         final_message = ""
         success = False
+        clear_cached_runtime_handle = False
+        execution_context_id = execution_id or session_id
+        persisted_runtime_handle = await self._load_persisted_ac_runtime_handle(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        if persisted_runtime_handle is not None:
+            self._remember_ac_runtime_handle(
+                ac_index,
+                persisted_runtime_handle,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=retry_attempt,
+            )
+        runtime_handle = self._build_ac_runtime_handle(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+            tool_catalog=tool_catalog,
+        )
+        runtime_identity = build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_context_id,
+            is_sub_ac=is_sub_ac,
+            parent_ac_index=parent_ac_index,
+            sub_ac_index=sub_ac_index,
+            node_identity=node_identity,
+            retry_attempt=retry_attempt,
+        )
+        await self._emit_atomic_context_governed_event(
+            runtime_identity=runtime_identity,
+            execution_id=execution_context_id,
+            session_id=session_id,
+            ac_content=ac_content,
+            context_audit=context_governance_audit,
+        )
+        lifecycle_event_type = (
+            "execution.session.resumed"
+            if self._is_resumable_runtime_handle(runtime_handle)
+            else "execution.session.started"
+        )
+        lifecycle_emitted = False
+        emitted_recovery_turn_ids: set[str] = set()
+
+        # Stall detection: CancelScope with resettable deadline (RC6)
+        message_count = 0
+        last_heartbeat = time.monotonic()
+        exec_start = time.monotonic()
+
+        await self._wait_for_memory(label)
 
         try:
-            async for message in self._adapter.execute_task(
-                prompt=prompt,
-                tools=tools,
-                system_prompt=system_prompt,
-            ):
-                messages.append(message)
+            with anyio.CancelScope(
+                deadline=anyio.current_time() + STALL_TIMEOUT_SECONDS,
+            ) as stall_scope:
+                async for message in self._adapter.execute_task(
+                    prompt=prompt,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    resume_handle=runtime_handle,
+                ):
+                    # Reset stall deadline on every message (RC6 core)
+                    stall_scope.deadline = anyio.current_time() + STALL_TIMEOUT_SECONDS
+                    if message.resume_handle is not None:
+                        runtime_handle = self._remember_ac_runtime_handle(
+                            ac_index,
+                            message.resume_handle,
+                            execution_context_id=execution_context_id,
+                            is_sub_ac=is_sub_ac,
+                            parent_ac_index=parent_ac_index,
+                            sub_ac_index=sub_ac_index,
+                            node_identity=node_identity,
+                            retry_attempt=retry_attempt,
+                        )
 
-                if ac_session_id is None and message.data.get("session_id"):
-                    ac_session_id = message.data["session_id"]
+                    if runtime_handle is not None and runtime_handle.native_session_id:
+                        ac_session_id = runtime_handle.native_session_id
+                    elif (
+                        message.resume_handle is None
+                        and isinstance(message.data.get("session_id"), str)
+                        and message.data["session_id"]
+                    ):
+                        ac_session_id = message.data["session_id"]
 
-                if message.tool_name:
-                    tool_input = message.data.get("tool_input", {})
-                    tool_detail = self._format_tool_detail(message.tool_name, tool_input)
-                    self._console.print(f"{indent}[yellow]{label} → {tool_detail}[/yellow]")
-                    self._flush_console()
+                    runtime_handle = self._with_native_session_id(runtime_handle, ac_session_id)
+                    if runtime_handle is not None and message.resume_handle is not None:
+                        message = replace(message, resume_handle=runtime_handle)
 
-                    # Emit tool started event for TUI
-                    ac_id = (
-                        f"ac_{ac_index}"
-                        if not is_sub_ac
-                        else f"sub_ac_{parent_ac_index}_{sub_ac_index}"
+                    recovery_discontinuity = self._runtime_recovery_discontinuity(runtime_handle)
+                    if recovery_discontinuity is not None:
+                        replacement = recovery_discontinuity.get("replacement", {})
+                        replacement_turn_id = replacement.get("turn_id")
+                        if isinstance(replacement_turn_id, str) and replacement_turn_id:
+                            if replacement_turn_id not in emitted_recovery_turn_ids:
+                                await self._emit_ac_runtime_event(
+                                    event_type="execution.session.recovered",
+                                    runtime_identity=runtime_identity,
+                                    ac_content=ac_content,
+                                    runtime_handle=runtime_handle,
+                                    execution_id=execution_context_id,
+                                    session_id=ac_session_id,
+                                )
+                                emitted_recovery_turn_ids.add(replacement_turn_id)
+
+                    messages.append(message)
+                    message_count += 1
+                    if execution_counters is not None:
+                        async with self._execution_counters_lock:
+                            execution_counters["messages_count"] = (
+                                execution_counters.get("messages_count", 0) + 1
+                            )
+
+                    # RC1: Emit heartbeat piggybacking on message flow
+                    now = time.monotonic()
+                    if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                        ac_id = runtime_identity.ac_id
+                        heartbeat_event = create_heartbeat_event(
+                            session_id=session_id,
+                            ac_index=ac_index,
+                            ac_id=ac_id,
+                            elapsed_seconds=now - exec_start,
+                            message_count=message_count,
+                        )
+                        if node_identity is not None:
+                            heartbeat_event.data.update(node_identity.to_event_metadata())
+                        await self._safe_emit_event(heartbeat_event)
+                        last_heartbeat = now
+
+                    projected = project_runtime_message(message)
+
+                    persisted_session_id = self._runtime_resume_session_id(runtime_handle)
+                    if not lifecycle_emitted and persisted_session_id:
+                        await self._emit_ac_runtime_event(
+                            event_type=lifecycle_event_type,
+                            runtime_identity=runtime_identity,
+                            ac_content=ac_content,
+                            runtime_handle=runtime_handle,
+                            execution_id=execution_context_id,
+                            session_id=persisted_session_id,
+                        )
+                        lifecycle_emitted = True
+                        self._remember_ac_runtime_handle(
+                            ac_index,
+                            runtime_handle,
+                            execution_context_id=execution_context_id,
+                            is_sub_ac=is_sub_ac,
+                            parent_ac_index=parent_ac_index,
+                            sub_ac_index=sub_ac_index,
+                            node_identity=node_identity,
+                            retry_attempt=retry_attempt,
+                        )
+
+                    session_tool_event = self._build_session_tool_called_event(
+                        session_id,
+                        projected=projected,
                     )
-                    from ouroboros.events.base import BaseEvent as _BaseEvent
+                    if session_tool_event is not None:
+                        await self._event_store.append(session_tool_event)
 
-                    tool_event = _BaseEvent(
-                        type="execution.tool.started",
-                        aggregate_type="execution",
-                        aggregate_id=ac_id,
-                        data={
-                            "ac_id": ac_id,
-                            "tool_name": message.tool_name,
-                            "tool_detail": tool_detail,
-                            "tool_input": tool_input,
-                        },
-                    )
-                    await self._event_store.append(tool_event)
+                    if self._should_emit_session_progress_event(
+                        message,
+                        projected=projected,
+                        messages_processed=len(messages),
+                    ):
+                        session_progress_event = self._build_session_progress_event(
+                            session_id,
+                            message,
+                            projected=projected,
+                        )
+                        await self._event_store.append(session_progress_event)
 
-                if message.data.get("thinking"):
-                    ac_id = (
-                        f"ac_{ac_index}"
-                        if not is_sub_ac
-                        else f"sub_ac_{parent_ac_index}_{sub_ac_index}"
-                    )
-                    from ouroboros.events.base import BaseEvent as _BaseEvent
+                    if projected.is_tool_call and projected.tool_name is not None:
+                        # RC6: Tool invocations prove liveness — reset stall
+                        # deadline so long-running tools (Bash, external APIs)
+                        # are not falsely detected as stalls.
+                        stall_scope.deadline = anyio.current_time() + STALL_TIMEOUT_SECONDS
+                        if execution_counters is not None:
+                            async with self._execution_counters_lock:
+                                execution_counters["tool_calls_count"] = (
+                                    execution_counters.get("tool_calls_count", 0) + 1
+                                )
+                        tool_input = projected.tool_input
+                        tool_detail = self._format_tool_detail(projected.tool_name, tool_input)
+                        self._console.print(f"{indent}[yellow]{label} → {tool_detail}[/yellow]")
+                        self._flush_console()
 
-                    thinking_event = _BaseEvent(
-                        type="execution.agent.thinking",
-                        aggregate_type="execution",
-                        aggregate_id=ac_id,
-                        data={
-                            "ac_id": ac_id,
-                            "thinking_text": message.data["thinking"],
-                        },
-                    )
-                    await self._event_store.append(thinking_event)
+                        # Emit tool started event for TUI
+                        from ouroboros.events.base import BaseEvent as _BaseEvent
 
-                if message.is_final:
-                    final_message = message.content
-                    success = not message.is_error
+                        tool_event = _BaseEvent(
+                            type="execution.tool.started",
+                            aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+                            aggregate_id=runtime_identity.session_scope_id,
+                            data={
+                                **runtime_identity.to_metadata(),
+                                "tool_name": projected.tool_name,
+                                "tool_detail": tool_detail,
+                                "tool_input": tool_input,
+                                **self._runtime_event_metadata(message),
+                            },
+                        )
+                        await self._event_store.append(tool_event)
+
+                    if projected.is_tool_result and projected.tool_name is not None:
+                        from ouroboros.events.base import BaseEvent as _BaseEvent
+
+                        tool_result_event = _BaseEvent(
+                            type="execution.tool.completed",
+                            aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+                            aggregate_id=runtime_identity.session_scope_id,
+                            data={
+                                **runtime_identity.to_metadata(),
+                                "tool_name": projected.tool_name,
+                                "tool_result_text": projected.content,
+                                **self._runtime_event_metadata(message),
+                            },
+                        )
+                        await self._event_store.append(tool_result_event)
+
+                    if projected.thinking:
+                        from ouroboros.events.base import BaseEvent as _BaseEvent
+
+                        thinking_event = _BaseEvent(
+                            type="execution.agent.thinking",
+                            aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+                            aggregate_id=runtime_identity.session_scope_id,
+                            data={
+                                **runtime_identity.to_metadata(),
+                                "thinking_text": projected.thinking,
+                                **self._runtime_event_metadata(message),
+                            },
+                        )
+                        await self._event_store.append(thinking_event)
+
+                    if message.is_final:
+                        final_message = message.content
+                        success = not message.is_error
+
+            # Check if stall was detected (CancelScope ate the Cancelled)
+            if stall_scope.cancelled_caught:
+                duration = (datetime.now(UTC) - start_time).total_seconds()
+                log.warning(
+                    "parallel_executor.ac.stall_detected",
+                    ac_index=ac_index,
+                    depth=depth,
+                    silent_seconds=STALL_TIMEOUT_SECONDS,
+                    message_count=message_count,
+                )
+                clear_cached_runtime_handle = True
+                return ACExecutionResult(
+                    ac_index=ac_index,
+                    ac_content=ac_content,
+                    success=False,
+                    messages=tuple(messages),
+                    error=_STALL_SENTINEL,
+                    duration_seconds=duration,
+                    session_id=ac_session_id,
+                    retry_attempt=retry_attempt,
+                    depth=depth,
+                )
+
+            self._remember_ac_runtime_handle(
+                ac_index,
+                runtime_handle,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=retry_attempt,
+            )
 
             duration = (datetime.now(UTC) - start_time).total_seconds()
+
+            typed_evidence, typed_validation, typed_error = self._observe_atomic_typed_evidence(
+                ac_content=ac_content,
+                final_message=final_message,
+                success=success,
+            )
+            verifier_verdict = self._run_atomic_verifier_pass(
+                ac_content=ac_content,
+                final_message=final_message,
+                success=success,
+                messages=tuple(messages),
+                typed_evidence=typed_evidence,
+                typed_validation=typed_validation,
+            )
+            fat_harness_error = self._fat_harness_acceptance_error(
+                runtime_success=success,
+                typed_evidence=typed_evidence,
+                typed_validation=typed_validation,
+                typed_error=typed_error,
+                verifier_verdict=verifier_verdict,
+            )
+            result_final_message = final_message
+            if fat_harness_error is not None:
+                success = False
+                result_final_message = (
+                    f"{fat_harness_error}\n\nRuntime final message:\n{final_message}"
+                    if final_message
+                    else fat_harness_error
+                )
+            await self._emit_atomic_typed_evidence_event(
+                runtime_identity=runtime_identity,
+                execution_id=execution_context_id,
+                session_id=ac_session_id,
+                ac_content=ac_content,
+                typed_evidence=typed_evidence,
+                typed_validation=typed_validation,
+                typed_error=typed_error,
+                verifier_verdict=verifier_verdict,
+                enforcement_error=fat_harness_error,
+            )
+            await self._emit_ac_runtime_event(
+                event_type=(
+                    "execution.session.completed" if success else "execution.session.failed"
+                ),
+                runtime_identity=runtime_identity,
+                ac_content=ac_content,
+                runtime_handle=runtime_handle,
+                execution_id=execution_context_id,
+                session_id=ac_session_id,
+                result_summary=result_final_message or None,
+                success=success,
+                error=(
+                    None
+                    if success
+                    else fat_harness_error or final_message or "Implementation session failed"
+                ),
+            )
+            clear_cached_runtime_handle = True
+            result_typed_evidence = typed_evidence
+            if success and self._execution_profile is not None and typed_evidence is not None:
+                result_typed_evidence = _scoped_evidence_record_for_ac(
+                    self._execution_profile,
+                    ac_content,
+                    typed_evidence,
+                )
 
             log.info(
                 "parallel_executor.ac.completed",
@@ -986,14 +5261,43 @@ When complete, explicitly state: [TASK_COMPLETE]
                 ac_content=ac_content,
                 success=success,
                 messages=tuple(messages),
-                final_message=final_message,
+                final_message=result_final_message,
                 duration_seconds=duration,
                 session_id=ac_session_id,
+                retry_attempt=retry_attempt,
                 depth=depth,
+                runtime_handle=runtime_handle,
+                typed_evidence=result_typed_evidence,
+                typed_evidence_validation=typed_validation,
+                typed_evidence_error=typed_error,
+                atomic_verifier_verdict=verifier_verdict,
+                error=fat_harness_error,
             )
 
         except Exception as e:
             duration = (datetime.now(UTC) - start_time).total_seconds()
+
+            self._remember_ac_runtime_handle(
+                ac_index,
+                runtime_handle,
+                execution_context_id=execution_context_id,
+                is_sub_ac=is_sub_ac,
+                parent_ac_index=parent_ac_index,
+                sub_ac_index=sub_ac_index,
+                node_identity=node_identity,
+                retry_attempt=retry_attempt,
+            )
+            await self._emit_ac_runtime_event(
+                event_type="execution.session.failed",
+                runtime_identity=runtime_identity,
+                ac_content=ac_content,
+                runtime_handle=runtime_handle,
+                execution_id=execution_context_id,
+                session_id=ac_session_id,
+                success=False,
+                error=str(e),
+            )
+            clear_cached_runtime_handle = True
 
             log.exception(
                 "parallel_executor.ac.failed",
@@ -1010,29 +5314,352 @@ When complete, explicitly state: [TASK_COMPLETE]
                 error=str(e),
                 duration_seconds=duration,
                 session_id=ac_session_id,
+                retry_attempt=retry_attempt,
                 depth=depth,
+                runtime_handle=runtime_handle,
             )
+        finally:
+            if clear_cached_runtime_handle:
+                await self._terminate_runtime_handle(
+                    runtime_handle,
+                    runtime_scope_id=runtime_identity.session_scope_id,
+                )
+                self._forget_ac_runtime_handle(
+                    ac_index,
+                    execution_context_id=execution_context_id,
+                    is_sub_ac=is_sub_ac,
+                    parent_ac_index=parent_ac_index,
+                    sub_ac_index=sub_ac_index,
+                    node_identity=node_identity,
+                    retry_attempt=retry_attempt,
+                )
+
+    def _observe_atomic_typed_evidence(
+        self,
+        *,
+        ac_content: str,
+        final_message: str,
+        success: bool,
+    ) -> tuple[EvidenceRecord | None, ValidationResult | None, str | None]:
+        """Parse and validate typed evidence at the atomic AC acceptance boundary.
+
+        In observe-only mode this only records whether a successful atomic
+        leaf emitted profile-shaped evidence. In fat-harness mode, the caller
+        subsequently requires both this validation result and a separate
+        verifier PASS before accepting the AC.
+        """
+        if not success or self._execution_profile is None:
+            return None, None, None
+
+        try:
+            record = extract_evidence(final_message)
+            effective_schema = _effective_evidence_schema_for_ac(
+                self._execution_profile,
+                ac_content,
+            )
+            validation = validate_evidence(
+                _profile_with_evidence_schema(self._execution_profile, effective_schema),
+                record,
+            )
+        except ProfileEvidenceConfigError:
+            raise
+        except EvidenceError as exc:
+            return None, None, str(exc)
+        return record, validation, None
+
+    def _fat_harness_acceptance_error(
+        self,
+        *,
+        runtime_success: bool,
+        typed_evidence: EvidenceRecord | None,
+        typed_validation: ValidationResult | None,
+        typed_error: str | None,
+        verifier_verdict: VerifierVerdict | None,
+    ) -> str | None:
+        """Return the fat-harness rejection reason for an atomic leaf."""
+        if not self._fat_harness_mode or not runtime_success:
+            return None
+        if self._execution_profile is None:
+            return "Fat-harness mode requires a loaded execution profile."
+        if typed_evidence is None:
+            return typed_error or "Fat-harness mode requires typed evidence."
+        if typed_validation is None:
+            return "Fat-harness mode could not validate typed evidence."
+        if typed_validation.ok:
+            if verifier_verdict is None:
+                return "Fat-harness mode requires verifier PASS before atomic acceptance."
+            if verifier_verdict.passed:
+                return None
+            detail = "; ".join(verifier_verdict.reasons) or "verifier rejected atomic evidence"
+            return f"Fat-harness verifier failed ({detail})."
+
+        reasons: list[str] = []
+        if typed_validation.missing_fields:
+            reasons.append("missing fields: " + ", ".join(typed_validation.missing_fields))
+        if typed_validation.rejected_by:
+            reasons.append("rejected by: " + ", ".join(typed_validation.rejected_by))
+        if typed_validation.blocker is not None:
+            reasons.append("blocker: " + typed_validation.blocker.summary())
+        detail = "; ".join(reasons) if reasons else "profile evidence validation failed"
+        return f"Fat-harness typed evidence validation failed ({detail})."
+
+    def _run_atomic_verifier_pass(
+        self,
+        *,
+        ac_content: str,
+        final_message: str,
+        success: bool,
+        messages: tuple[AgentMessage, ...],
+        typed_evidence: EvidenceRecord | None,
+        typed_validation: ValidationResult | None,
+    ) -> VerifierVerdict | None:
+        """Run the separate verifier pass once typed evidence is schema-valid."""
+        if (
+            not success
+            or not self._fat_harness_mode
+            or self._execution_profile is None
+            or typed_evidence is None
+            or typed_validation is None
+            or not typed_validation.ok
+        ):
+            return None
+
+        verifier = self._atomic_verifier
+        try:
+            effective_schema = _effective_evidence_schema_for_ac(
+                self._execution_profile, ac_content
+            )
+            effective_profile = _profile_with_evidence_schema(
+                self._execution_profile, effective_schema
+            )
+            scoped_evidence = _scoped_evidence_record_for_ac(
+                self._execution_profile,
+                ac_content,
+                typed_evidence,
+            )
+            verdict = (
+                verifier(
+                    profile=effective_profile,
+                    ac=ac_content,
+                    leaf_output=final_message,
+                    record=scoped_evidence,
+                )
+                if verifier is not None
+                else self._verify_atomic_evidence_against_runtime_messages(
+                    messages=messages,
+                    typed_evidence=scoped_evidence,
+                    ac_content=ac_content,
+                )
+            )
+        except VerifierContractError:
+            raise
+        except Exception as exc:
+            verdict = verifier_operational_failure_verdict(exc)
+        if not isinstance(verdict, VerifierVerdict):
+            msg = f"Atomic verifier returned {type(verdict).__name__}, expected VerifierVerdict."
+            raise VerifierContractError(msg)
+        return verdict
+
+    def _verify_atomic_evidence_against_runtime_messages(
+        self,
+        *,
+        messages: tuple[AgentMessage, ...],
+        typed_evidence: EvidenceRecord,
+        ac_content: str,
+    ) -> VerifierVerdict:
+        """Verify leaf evidence is backed by runtime transcript events.
+
+        The verifier deliberately ignores the final result message so the
+        accepted evidence cannot be supported only by the leaf's self-report.
+        """
+        support_messages = tuple(messages[:-1] if messages and messages[-1].is_final else messages)
+        if not support_messages:
+            return VerifierVerdict(
+                passed=False,
+                reasons=("no runtime transcript evidence supports the typed evidence claims",),
+                failure_class="EVIDENCE_MISSING",
+            )
+
+        unsupported: list[str] = []
+        backed_commands = tuple(
+            command
+            for command in _flatten_evidence_values(typed_evidence.get("commands_run"))
+            if _runtime_messages_support_command_claim(
+                command,
+                _runtime_support_messages_for_field("commands_run", support_messages),
+            )
+        )
+        effective_schema = _effective_evidence_schema_for_ac(self._execution_profile, ac_content)
+        required_fields = set(effective_schema.required)
+        fields_to_verify = list(effective_schema.required)
+
+        for field_name in fields_to_verify:
+            values = tuple(_flatten_evidence_values(typed_evidence.get(field_name)))
+            if not values:
+                if field_name in required_fields:
+                    unsupported.append(f"{field_name}: no concrete claim values")
+                continue
+            field_messages = _runtime_support_messages_for_field(field_name, support_messages)
+            for value in values:
+                if field_name == "commands_run":
+                    if _runtime_messages_support_command_claim(value, field_messages):
+                        continue
+                    unsupported.append(f"{field_name}: {value}")
+                    continue
+                if field_name == "files_touched":
+                    if _runtime_messages_support_file_claim(
+                        value,
+                        field_messages,
+                        task_cwd=self._task_cwd or self._adapter.working_directory,
+                    ):
+                        continue
+                    unsupported.append(f"{field_name}: {value}")
+                    continue
+                if field_name == "tests_passed":
+                    if _runtime_messages_support_test_claim(
+                        value=value,
+                        backed_commands=backed_commands,
+                        messages=support_messages,
+                        task_cwd=self._task_cwd or self._adapter.working_directory,
+                    ):
+                        continue
+                    unsupported.append(f"{field_name}: {value}")
+                    continue
+                if not _runtime_messages_support_claim(value, field_messages):
+                    unsupported.append(f"{field_name}: {value}")
+
+        if unsupported:
+            return VerifierVerdict(
+                passed=False,
+                reasons=("unsupported evidence claims: " + "; ".join(unsupported),),
+                failure_class="FABRICATION_SUSPECTED",
+            )
+
+        return VerifierVerdict(passed=True)
+
+    async def _emit_atomic_typed_evidence_event(
+        self,
+        *,
+        runtime_identity: ACRuntimeIdentity,
+        execution_id: str,
+        session_id: str | None,
+        ac_content: str,
+        typed_evidence: EvidenceRecord | None,
+        typed_validation: ValidationResult | None,
+        typed_error: str | None,
+        verifier_verdict: VerifierVerdict | None = None,
+        enforcement_error: str | None = None,
+    ) -> None:
+        """Persist typed-evidence metadata for atomic AC completion."""
+        if self._execution_profile is None:
+            return
+
+        from ouroboros.events.base import BaseEvent
+
+        data: dict[str, Any] = {
+            **runtime_identity.to_metadata(),
+            **self._decomposition_profile_metadata(),
+            "execution_id": execution_id,
+            "session_id": session_id,
+            "acceptance_criterion": ac_content,
+            "profile": self._execution_profile.profile,
+            "required_fields": list(
+                _effective_evidence_schema_for_ac(self._execution_profile, ac_content).required
+            ),
+            "observe_only": not self._fat_harness_mode,
+            "enforced": self._fat_harness_mode,
+            "fat_harness_mode": self._fat_harness_mode,
+            "enforcement_error": enforcement_error,
+            "typed_evidence_present": typed_evidence is not None,
+            "typed_evidence_valid": typed_validation.ok if typed_validation is not None else False,
+            "typed_evidence_error": typed_error,
+            "verifier_ran": verifier_verdict is not None,
+            "verifier_passed": verifier_verdict.passed if verifier_verdict is not None else False,
+        }
+        if verifier_verdict is not None:
+            data["verifier_reasons"] = list(verifier_verdict.reasons)
+            data["verifier_failure_class"] = verifier_verdict.failure_class
+        if typed_evidence is not None:
+            data["typed_evidence_fields"] = sorted(typed_evidence.data)
+            data["ignored_out_of_scope_evidence_fields"] = list(
+                _out_of_scope_evidence_fields_for_ac(
+                    self._execution_profile,
+                    ac_content,
+                    typed_evidence,
+                )
+            )
+            data["ignored_out_of_scope_evidence"] = _out_of_scope_evidence_values_for_ac(
+                self._execution_profile,
+                ac_content,
+                typed_evidence,
+            )
+        if typed_validation is not None:
+            data["missing_fields"] = list(typed_validation.missing_fields)
+            data["rejected_by"] = list(typed_validation.rejected_by)
+            data["blocker"] = (
+                typed_validation.blocker.summary() if typed_validation.blocker is not None else None
+            )
+
+        await self._safe_emit_event(
+            BaseEvent(
+                type="execution.ac.typed_evidence.observed",
+                aggregate_type=runtime_identity.runtime_scope.aggregate_type,
+                aggregate_id=runtime_identity.session_scope_id,
+                data=data,
+            )
+        )
 
     async def _emit_subtask_event(
         self,
         execution_id: str,
         ac_index: int,
         sub_task_index: int,
-        sub_task_desc: str,
+        sub_task_content: str,
         status: str,
+        node_identity: ExecutionNodeIdentity | None = None,
     ) -> None:
-        """Emit sub-task event for TUI tree updates."""
+        """Emit sub-task event for TUI tree updates.
+
+        ``ac_index`` arrives 0-based from the executor loop but the TUI
+        tree keys AC nodes as ``ac_{1-based}``, so we convert here.
+        """
         from ouroboros.events.base import BaseEvent
+
+        ac_index_1 = ac_index + 1  # 0-based → 1-based for TUI node keys
+        label = _subtask_event_label(sub_task_content)
+        node_metadata = node_identity.to_event_metadata() if node_identity is not None else {}
+        node_event_type = (
+            "execution.node.created" if status == "pending" else "execution.node.updated"
+        )
+        if node_identity is not None:
+            node_event = BaseEvent(
+                type=node_event_type,
+                aggregate_type="execution",
+                aggregate_id=execution_id,
+                data={
+                    **node_metadata,
+                    "node_kind": "sub_ac",
+                    "content": sub_task_content,
+                    "label": label,
+                    "status": status,
+                    "legacy_ac_index": ac_index_1,
+                    "legacy_sub_task_index": sub_task_index,
+                    "legacy_sub_task_id": f"ac_{ac_index_1}_sub_{sub_task_index}",
+                },
+            )
+            await self._event_store.append(node_event)
 
         event = BaseEvent(
             type="execution.subtask.updated",
             aggregate_type="execution",
             aggregate_id=execution_id,
             data={
-                "ac_index": ac_index,
+                **node_metadata,
+                "ac_index": ac_index_1,
                 "sub_task_index": sub_task_index,
-                "sub_task_id": f"ac_{ac_index}_sub_{sub_task_index}",
-                "content": sub_task_desc,
+                "sub_task_id": f"ac_{ac_index_1}_sub_{sub_task_index}",
+                "content": sub_task_content,
+                "label": label,
                 "status": status,
             },
         )
@@ -1057,6 +5684,7 @@ When complete, explicitly state: [TASK_COMPLETE]
                 "total_levels": total_levels,
                 "child_indices": ac_indices,  # TUI expects this field name
                 "ac_count": len(ac_indices),
+                **self._decomposition_profile_metadata(),
             },
         )
         await self._event_store.append(event)
@@ -1067,6 +5695,9 @@ When complete, explicitly state: [TASK_COMPLETE]
         level: int,
         success_count: int,
         failure_count: int,
+        blocked_count: int = 0,
+        started: bool = True,
+        outcome: str | None = None,
     ) -> None:
         """Emit event when a parallel level completes."""
         from ouroboros.events.base import BaseEvent
@@ -1078,10 +5709,82 @@ When complete, explicitly state: [TASK_COMPLETE]
             data={
                 "level": level - 1,  # TUI expects 0-based index
                 "successful": success_count,
-                "total": success_count + failure_count,
+                "failed": failure_count,
+                "blocked": blocked_count,
+                "started": started,
+                "outcome": outcome or StageExecutionOutcome.SUCCEEDED.value,
+                "total": success_count + failure_count + blocked_count,
             },
         )
         await self._event_store.append(event)
+
+    async def _resilient_progress_emitter(
+        self,
+        session_id: str,
+        execution_id: str,
+        seed: Seed,
+        ac_statuses: dict[int, str],
+        progress_state: dict[str, int],
+        interval: float = 15.0,
+        max_consecutive_errors: int = 5,
+    ) -> None:
+        """Periodically emit workflow progress with error resilience (RC2 + RC4).
+
+        Runs as a background task inside a task group. Terminates when:
+        - All ACs are in terminal state (RC4: no stale monitoring)
+        - Consecutive errors exceed threshold (RC2: graceful degradation)
+        - Task group cancel scope triggers (execution loop finished)
+
+        Args:
+            session_id: Session ID.
+            execution_id: Execution ID.
+            seed: Seed specification.
+            ac_statuses: Shared dict of AC statuses (mutated externally).
+            progress_state: Shared dict with ``current_level`` and ``total_levels``
+                keys, mutated by the main execution loop.
+            interval: Seconds between emissions.
+            max_consecutive_errors: Stop after this many consecutive failures.
+        """
+        consecutive_errors = 0
+        terminal_states = {"completed", "failed", "skipped"}
+
+        while True:
+            await anyio.sleep(interval)
+
+            # RC4: Stop when all ACs are done
+            if all(s in terminal_states for s in ac_statuses.values()):
+                log.info("parallel_executor.progress_emitter.all_done")
+                return
+
+            try:
+                await self._emit_workflow_progress(
+                    session_id=session_id,
+                    execution_id=execution_id,
+                    seed=seed,
+                    ac_statuses=ac_statuses,
+                    ac_retry_attempts=None,
+                    executing_indices=[i for i, s in ac_statuses.items() if s == "executing"],
+                    completed_count=sum(1 for s in ac_statuses.values() if s == "completed"),
+                    current_level=progress_state.get("current_level", 0),
+                    total_levels=progress_state.get("total_levels", 0),
+                    activity="Monitoring",
+                )
+                consecutive_errors = 0
+            except Exception as e:
+                consecutive_errors += 1
+                wait = min(2.0**consecutive_errors, 30.0)
+                log.warning(
+                    "parallel_executor.progress_emitter.error",
+                    error=str(e),
+                    consecutive_errors=consecutive_errors,
+                )
+                if consecutive_errors >= max_consecutive_errors:
+                    log.error(
+                        "parallel_executor.progress_emitter.giving_up",
+                        consecutive_errors=consecutive_errors,
+                    )
+                    return
+                await anyio.sleep(wait)
 
     async def _emit_workflow_progress(
         self,
@@ -1089,11 +5792,14 @@ When complete, explicitly state: [TASK_COMPLETE]
         execution_id: str,
         seed: Seed,
         ac_statuses: dict[int, str],
+        ac_retry_attempts: dict[int, int] | None,
         executing_indices: list[int],
         completed_count: int,
         current_level: int,
         total_levels: int,
         activity: str = "Executing",
+        messages_count: int = 0,
+        tool_calls_count: int = 0,
     ) -> None:
         """Emit workflow progress event for TUI updates.
 
@@ -1102,6 +5808,7 @@ When complete, explicitly state: [TASK_COMPLETE]
             execution_id: Execution ID.
             seed: Seed specification.
             ac_statuses: Dict mapping AC index to status string.
+            ac_retry_attempts: Dict mapping AC index to reopen retry count.
             executing_indices: Currently executing AC indices.
             completed_count: Number of completed ACs.
             current_level: Current execution level.
@@ -1114,11 +5821,27 @@ When complete, explicitly state: [TASK_COMPLETE]
         acceptance_criteria = []
         for i, ac_content in enumerate(seed.acceptance_criteria):
             status = ac_statuses.get(i, "pending")
+            retry_attempt = (ac_retry_attempts or {}).get(i, 0)
+            node_identity = ExecutionNodeIdentity.root(
+                execution_context_id=execution_id or session_id,
+                ac_index=i,
+            )
+            runtime_scope = build_ac_runtime_scope(
+                i,
+                execution_context_id=execution_id or session_id,
+                retry_attempt=retry_attempt,
+                node_id=node_identity.node_id,
+                node_path=node_identity.path,
+            )
             acceptance_criteria.append(
                 {
-                    "index": i,
+                    **node_identity.to_event_metadata(),
+                    "index": i + 1,
+                    "ac_id": runtime_scope.aggregate_id,
                     "content": ac_content,
                     "status": status,
+                    "retry_attempt": retry_attempt,
+                    "attempt_number": runtime_scope.attempt_number,
                     "elapsed": "",
                 }
             )
@@ -1144,12 +5867,17 @@ When complete, explicitly state: [TASK_COMPLETE]
             current_phase="Deliver",  # Parallel execution is in Deliver phase
             activity=activity,
             activity_detail=activity_detail,
+            messages_count=messages_count,
+            tool_calls_count=tool_calls_count,
         )
         await self._event_store.append(event)
 
 
 __all__ = [
+    "ACExecutionOutcome",
     "ACExecutionResult",
+    "ParallelExecutionStageResult",
+    "StageExecutionOutcome",
     "ParallelExecutionResult",
     "ParallelACExecutor",
 ]

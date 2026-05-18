@@ -1,201 +1,158 @@
 ---
 name: ralph
-description: "Persistent self-referential loop until verification passes"
+description: "MCP-owned Ralph loop around background evolve_step jobs"
+mcp_tool: ouroboros_ralph
+mcp_args:
+  lineage_id: "$lineage_id"
 ---
 
 # /ouroboros:ralph
 
-Persistent self-referential loop until verification passes. "The boulder never stops."
+MCP-owned Ralph loop around background `evolve_step` jobs. "The boulder never stops."
 
 ## Usage
 
 ```
-ooo ralph "<your request>"
-/ouroboros:ralph "<your request>"
+ooo ralph --lineage-id <lineage_id>
+/ouroboros:ralph --lineage-id <lineage_id>
+
+# For a plain natural-language request, run `ooo interview` + `ooo seed` first,
+# then call the MCP tool with a fresh lineage_id and the validated Seed YAML.
 ```
 
 **Trigger keywords:** "ralph", "don't stop", "must complete", "until it works", "keep going"
 
 ## How It Works
 
-Ralph mode includes parallel execution + automatic verification + persistence:
+Ralph is owned by the `ouroboros_ralph` MCP tool. In non-plugin runtimes, the
+tool starts one background Ralph job, runs repeated `evolve_step` generations
+inside that job, and stops only when QA passes, convergence is reached, a
+terminal evolution action occurs, cancellation is requested, or
+`max_generations` is reached. In OpenCode plugin mode, the MCP tool returns a
+`delegated_to_plugin` envelope with `job_id=None`; the bridge plugin dispatches
+a child Task session that owns the loop instead of creating a local JobManager
+job.
 
-1. **Execute** (parallel where possible)
-   - Independent tasks run concurrently
-   - Dependency-aware scheduling
-
-2. **Verify** (verifier)
-   - Check completion
-   - Validate tests pass
-   - Measure drift
-
-3. **Loop** (if failed)
-   - Analyze failure
-   - Fix issues
-   - Repeat from step 1
-
-4. **Persist** (checkpoint)
-   - Save state after each iteration
-   - Resume capability if interrupted
-   - Full audit trail
+The client skill should not reimplement the loop. Deterministic frontmatter
+dispatch is limited to the router's named `--lineage-id` option so raw trailing
+text is never treated as lineage identity. Raw natural-language
+`ooo ralph "<request>"` input must flow through the validated Seed path before
+any mutating Ralph loop starts. Until a lineage id and optional Seed YAML are
+prepared, `ouroboros_ralph` returns structured input guidance instead of
+starting a job. Once the inputs are prepared, start the MCP-owned Ralph surface
+once, then follow either the returned job tools path or the OpenCode Task widget
+path.
 
 ## Instructions
 
 When the user invokes this skill:
 
-1. **Parse the request**: Extract what needs to be done
+### Load MCP Tools (Required first)
 
-2. **Initialize state**: Create `.omc/state/ralph-state.json`:
-   ```json
-   {
-     "mode": "ralph",
-     "session_id": "<uuid>",
-     "request": "<user request>",
-     "status": "running",
-     "iteration": 0,
-     "max_iterations": 10,
-     "last_checkpoint": null,
-     "verification_history": []
-   }
+The Ouroboros MCP tools are often registered as deferred tools that must be
+explicitly loaded before use. Do this before preparing input or calling Ralph:
+
+1. Use the `ToolSearch` tool to find and load the Ralph/job MCP tools:
    ```
-
-3. **Enter the loop**:
-
+   ToolSearch query: "+ouroboros ralph job"
    ```
-   while iteration < max_iterations:
-       # Execute with parallel agents via evolve_step
-       # QA is built into ouroboros_evolve_step — the response
-       # includes a "### QA Verdict" section automatically.
-       result = await evolve_step(lineage_id, seed_content, execute=true)
+2. The loaded tools may be exposed under plugin-prefixed names such as
+   `mcp__plugin_ouroboros_ouroboros__ouroboros_ralph`. Use the actual tool
+   names returned by `ToolSearch`; the bare names below are the canonical MCP
+   tool names for documentation.
+3. Confirm that `ouroboros_ralph` and the job tools (`ouroboros_job_wait`,
+   `ouroboros_job_status`, `ouroboros_job_result`, and
+   `ouroboros_cancel_job`) are callable. If the tools are unavailable, stop and
+   tell the user that Ralph requires the Ouroboros MCP runtime.
 
-       # Parse QA from evolve_step response text
-       # (EvolveStepHandler runs QA internally and appends verdict)
-       verification.passed = (qa_verdict == "pass")
-       verification.score = qa_score
+### Ralph Flow
 
-       # Record in history
-       state.verification_history.append({
-           "iteration": iteration,
-           "passed": verification.passed,
-           "score": verification.score,
-           "verdict": qa_verdict,
-           "timestamp": <now>
-       })
+1. **Prepare lineage input**:
+   - If the user provides an existing `lineage_id` and explicitly wants to
+     continue it, reuse that `lineage_id` and omit `seed_content` unless they
+     explicitly provide an updated Seed.
+   - If the user provides Seed YAML for a new Ralph run, use it as
+     `seed_content` and generate a fresh `lineage_id` for this run. Keep
+     `lineage_id` separate from Seed, interview, and session IDs so separate
+     Ralph runs over the same Seed do not collide.
+   - If the user provides only a plain natural-language request, do not treat
+     it as a direct `ooo ralph "<request>"` command, do not freehand Seed YAML,
+     and do not pass raw text as `seed_content`. Route through the authoritative
+     Seed path first: `ooo interview` to capture requirements, then `ooo seed` /
+     `ouroboros_generate_seed` to produce validated Seed YAML with the normal
+     ambiguity gate. After Seed generation, call the MCP tool with a fresh
+     `lineage_id` and that validated Seed YAML as `seed_content`; do not use the
+     raw request text. If an interview/seed session already exists in context,
+     reuse that validated Seed output instead of regenerating it.
 
-       if verification.passed:
-           # SUCCESS - persist final checkpoint
-           await save_checkpoint("complete")
-           break
+2. **Start Ralph** by calling `ouroboros_ralph` with:
+   - `lineage_id`: existing lineage id for an explicit continuation, otherwise a
+     freshly generated stable id for this Ralph run, such as
+     `ralph-<short-slug>-<uuid>`; do not use a Seed/interview id by itself
+   - `seed_content`: valid Seed YAML for generation 1 when starting a new lineage
+   - `execute`: default `true`
+   - `parallel`: default `true`
+   - `skip_qa`: default `false`
+   - `project_dir`: explicit target project directory when known
+   - `max_generations`: default `10` unless the user requests a tighter bound
 
-       # Failed - analyze and continue
-       iteration += 1
-       await save_checkpoint("iteration_{iteration}")
+3. **Handle the start response**:
+   - If `response.meta.job_id` is present, report it concisely and retain the
+     job cursor from `response.meta.cursor`:
 
-       if iteration >= max_iterations:
-           # Max iterations reached
-           break
-   ```
+     ```
+     [Ralph] Started background loop: <job_id>
+     Lineage: <lineage_id>
+     ```
 
-4. **On termination**, display a 📍 next-step:
-   - **Success** (QA passed): `📍 Next: ooo evaluate for formal 3-stage verification`
-   - **Max iterations reached**: `📍 Next: ooo interview to re-examine the problem — or ooo unstuck to try a different approach`
+   - If `response.meta.status == "delegated_to_plugin"` and
+     `response.meta.job_id is None`, report that OpenCode plugin mode delegated
+     the loop to a child Task session. Do not call `ouroboros_job_wait`,
+     `ouroboros_job_result`, or `ouroboros_cancel_job` without a job id; follow
+     the host Task widget/session lifecycle instead.
 
-5. **Report progress** each iteration:
-   ```
-   [Ralph Iteration <i>/<max>]
-   Execution complete. Running QA...
+4. **Monitor non-plugin job progress** with job tooling when a `job_id` exists:
+   - `ouroboros_job_wait(job_id, cursor, timeout_seconds=120)` for long polling;
+     after every wait/status response, update `cursor = response.meta.cursor`
+   - `ouroboros_job_status(job_id)` for a quick status check
+   - `ouroboros_job_result(job_id)` when the job is terminal
+   - `ouroboros_cancel_job(job_id)` if the user says stop/cancel
 
-   QA Verdict: <PASS/REVISE/FAIL> (score: <score>)
-   Differences:
-     - <difference 1>
-     - <difference 2>
-   Suggestions:
-     - <suggestion 1>
-     - <suggestion 2>
+5. **On non-plugin job termination**, fetch `ouroboros_job_result(job_id)` and
+   summarize the final job result and next step:
+   - Success / convergence: summarize the final generation output, QA verdict,
+     and any `worktree_path` / `worktree_branch` returned in job metadata. Do not
+     present `ooo evaluate` as an automatic next step for Ralph results: the
+     Ralph job contract preserves the evolution `lineage_id`, but it does not
+     reliably preserve a separate execution `session_id` for the evaluate
+     workflow. If a valid execution `session_id` is explicitly available from a
+     separate run result, keep it distinct from the Ralph `lineage_id` and follow
+     the `ooo evaluate <session_id>` contract; otherwise state that formal
+     evaluation needs a real execution session and should not be invoked from the
+     Ralph lineage id alone.
+   - Max generations / failure: summarize the stop reason and suggest
+     `ooo unstuck`, `ooo interview`, or a narrower Ralph retry
+   - Cancelled: confirm cancellation and preserve the job id for later inspection
 
-   The boulder never stops. Continuing...
-   ```
+6. **On OpenCode plugin delegation**, rely on the child Task result as the
+   terminal surface. Summarize the Task completion/error state and lineage id; do
+   not claim a local Ralph job can be polled or cancelled.
 
-6. **Handle interruption**:
-   - If user says "stop": save checkpoint, exit gracefully
-   - If user says "continue": reload from last checkpoint
-   - State persists across session resets
+## Tool Mapping
 
-## Persistence
-
-State includes:
-- Current iteration number
-- Verification history for all iterations
-- Last successful checkpoint
-- Issues found in each iteration
-- Execution context for resume
-
-Resume command: "continue ralph" or "ralph continue"
+| Skill action | MCP tool |
+| --- | --- |
+| Start Ralph loop | `ouroboros_ralph` |
+| Wait for progress | `ouroboros_job_wait` |
+| Fetch final result | `ouroboros_job_result` |
+| Cancel loop | `ouroboros_cancel_job` |
+| Inspect current status | `ouroboros_job_status` |
 
 ## The Boulder Never Stops
 
 This is the key phrase. Ralph does not give up:
-- Each failure is data for the next attempt
-- Verification drives the loop
-- Only complete success or max iterations stops it
 
-## Example
-
-```
-User: ooo ralph fix all failing tests
-
-[Ralph Iteration 1/10]
-Executing in parallel...
-Fixing test failures...
-Running QA...
-
-QA Verdict: REVISE (score: 0.65)
-Differences:
-  - 3 tests still failing
-  - Type errors in src/api.py
-Suggestions:
-  - Fix type annotations in api.py before retrying
-
-The boulder never stops. Continuing...
-
-[Ralph Iteration 2/10]
-Executing in parallel...
-Fixing remaining issues...
-Running QA...
-
-QA Verdict: REVISE (score: 0.85)
-Differences:
-  - 1 test edge case failing
-Suggestions:
-  - Add boundary check in parse_input()
-
-The boulder never stops. Continuing...
-
-[Ralph Iteration 3/10]
-Executing in parallel...
-Fixing edge case...
-Running QA...
-
-QA Verdict: PASS (score: 1.0)
-
-Ralph COMPLETE
-==============
-Request: Fix all failing tests
-Duration: 8m 32s
-Iterations: 3
-
-QA History:
-- Iteration 1: REVISE (0.65)
-- Iteration 2: REVISE (0.85)
-- Iteration 3: PASS (1.0)
-
-All tests passing. Build successful.
-
-📍 Next: `ooo evaluate` for formal 3-stage verification
-```
-
-## Cancellation
-
-Cancel with `/ouroboros:cancel --force` to clear state.
-
-Standard `/ouroboros:cancel` saves checkpoint for resume.
+- Each failure is data for the next attempt.
+- Verification drives the loop.
+- Only success, convergence, terminal failure, cancellation, or max-generation
+  limits stop it.

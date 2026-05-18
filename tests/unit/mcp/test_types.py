@@ -1,5 +1,7 @@
 """Tests for MCP types."""
 
+import socket
+
 import pytest
 
 from ouroboros.mcp.types import (
@@ -29,6 +31,7 @@ class TestTransportType:
         assert TransportType.STDIO == "stdio"
         assert TransportType.SSE == "sse"
         assert TransportType.STREAMABLE_HTTP == "streamable-http"
+        assert TransportType.HTTP == "http"
 
 
 class TestMCPServerConfig:
@@ -62,8 +65,27 @@ class TestMCPServerConfig:
                 transport=TransportType.SSE,
             )
 
-    def test_valid_sse_config(self) -> None:
+    def test_http_config_requires_url(self) -> None:
+        """HTTP transport requires URL."""
+        with pytest.raises(ValueError, match="url is required"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+            )
+
+    def test_valid_http_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Valid HTTP config is created successfully."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://localhost:3000",
+        )
+        assert config.url == "http://localhost:3000"
+
+    def test_valid_sse_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Valid SSE config is created successfully."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
         config = MCPServerConfig(
             name="test",
             transport=TransportType.SSE,
@@ -92,6 +114,368 @@ class TestMCPServerConfig:
         assert config.args == ()
         assert config.env == {}
         assert config.headers == {}
+
+    @pytest.mark.parametrize("scheme", ["file", "gopher", "ftp"])
+    def test_rejects_non_http_url_schemes(self, scheme: str) -> None:
+        """MCPServerConfig rejects non-http(s) URL schemes to prevent SSRF."""
+        url = f"{scheme}://example.com/path"
+        with pytest.raises(ValueError, match="Only http:// and https:// URLs are supported"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.SSE,
+                url=url,
+            )
+
+    @pytest.mark.parametrize("scheme", ["file", "gopher", "ftp"])
+    def test_rejects_non_http_url_schemes_streamable_http(self, scheme: str) -> None:
+        """MCPServerConfig rejects non-http(s) schemes for STREAMABLE_HTTP transport."""
+        url = f"{scheme}://example.com/path"
+        with pytest.raises(ValueError, match="Only http:// and https:// URLs are supported"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.STREAMABLE_HTTP,
+                url=url,
+            )
+
+    def test_accepts_http_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """MCPServerConfig accepts http:// URLs."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.SSE,
+            url="http://localhost:8080/sse",
+        )
+        assert config.url == "http://localhost:8080/sse"
+
+    def test_accepts_https_url(self) -> None:
+        """MCPServerConfig accepts https:// URLs."""
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.STREAMABLE_HTTP,
+            url="https://api.example.com/mcp",
+        )
+        assert config.url == "https://api.example.com/mcp"
+
+
+class TestMCPServerConfigSSRFHardening:
+    """SSRF hardening beyond the scheme allowlist.
+
+    These tests cover review finding #402: the prior check only validated
+    URL schemes and left obvious SSRF vectors open (loopback, link-local
+    metadata endpoints, RFC1918 ranges, credential smuggling, empty hosts).
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://127.0.0.1/",
+            "http://127.0.0.1:8080/",
+            "http://[::1]/",
+            "https://[::1]:443/",
+        ],
+    )
+    def test_rejects_loopback(self, url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loopback IPv4/IPv6 literals are rejected."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+        with pytest.raises(ValueError, match="loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url=url,
+            )
+
+    def test_rejects_aws_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The AWS / GCP / Azure metadata link-local IP is rejected."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+        with pytest.raises(ValueError, match="loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.STREAMABLE_HTTP,
+                url="http://169.254.169.254/latest/meta-data/",
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://10.0.0.1/",
+            "http://10.255.255.255/",
+            "http://172.16.0.1/",
+            "http://172.31.255.254/",
+            "http://192.168.1.1/",
+        ],
+    )
+    def test_rejects_private_ranges(self, url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """RFC1918 private IPv4 ranges are rejected."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+        with pytest.raises(ValueError, match="loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url=url,
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://user:pass@example.com/",
+            "http://user@example.com/",
+            "https://admin:secret@api.example.com/mcp",
+        ],
+    )
+    def test_rejects_userinfo(self, url: str) -> None:
+        """URLs carrying userinfo (credential smuggling) are rejected."""
+        with pytest.raises(ValueError, match="userinfo"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url=url,
+            )
+
+    def test_rejects_empty_hostname(self) -> None:
+        """Bare scheme URLs without a hostname are rejected."""
+        with pytest.raises(ValueError, match="hostname"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://",
+            )
+
+    def test_rejects_javascript_scheme(self) -> None:
+        """javascript: and other non-http schemes remain rejected."""
+        with pytest.raises(ValueError, match="Only http:// and https://"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="javascript:alert(1)",
+            )
+
+    def test_accepts_public_hostname(self) -> None:
+        """Public DNS hostnames are still accepted."""
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://example.com/",
+        )
+        assert config.url == "http://example.com/"
+
+    def test_accepts_public_ip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Public IP literals (e.g. 8.8.8.8) are still accepted."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="https://8.8.8.8/mcp",
+        )
+        assert config.url == "https://8.8.8.8/mcp"
+
+    def test_local_transport_escape_hatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OUROBOROS_ALLOW_LOCAL_TRANSPORT=1 permits loopback for local dev."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://127.0.0.1:3000/",
+        )
+        assert config.url == "http://127.0.0.1:3000/"
+
+    def test_local_transport_escape_hatch_off_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the env flag, the loopback guard still fires."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "0")
+        with pytest.raises(ValueError, match="loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://127.0.0.1/",
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost/",
+            "http://localhost:3000/",
+            "http://localhost:8080/sse",
+            "https://localhost/",
+            # Canonical FQDN form: a trailing dot marks an absolute DNS name
+            # and must be treated as identical to "localhost".  Without
+            # normalization these slipped past the well-known loopback check
+            # and fell through to DNS resolution.
+            "http://localhost./",
+            "http://localhost.:3000/",
+            "https://LOCALHOST./",
+        ],
+    )
+    def test_rejects_localhost(self, url: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Loopback hostnames (localhost) are rejected without escape hatch."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+        with pytest.raises(ValueError, match="local hostname"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url=url,
+            )
+
+    def test_localhost_allowed_with_escape_hatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OUROBOROS_ALLOW_LOCAL_TRANSPORT=1 permits localhost for local dev."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://localhost:3000/",
+        )
+        assert config.url == "http://localhost:3000/"
+
+    def test_rejects_hostname_resolving_to_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Public-looking hostnames that resolve to loopback are rejected."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+
+        def _fake_getaddrinfo(host: str, *_args, **_kwargs):
+            assert host == "127.0.0.1.nip.io"
+            return [
+                (
+                    2,
+                    1,
+                    6,
+                    "",
+                    ("127.0.0.1", 0),
+                )
+            ]
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        with pytest.raises(ValueError, match="hostname resolves to loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://127.0.0.1.nip.io/",
+            )
+
+    def test_rejects_hostname_resolving_to_metadata_ip(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hostnames resolving to link-local metadata IPs are rejected."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+
+        def _fake_getaddrinfo(host: str, *_args, **_kwargs):
+            assert host == "metadata.example.test"
+            return [
+                (
+                    2,
+                    1,
+                    6,
+                    "",
+                    ("169.254.169.254", 0),
+                )
+            ]
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        with pytest.raises(ValueError, match="169.254.169.254"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://metadata.example.test/latest/meta-data/",
+            )
+
+    def test_hostname_resolution_failure_is_inconclusive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolution failures stay non-fatal to preserve existing DNS behavior."""
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+
+        def _fake_getaddrinfo(_host: str, *_args, **_kwargs):
+            raise socket.gaierror("unresolvable")
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://future-host.example.test/",
+        )
+        assert config.url == "http://future-host.example.test/"
+
+    def test_hostname_resolution_escape_hatch_allows_local_alias(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The dev escape hatch still permits aliases that resolve locally."""
+        monkeypatch.setenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", "1")
+
+        def _fake_getaddrinfo(_host: str, *_args, **_kwargs):
+            return [(2, 1, 6, "", ("127.0.0.1", 0))]
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        config = MCPServerConfig(
+            name="test",
+            transport=TransportType.HTTP,
+            url="http://127.0.0.1.nip.io/",
+        )
+        assert config.url == "http://127.0.0.1.nip.io/"
+
+    def test_dns_lookup_uses_unnormalized_host_for_trailing_dot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: DNS resolution must use the exact host the client dials.
+
+        Canonical matching against ``_LOOPBACK_HOSTNAMES`` collapses the
+        trailing-dot/case variants of ``localhost`` into a single form for
+        identity matching. But for hosts that *don't* hit the canonical
+        loopback set and fall through to DNS, the resolver must see the
+        original host (trailing dot preserved) because an absolute FQDN
+        (``example.com.``) and a relative name (``example.com``) can give
+        different answers under some resolver configurations.
+        """
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+
+        seen_hosts: list[str] = []
+
+        def _fake_getaddrinfo(host: str, *_args, **_kwargs):
+            seen_hosts.append(host)
+            return [(2, 1, 6, "", ("127.0.0.1", 0))]
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        with pytest.raises(ValueError, match="hostname resolves to loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://127.0.0.1.nip.io./",
+            )
+
+        # The resolver must have been handed the trailing-dot form, not the
+        # canonicalized (stripped) form, so the lookup matches exactly what
+        # the HTTP client will connect to.
+        assert seen_hosts == ["127.0.0.1.nip.io."]
+
+    def test_canonical_match_does_not_short_circuit_non_loopback_aliases(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A host whose canonical form is not ``localhost`` still gets DNS-checked.
+
+        Guards against a regression where the canonical/lookup split is
+        collapsed back into a single normalized string and DNS is skipped
+        when the canonical form does not equal a well-known loopback name.
+        """
+        monkeypatch.delenv("OUROBOROS_ALLOW_LOCAL_TRANSPORT", raising=False)
+
+        seen_hosts: list[str] = []
+
+        def _fake_getaddrinfo(host: str, *_args, **_kwargs):
+            seen_hosts.append(host)
+            return [(2, 1, 6, "", ("10.0.0.5", 0))]
+
+        monkeypatch.setattr("ouroboros.mcp.types.socket.getaddrinfo", _fake_getaddrinfo)
+
+        with pytest.raises(ValueError, match="hostname resolves to loopback/link-local/private"):
+            MCPServerConfig(
+                name="test",
+                transport=TransportType.HTTP,
+                url="http://internal.example.test./",
+            )
+
+        assert seen_hosts == ["internal.example.test."]
 
 
 class TestMCPToolParameter:

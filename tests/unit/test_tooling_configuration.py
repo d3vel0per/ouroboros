@@ -48,7 +48,7 @@ def test_mypy_configured():
     assert "tool" in pyproject, "tool section should exist in pyproject.toml"
     assert "mypy" in pyproject["tool"], "mypy should be configured in pyproject.toml"
     mypy_config = pyproject["tool"]["mypy"]
-    assert mypy_config["python_version"] == "3.14"
+    assert mypy_config["python_version"] == "3.12"
     assert "disable_error_code" in mypy_config
 
 

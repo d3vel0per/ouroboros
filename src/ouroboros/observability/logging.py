@@ -40,7 +40,7 @@ Usage:
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
@@ -57,7 +57,7 @@ from ouroboros.core.security import (
 )
 
 
-class LogMode(str, Enum):
+class LogMode(StrEnum):
     """Logging output mode."""
 
     DEV = "dev"
@@ -87,6 +87,21 @@ class LoggingConfig(BaseModel):
 # Module-level state for tracking configuration
 _configured: bool = False
 _current_config: LoggingConfig | None = None
+
+
+def _close_root_handlers() -> None:
+    """Detach and close all handlers currently attached to the root logger."""
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        try:
+            handler.flush()
+        except Exception:
+            pass
+        try:
+            handler.close()
+        except Exception:
+            pass
 
 
 def _get_mode_from_env() -> LogMode:
@@ -129,28 +144,34 @@ def _setup_file_handler(config: LoggingConfig) -> TimedRotatingFileHandler | Non
         config: Logging configuration.
 
     Returns:
-        Configured TimedRotatingFileHandler or None if file logging disabled.
+        Configured TimedRotatingFileHandler or None if file logging is disabled
+        or the handler cannot be created.
     """
     if not config.enable_file_logging:
         return None
 
-    # Ensure log directory exists
-    config.log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        # Ensure log directory exists
+        config.log_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create log file path with date
-    log_file = config.log_dir / "ouroboros.log"
+        # Create log file path with date
+        log_file = config.log_dir / "ouroboros.log"
 
-    # Configure rotating file handler
-    # - when="midnight" for daily rotation
-    # - backupCount controls retention
-    handler = TimedRotatingFileHandler(
-        filename=str(log_file),
-        when="midnight",
-        interval=1,
-        backupCount=config.max_log_days,
-        encoding="utf-8",
-        utc=True,
-    )
+        # Configure rotating file handler
+        # - when="midnight" for daily rotation
+        # - backupCount controls retention
+        handler = TimedRotatingFileHandler(
+            filename=str(log_file),
+            when="midnight",
+            interval=1,
+            backupCount=config.max_log_days,
+            encoding="utf-8",
+            utc=True,
+        )
+    except OSError:
+        # File logging should not break imports or test collection when the
+        # default log path is unavailable (for example in sandboxed CI).
+        return None
 
     # Set formatter based on mode
     if config.mode == LogMode.PROD:
@@ -267,15 +288,15 @@ def _get_console_processors(mode: LogMode) -> list[Any]:
     """
     processors = _get_shared_processors()
 
-    # Format exceptions nicely for console
-    processors.append(structlog.processors.format_exc_info)
-
     # Add final renderer based on mode
     if mode == LogMode.DEV:
-        # Human-readable console output for development
+        # Human-readable console output for development.
+        # ConsoleRenderer handles exc_info itself and warns if format_exc_info
+        # is also present in the processor chain.
         processors.append(structlog.dev.ConsoleRenderer(colors=True))
     else:
         # JSON output for production
+        processors.append(structlog.processors.format_exc_info)
         processors.append(structlog.processors.JSONRenderer())
 
     return processors
@@ -462,8 +483,7 @@ def configure_logging(config: LoggingConfig | None = None) -> None:
     root_logger.setLevel(log_level)
 
     # Remove existing handlers to avoid duplicates on reconfigure
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
+    _close_root_handlers()
 
     # Add file handler if enabled
     file_handler = _setup_file_handler(config)
@@ -594,6 +614,7 @@ def reset_logging() -> None:
     global _configured, _current_config
     _configured = False
     _current_config = None
+    _close_root_handlers()
     # Clear any bound context
     structlog.contextvars.clear_contextvars()
     # Reset structlog configuration
