@@ -8,14 +8,14 @@ payloads without choosing a renderer (CLI, MCP, TUI, or structured question).
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
 from types import MappingProxyType
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Self, cast
 
-HITL_CONTRACT_SCHEMA_VERSION = 1
+HITL_CONTRACT_SCHEMA_VERSION = 2
 MAX_HITL_PAYLOAD_BYTES = 8192
 _SECRET_KEY_NAMES = frozenset(
     {
@@ -207,12 +207,65 @@ class HumanInputRequest:
     surface: str | None = None
     payload: Mapping[str, FrozenJsonValue] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    _legacy_schema_v1_replay: InitVar[bool] = False
 
     REQUESTED_EVENT_TYPE: ClassVar[str] = "hitl.requested"
     TIMED_OUT_EVENT_TYPE: ClassVar[str] = "hitl.timed_out"
     CANCELLED_EVENT_TYPE: ClassVar[str] = "hitl.cancelled"
 
-    def __post_init__(self) -> None:
+    @classmethod
+    def from_persisted_schema_v1(cls, **kwargs: Any) -> Self:
+        """Rehydrate a schema v1 request from already-persisted event data.
+
+        Early v1 plugin-firewall approval events did not persist all fields that
+        new requests must include.  Keep that compatibility path explicit so the
+        normal constructor remains strict for fresh requests.
+        """
+
+        schema_version = kwargs.get("schema_version", 1)
+        if schema_version != 1:
+            raise ValueError("legacy HITL request replay only supports schema_version=1")
+        return cls(**{**kwargs, "schema_version": 1}, _legacy_schema_v1_replay=True)
+
+    @classmethod
+    def from_persisted_event_data(cls, **kwargs: Any) -> Self:
+        """Rehydrate a request from persisted event data.
+
+        Fresh requests must always use the strict constructor.  Persisted replay
+        only relaxes early schema v1 plugin-firewall approval records that are
+        missing fields later required by the v1 permission contract.
+        """
+
+        if cls._requires_legacy_schema_v1_plugin_firewall_replay(kwargs):
+            return cls.from_persisted_schema_v1(**kwargs)
+        return cls(**kwargs)
+
+    @staticmethod
+    def _requires_legacy_schema_v1_plugin_firewall_replay(kwargs: Mapping[str, Any]) -> bool:
+        if kwargs.get("schema_version", HITL_CONTRACT_SCHEMA_VERSION) != 1:
+            return False
+        source = kwargs.get("source")
+        if source not in {HumanInputSource.PLUGIN_FIREWALL, HumanInputSource.PLUGIN_FIREWALL.value}:
+            return False
+
+        kind = kwargs.get("kind")
+        if kind not in {
+            HumanInputKind.APPROVAL,
+            HumanInputKind.DESTRUCTIVE_CONFIRMATION,
+            HumanInputKind.APPROVAL.value,
+            HumanInputKind.DESTRUCTIVE_CONFIRMATION.value,
+        }:
+            return False
+
+        payload = kwargs.get("payload", {})
+        permission_scope = payload.get("permission_scope") if isinstance(payload, Mapping) else None
+        return (
+            kwargs.get("required_permission") is None
+            or kwargs.get("surface") is None
+            or permission_scope is None
+        )
+
+    def __post_init__(self, _legacy_schema_v1_replay: bool) -> None:
         if type(self.schema_version) is not int or self.schema_version < 1:
             raise ValueError("HumanInputRequest schema_version must be a positive integer")
         if not isinstance(self.kind, HumanInputKind):
@@ -256,9 +309,52 @@ class HumanInputRequest:
             raise ValueError("select HumanInputRequest requires at least one option")
         object.__setattr__(self, "options", _normalize_string_tuple("options", self.options))
         object.__setattr__(self, "payload", _ensure_json_safe_payload("payload", self.payload))
+        self._validate_source_specific_contract(
+            allow_legacy_schema_v1_replay=_legacy_schema_v1_replay
+        )
         object.__setattr__(
             self, "created_at", _normalize_utc_datetime("created_at", self.created_at)
         )
+
+    def _validate_source_specific_contract(
+        self, *, allow_legacy_schema_v1_replay: bool = False
+    ) -> None:
+        if self.source is not HumanInputSource.PLUGIN_FIREWALL or self.kind not in {
+            HumanInputKind.APPROVAL,
+            HumanInputKind.DESTRUCTIVE_CONFIRMATION,
+        }:
+            return
+
+        if allow_legacy_schema_v1_replay and self.schema_version == 1:
+            self._validate_legacy_plugin_firewall_replay_contract()
+            return
+
+        if self.required_permission is None:
+            raise ValueError(
+                "plugin_firewall approval HumanInputRequest requires required_permission"
+            )
+        if self.surface is None:
+            raise ValueError("plugin_firewall approval HumanInputRequest requires surface")
+        if not self.payload:
+            raise ValueError("plugin_firewall approval HumanInputRequest requires payload")
+
+        permission_scope = self.payload.get("permission_scope")
+        if permission_scope != self.required_permission:
+            raise ValueError(
+                "plugin_firewall approval HumanInputRequest payload permission_scope "
+                "must match required_permission"
+            )
+
+    def _validate_legacy_plugin_firewall_replay_contract(self) -> None:
+        if self.required_permission is None:
+            return
+
+        permission_scope = self.payload.get("permission_scope")
+        if permission_scope is not None and permission_scope != self.required_permission:
+            raise ValueError(
+                "plugin_firewall approval HumanInputRequest payload permission_scope "
+                "must match required_permission"
+            )
 
     @property
     def aggregate_id(self) -> str:
