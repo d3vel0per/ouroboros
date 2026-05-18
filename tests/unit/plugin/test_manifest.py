@@ -298,13 +298,27 @@ def test_optional_fields_omitted(tmp_path: Path) -> None:
     assert manifest.hooks == ()
 
 
+def test_v02_optional_audit_still_defaults_to_legacy_four(tmp_path: Path) -> None:
+    bare = _hook_manifest()
+    bare.pop("audit", None)
+    manifest = load_manifest(_write(tmp_path, bare))
+    assert manifest.audit.events == (
+        "plugin.invoked",
+        "plugin.permission_used",
+        "plugin.completed",
+        "plugin.failed",
+    )
+
+
 def test_audit_events_accept_full_explicit_vocabulary(tmp_path: Path) -> None:
-    """Manifests may opt into any event type the audit-event schema emits."""
+    """Manifests may opt into every event emitted by their schema version."""
     raw = json.loads(json.dumps(REFERENCE_MANIFEST))
+    raw["schema_version"] = "0.3"
     raw["audit"] = {"events": list(AUDIT_EVENT_TYPES)}
 
     manifest = load_manifest(_write(tmp_path, raw))
 
+    assert manifest.schema_version == "0.3"
     assert manifest.audit.events == AUDIT_EVENT_TYPES
 
 

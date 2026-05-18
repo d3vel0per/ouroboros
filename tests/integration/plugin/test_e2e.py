@@ -95,12 +95,69 @@ def _grant_trust(paths: dict[str, Path], scope: str = "github:read") -> None:
     assert result.exit_code == 0, result.output
 
 
+def _grant_lifecycle_policy_trust(paths: dict[str, Path]) -> None:
+    _grant_trust(paths, scope="plugin:lifecycle:read")
+    _grant_trust(paths, scope="plugin:lifecycle:policy")
+
+
 def _build_program_for_invocation(paths: dict[str, Path]):
     """Load the installed manifest into a fresh UserLevel registry."""
     plugin_home = paths["plugin_home_root"] / "github-pr-ops"
     manifest = load_manifest(plugin_home / "ouroboros.plugin.json")
     registry = UserLevelProgramRegistry()
     return registry.register(manifest), plugin_home
+
+
+def _enable_v1_lifecycle_hooks(
+    plugin_home: Path,
+    *,
+    before_policy: str = "fail_closed",
+    after_policy: str = "fail_open",
+    before_script: str = "from pathlib import Path\nPath('before-hook-ran').write_text('yes')\n",
+    after_script: str = "from pathlib import Path\nPath('after-hook-ran').write_text('yes')\n",
+) -> None:
+    manifest_path = plugin_home / "ouroboros.plugin.json"
+    raw = json.loads(manifest_path.read_text())
+    raw["schema_version"] = "0.3"
+    raw["permissions"].append(
+        {
+            "scope": "plugin:lifecycle:read",
+            "risk": "read_only",
+            "required": True,
+            "reason": "Allow v1 lifecycle hook observation during invocation.",
+        }
+    )
+    before_permissions = (
+        ["plugin:lifecycle:policy"] if before_policy == "fail_closed" else ["plugin:lifecycle:read"]
+    )
+    if before_policy == "fail_closed":
+        raw["permissions"].append(
+            {
+                "scope": "plugin:lifecycle:policy",
+                "risk": "read_only",
+                "required": True,
+                "reason": "Allow v1 lifecycle hook policy decisions during invocation.",
+            }
+        )
+    raw["hooks"] = [
+        {
+            "name": "before_invocation",
+            "entrypoint": {"type": "command", "command": "python before_hook.py"},
+            "failure_policy": before_policy,
+            "permissions": before_permissions,
+            "timeout_seconds": 5,
+        },
+        {
+            "name": "after_invocation",
+            "entrypoint": {"type": "command", "command": "python after_hook.py"},
+            "failure_policy": after_policy,
+            "permissions": ["plugin:lifecycle:read"],
+            "timeout_seconds": 5,
+        },
+    ]
+    manifest_path.write_text(json.dumps(raw, indent=2) + "\n")
+    (plugin_home / "before_hook.py").write_text(before_script)
+    (plugin_home / "after_hook.py").write_text(after_script)
 
 
 def _python_exec_runner():
@@ -201,6 +258,222 @@ def test_path_1_read_only_success(tmp_path: Path) -> None:
     # sha256 hash recorded.
     completed = next(p for p in payloads if p["event_type"] == "plugin.completed")
     assert "stdout_sha256" in completed["provenance"]
+
+
+def test_v1_lifecycle_hooks_wrap_successful_invocation(tmp_path: Path) -> None:
+    paths = _install_fixture_plugin(tmp_path)
+    plugin_home = paths["plugin_home_root"] / "github-pr-ops"
+    _enable_v1_lifecycle_hooks(plugin_home)
+    _grant_trust(paths)
+    _grant_lifecycle_policy_trust(paths)
+
+    program, plugin_home = _build_program_for_invocation(paths)
+    trust_record = TrustStore(root=paths["trust_root"]).read("github-pr-ops")
+
+    envelopes: list[dict] = []
+    sink = make_event_sink(envelopes.append, correlation_id="e2e-hooks")
+    result = invoke_plugin(
+        program,
+        command_name="review",
+        argv=["https://example.com/pr/123"],
+        trust_record=trust_record,
+        event_sink=sink,
+        correlation_id="e2e-hooks",
+        plugin_home=plugin_home,
+        subprocess_runner=_python_exec_runner(),
+    )
+
+    assert result.status == "success", result.message
+    assert (plugin_home / "before-hook-ran").read_text() == "yes"
+    assert (plugin_home / "after-hook-ran").read_text() == "yes"
+
+    payloads = [unwrap_plugin_event(env) for env in envelopes]
+    types = [p["event_type"] for p in payloads]
+    assert types == [
+        "plugin.hook.invoked",
+        "plugin.hook.completed",
+        "plugin.invoked",
+        "plugin.permission_used",
+        "plugin.permission_used",
+        "plugin.permission_used",
+        "plugin.completed",
+        "plugin.hook.invoked",
+        "plugin.hook.completed",
+    ]
+    hook_payloads = [p for p in payloads if p["event_type"].startswith("plugin.hook.")]
+    assert {p["schema_version"] for p in hook_payloads} == {"0.3"}
+    assert {p["permissions_used"][0] for p in hook_payloads} == {
+        "plugin:lifecycle:policy",
+        "plugin:lifecycle:read",
+    }
+    assert [p["provenance"]["hook_name"] for p in hook_payloads] == [
+        "before_invocation",
+        "before_invocation",
+        "after_invocation",
+        "after_invocation",
+    ]
+
+
+def test_fail_closed_before_hook_blocks_without_launching_entrypoint(tmp_path: Path) -> None:
+    paths = _install_fixture_plugin(tmp_path)
+    plugin_home = paths["plugin_home_root"] / "github-pr-ops"
+    _enable_v1_lifecycle_hooks(
+        plugin_home,
+        before_script=(
+            "from pathlib import Path\n"
+            "Path('before-hook-ran').write_text('yes')\n"
+            "raise SystemExit(17)\n"
+        ),
+    )
+    _grant_trust(paths)
+    _grant_lifecycle_policy_trust(paths)
+
+    program, plugin_home = _build_program_for_invocation(paths)
+    trust_record = TrustStore(root=paths["trust_root"]).read("github-pr-ops")
+
+    envelopes: list[dict] = []
+    sink = make_event_sink(envelopes.append, correlation_id="e2e-before-hook-fail-closed")
+    result = invoke_plugin(
+        program,
+        command_name="review",
+        argv=["https://example.com/pr/123"],
+        trust_record=trust_record,
+        event_sink=sink,
+        correlation_id="e2e-before-hook-fail-closed",
+        plugin_home=plugin_home,
+        subprocess_runner=_python_exec_runner(),
+    )
+
+    assert result.status == "blocked"
+    assert result.exit_code is None
+    assert (plugin_home / "before-hook-ran").read_text() == "yes"
+    assert not (plugin_home / "after-hook-ran").exists()
+
+    payloads = [unwrap_plugin_event(env) for env in envelopes]
+    types = [p["event_type"] for p in payloads]
+    assert types == ["plugin.hook.invoked", "plugin.hook.blocked"]
+    assert "plugin.invoked" not in types
+    assert "plugin.failed" not in types
+    hook_blocked = payloads[1]
+    assert hook_blocked["result"]["status"] == "blocked"
+    assert "code 17" in hook_blocked["result"]["message"]
+    assert hook_blocked["provenance"]["returncode"] == "17"
+    assert "stdout_sha256" in hook_blocked["provenance"]
+
+
+def test_fail_open_before_hook_records_failure_and_continues(tmp_path: Path) -> None:
+    paths = _install_fixture_plugin(tmp_path)
+    plugin_home = paths["plugin_home_root"] / "github-pr-ops"
+    _enable_v1_lifecycle_hooks(
+        plugin_home,
+        before_policy="fail_open",
+        before_script=(
+            "from pathlib import Path\n"
+            "Path('before-hook-ran').write_text('yes')\n"
+            "raise SystemExit(23)\n"
+        ),
+    )
+    _grant_trust(paths)
+    _grant_trust(paths, scope="plugin:lifecycle:read")
+
+    program, plugin_home = _build_program_for_invocation(paths)
+    trust_record = TrustStore(root=paths["trust_root"]).read("github-pr-ops")
+
+    envelopes: list[dict] = []
+    sink = make_event_sink(envelopes.append, correlation_id="e2e-before-hook-fail-open")
+    result = invoke_plugin(
+        program,
+        command_name="review",
+        argv=["https://example.com/pr/123"],
+        trust_record=trust_record,
+        event_sink=sink,
+        correlation_id="e2e-before-hook-fail-open",
+        plugin_home=plugin_home,
+        subprocess_runner=_python_exec_runner(),
+    )
+
+    assert result.status == "success", result.message
+    assert result.exit_code == 0
+    assert (plugin_home / "before-hook-ran").read_text() == "yes"
+    assert (plugin_home / "after-hook-ran").read_text() == "yes"
+
+    payloads = [unwrap_plugin_event(env) for env in envelopes]
+    types = [p["event_type"] for p in payloads]
+    assert types == [
+        "plugin.hook.invoked",
+        "plugin.hook.failed",
+        "plugin.invoked",
+        "plugin.permission_used",
+        "plugin.permission_used",
+        "plugin.completed",
+        "plugin.hook.invoked",
+        "plugin.hook.completed",
+    ]
+    hook_failed = payloads[1]
+    assert hook_failed["provenance"]["failure_policy"] == "fail_open"
+    assert hook_failed["provenance"]["returncode"] == "23"
+    assert payloads[-3]["event_type"] == "plugin.completed"
+
+
+def test_fail_open_after_hook_records_failure_and_preserves_terminal_success(
+    tmp_path: Path,
+) -> None:
+    paths = _install_fixture_plugin(tmp_path)
+    plugin_home = paths["plugin_home_root"] / "github-pr-ops"
+    _enable_v1_lifecycle_hooks(
+        plugin_home,
+        after_policy="fail_open",
+        after_script=(
+            "from pathlib import Path\n"
+            "Path('after-hook-ran').write_text('yes')\n"
+            "raise SystemExit(31)\n"
+        ),
+    )
+    _grant_trust(paths)
+    _grant_lifecycle_policy_trust(paths)
+
+    program, plugin_home = _build_program_for_invocation(paths)
+    trust_record = TrustStore(root=paths["trust_root"]).read("github-pr-ops")
+
+    envelopes: list[dict] = []
+    sink = make_event_sink(envelopes.append, correlation_id="e2e-after-hook-fail-open")
+    result = invoke_plugin(
+        program,
+        command_name="review",
+        argv=["https://example.com/pr/123"],
+        trust_record=trust_record,
+        event_sink=sink,
+        correlation_id="e2e-after-hook-fail-open",
+        plugin_home=plugin_home,
+        subprocess_runner=_python_exec_runner(),
+    )
+
+    assert result.status == "success", result.message
+    assert result.exit_code == 0
+    assert (plugin_home / "before-hook-ran").read_text() == "yes"
+    assert (plugin_home / "after-hook-ran").read_text() == "yes"
+
+    payloads = [unwrap_plugin_event(env) for env in envelopes]
+    types = [p["event_type"] for p in payloads]
+    assert types == [
+        "plugin.hook.invoked",
+        "plugin.hook.completed",
+        "plugin.invoked",
+        "plugin.permission_used",
+        "plugin.permission_used",
+        "plugin.permission_used",
+        "plugin.completed",
+        "plugin.hook.invoked",
+        "plugin.hook.failed",
+    ]
+    assert "plugin.failed" not in types
+    hook_failed = payloads[-1]
+    assert hook_failed["provenance"]["failure_policy"] == "fail_open"
+    assert hook_failed["result"]["status"] == "failed"
+    assert hook_failed["provenance"]["returncode"] == "31"
+    terminal = payloads[-3]
+    assert terminal["event_type"] == "plugin.completed"
+    assert terminal["result"]["status"] == "success"
 
 
 # ---------------------------------------------------------------------------
@@ -390,5 +663,9 @@ def test_envelopes_carry_all_current_v0_emitted_event_types() -> None:
         "plugin.permission_used",
         "plugin.completed",
         "plugin.failed",
+        "plugin.hook.invoked",
+        "plugin.hook.completed",
+        "plugin.hook.blocked",
+        "plugin.hook.failed",
     }
     assert set(AUDIT_EVENT_TYPES) == expected

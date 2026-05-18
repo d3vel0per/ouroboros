@@ -1,11 +1,8 @@
 """Plugin lifecycle hook contract types.
 
-This module is the first reviewable slice of issue #939. It introduces
-the typed vocabulary the harness will use to dispatch plugin lifecycle
-hooks — without changing runtime behavior, manifest schema validation,
-or audit emission yet. The shape mirrors the contract documented in
-``docs/rfc/userlevel-plugins.md`` (the boundary doc that landed in
-``f718ef89e``).
+This module defines the typed vocabulary used to validate and dispatch
+v1 plugin lifecycle hooks. The shape mirrors the contract documented in
+``docs/rfc/userlevel-plugins.md``.
 
 What this module owns:
 
@@ -16,28 +13,18 @@ What this module owns:
   silently accepting them at manifest-validation time.
 * :class:`HookFailurePolicy` — the v1 failure policies (``fail_open``
   / ``fail_closed``).
-* :data:`HOOK_OUTCOME_AUDIT_EVENTS` — the v1 hook outcome event names
-  currently vendored in the manifest schemas
-  (``plugin.hook.blocked`` / ``plugin.hook.failed``). The v0.3 audit-event
-  schema also vendors the successful hook start/completion names for forward
-  compatibility, but runtime emission of those events remains deferred.
+* :data:`HOOK_EVENT_TYPES` — the v1 hook event names vendored in the
+  manifest/audit schemas and emitted or reserved by the firewall
+  lifecycle wrapper (``plugin.hook.invoked``,
+  ``plugin.hook.completed``, ``plugin.hook.blocked``, and
+  ``plugin.hook.failed``).
 * :func:`is_v1_hook_kind` / :func:`is_v1_failure_policy` — helpers
-  consumed by manifest validators in follow-up PRs. They live here so
-  the contract is the single source of truth.
+  consumed by manifest validators. They live here so the contract is
+  the single source of truth.
 
-What this module does **not** do:
-
-* Wire hook dispatch into ``HarnessRunner`` or any runtime path.
-* Change the manifest schema or the existing :class:`HookSpec`
-  dataclass (validators that consume these helpers land in a follow-up
-  PR).
-* Emit audit events. The event names are exported as constants only.
-* Add or remove permissions. Hook-specific permission emission is a
-  future extension per the RFC.
-
-Routes to #939. The full lifecycle slate lands incrementally; this
-module is intentionally narrow enough to review as a typed contract
-before any wiring change.
+This module deliberately stays contract-only: runtime execution belongs
+to ``ouroboros.plugin.firewall`` and manifest shape belongs to the
+versioned schemas plus ``ouroboros.plugin.manifest``.
 """
 
 from __future__ import annotations
@@ -59,7 +46,8 @@ class HookKind(StrEnum):
 
     #: Runs after trust check and confirmation gate, before
     #: ``plugin.invoked`` is emitted. Intended for read-only
-    #: inspection or ``fail_closed`` policy decisions.
+    #: inspection or policy decisions declared with the stronger
+    #: lifecycle policy scope.
     BEFORE_INVOCATION = "before_invocation"
 
     #: Runs after ``plugin.completed`` / ``plugin.failed`` is known,
@@ -129,17 +117,10 @@ class HookFailurePolicy(StrEnum):
     FAIL_CLOSED = "fail_closed"
 
 
-#: V1 hook outcome event names currently vendored in the
-#: manifest schemas. These are exported as constants so manifest
-#: validators and audit consumers reference the same string set the
-#: wrapper will emit for hook block/failure outcomes when dispatch
-#: lands in a follow-up PR.
-#:
-#: This is deliberately narrower than the full future hook telemetry
-#: vocabulary in ``docs/rfc/userlevel-plugins.md``. The v0.3 audit-event
-#: schema vendors ``plugin.hook.invoked`` / ``plugin.hook.completed`` for
-#: forward compatibility, but core runtime emission remains deferred until
-#: dispatch wiring lands.
+#: V1 hook event names vendored in the manifest/audit schemas.
+#: These are exported as constants so manifest validators, audit
+#: consumers, and the firewall lifecycle wrapper reference the same
+#: string set for hook start, completion, blocked, and failed outcomes.
 HOOK_INVOKED_EVENT: Final[str] = "plugin.hook.invoked"
 HOOK_COMPLETED_EVENT: Final[str] = "plugin.hook.completed"
 HOOK_BLOCKED_EVENT: Final[str] = "plugin.hook.blocked"
@@ -154,8 +135,7 @@ HOOK_EVENT_TYPES: Final[frozenset[str]] = HOOK_RUNTIME_AUDIT_EVENTS | HOOK_OUTCO
 
 #: Backward-compatible alias for the original #984 export. Prefer
 #: :data:`HOOK_OUTCOME_AUDIT_EVENTS` in new call sites so the name does
-#: not imply that all future hook audit events are already schema-
-#: vendored or safe to emit.
+#: not imply that only blocked/failed hook outcomes exist.
 HOOK_AUDIT_EVENTS: Final[frozenset[str]] = HOOK_OUTCOME_AUDIT_EVENTS
 
 #: Hook permission scope reserved for read-only lifecycle observation
@@ -163,16 +143,22 @@ HOOK_AUDIT_EVENTS: Final[frozenset[str]] = HOOK_OUTCOME_AUDIT_EVENTS
 #: observability hooks per ``docs/rfc/userlevel-plugins.md``). Manifest
 #: authors declare it under top-level ``permissions[].scope`` so the
 #: existing ``plugin.permission_used`` emission rule covers it without
-#: a separate event family. Stronger lifecycle scopes for policy
-#: decisions are deferred to a follow-up RFC slice.
+#: a separate event family.
 HOOK_LIFECYCLE_READ_SCOPE: Final[str] = "plugin:lifecycle:read"
+
+#: Hook permission scope required for lifecycle hooks that can veto an
+#: invocation through ``fail_closed``. Read-only lifecycle observation
+#: remains available through :data:`HOOK_LIFECYCLE_READ_SCOPE`; this
+#: ``plugin:lifecycle:policy`` is the explicit authority boundary for
+#: policy decisions.
+HOOK_LIFECYCLE_POLICY_SCOPE: Final[str] = "plugin:lifecycle:policy"
 
 #: Frozen set of v1 hook permission scopes. Validators and manifest
 #: authors reference this set rather than the bare string so the
-#: contract intent is observable at every call site. The set is
-#: intentionally a single entry for v1 — additional lifecycle scopes
-#: land alongside the RFC update that introduces them.
-HOOK_LIFECYCLE_SCOPES: Final[frozenset[str]] = frozenset({HOOK_LIFECYCLE_READ_SCOPE})
+#: contract intent is observable at every call site.
+HOOK_LIFECYCLE_SCOPES: Final[frozenset[str]] = frozenset(
+    {HOOK_LIFECYCLE_READ_SCOPE, HOOK_LIFECYCLE_POLICY_SCOPE}
+)
 
 
 def is_v1_hook_kind(value: str) -> bool:
@@ -218,6 +204,7 @@ __all__ = [
     "HOOK_EVENT_TYPES",
     "HOOK_FAILED_EVENT",
     "HOOK_INVOKED_EVENT",
+    "HOOK_LIFECYCLE_POLICY_SCOPE",
     "HOOK_LIFECYCLE_READ_SCOPE",
     "HOOK_LIFECYCLE_SCOPES",
     "HOOK_OUTCOME_AUDIT_EVENTS",
